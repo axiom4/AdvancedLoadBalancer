@@ -267,6 +267,10 @@ void record_backend_success(int index) {
     if (index >= 0 && index < g_num_backends) {
         pthread_mutex_lock(&g_backend_mutex);
         g_backends[index].consecutive_failures = 0;
+        if (!atomic_load_explicit(&g_backends[index].is_alive, memory_order_relaxed)) {
+            atomic_store_explicit(&g_backends[index].is_alive, true, memory_order_relaxed);
+            g_backends[index].consecutive_successes = RISE_THRESHOLD;
+        }
         pthread_mutex_unlock(&g_backend_mutex);
     }
 }

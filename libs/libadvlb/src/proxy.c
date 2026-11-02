@@ -118,6 +118,7 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
 
 typedef enum {
     CONN_STATE_SSL_HANDSHAKE,
+    CONN_STATE_BACKEND_CONNECTING,
     CONN_STATE_FORWARDING
 } ConnectionState;
 
@@ -189,6 +190,8 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn);
 static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn);
 static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *conn);
 static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *conn);
+static void worker_retry_backend_connect(WorkerThread *worker, ProxyConnection *conn);
+static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events);
 static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *conn);
 static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events);
 static void worker_check_timeouts(WorkerThread *worker);
@@ -369,12 +372,31 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
         char pp_hdr[128];
         int pp_len = build_proxy_protocol_v1_header(pp_hdr, sizeof(pp_hdr), &conn->client_addr, &lb_addr);
         if (pp_len > 0) {
-            size_t space = buffer_space(&conn->c2b);
-            if ((size_t)pp_len <= space) {
-                memcpy(conn->c2b.data + conn->c2b.tail, pp_hdr, (size_t)pp_len);
+            size_t avail = buffer_available(&conn->c2b);
+            if (conn->c2b.head >= (size_t)pp_len) {
+                conn->c2b.head -= (size_t)pp_len;
+                memcpy(conn->c2b.data + conn->c2b.head, pp_hdr, (size_t)pp_len);
+            } else if (conn->c2b.tail + (size_t)pp_len <= BUFFER_SIZE) {
+                if (avail > 0) {
+                    memmove(conn->c2b.data + conn->c2b.head + pp_len,
+                            conn->c2b.data + conn->c2b.head,
+                            avail);
+                }
+                memcpy(conn->c2b.data + conn->c2b.head, pp_hdr, (size_t)pp_len);
                 conn->c2b.tail += (size_t)pp_len;
             } else {
-                add_log("\033[1;31m[PPv1 ERR]\033[0m Buffer full, failed prepending PROXY v1 header");
+                buffer_compact(&conn->c2b);
+                avail = buffer_available(&conn->c2b);
+                if (conn->c2b.tail + (size_t)pp_len <= BUFFER_SIZE) {
+                    if (avail > 0) {
+                        memmove(conn->c2b.data + pp_len, conn->c2b.data, avail);
+                    }
+                    memcpy(conn->c2b.data, pp_hdr, (size_t)pp_len);
+                    conn->c2b.head = 0;
+                    conn->c2b.tail = avail + (size_t)pp_len;
+                } else {
+                    add_log("\033[1;31m[PPv1 ERR]\033[0m Buffer full, failed prepending PROXY v1 header");
+                }
             }
         }
     }
@@ -398,10 +420,36 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
     worker_update_conn_epoll(worker, conn);
 }
 
+static void worker_retry_backend_connect(WorkerThread *worker, ProxyConnection *conn) {
+    if (conn->backend_fd >= 0) {
+        epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
+        worker_clear_fd(worker, conn->backend_fd);
+        close(conn->backend_fd);
+        conn->backend_fd = -1;
+        conn->last_backend_ev = 0;
+    }
+    if (conn->backend_idx >= 0) {
+        release_backend(conn->backend_idx);
+        conn->backend_idx = -1;
+    }
+
+    worker_start_backend_connect(worker, conn);
+}
+
 static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *conn) {
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(conn->client_addr.sin_addr), client_ip, sizeof(client_ip));
     int client_port = ntohs(conn->client_addr.sin_port);
+
+    // Register client_fd in epoll if not yet monitored so initial client data can be buffered
+    if (conn->client_fd >= 0 && conn->last_client_ev == 0) {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.data.fd = conn->client_fd;
+        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        conn->last_client_ev = ev.events;
+        epoll_ctl(worker->epfd, EPOLL_CTL_ADD, conn->client_fd, &ev);
+    }
 
     while (conn->retry_count < g_num_backends) {
         conn->retry_count++;
@@ -417,26 +465,91 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
         b_port = g_backends[b_idx].port;
         pthread_mutex_unlock(&g_backend_mutex);
 
-        int bfd = connect_with_timeout_transparent(b_ip, b_port, 1000, &conn->client_addr);
+        bool in_progress = false;
+        int bfd = connect_nonblocking_transparent(b_ip, b_port, &conn->client_addr, &in_progress);
         if (bfd >= 0) {
             conn->backend_idx = b_idx;
             conn->backend_fd = bfd;
-            record_backend_success(b_idx);
-            set_nonblocking(bfd);
-            int flag = 1;
-            setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
             worker_set_fd(worker, bfd, conn);
-            worker_on_backend_connected(worker, conn);
+
+            if (!in_progress) {
+                record_backend_success(b_idx);
+                worker_on_backend_connected(worker, conn);
+                return;
+            }
+
+            conn->state = CONN_STATE_BACKEND_CONNECTING;
+            conn->last_activity = time(NULL);
+
+            struct epoll_event ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.data.fd = bfd;
+            ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+            conn->last_backend_ev = ev.events;
+            epoll_ctl(worker->epfd, EPOLL_CTL_ADD, bfd, &ev);
             return;
         }
 
-        add_log("\033[1;33m[WARN]\033[0m Backend [%d] %s:%d connect error: %s (errno %d)",
+        add_log("\033[1;33m[WARN]\033[0m Backend [%d] %s:%d immediate connect failed: %s (errno %d)",
                 b_idx, b_ip, b_port, strerror(errno), errno);
         record_backend_failure(b_idx);
+        release_backend(b_idx);
     }
 
     add_log("\033[1;31m[DROP]\033[0m No healthy backend available for %s:%d", client_ip, client_port);
     worker_close_conn(worker, conn);
+}
+
+static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events) {
+    if (fd == conn->client_fd) {
+        if (events & (EPOLLERR | EPOLLHUP)) {
+            worker_close_conn(worker, conn);
+            return;
+        }
+        if (events & EPOLLIN) {
+            buffer_compact(&conn->c2b);
+            size_t space = buffer_space(&conn->c2b);
+            if (space > 0) {
+                bool want_io = false;
+                ssize_t r = nonblocking_read(conn->client_fd, conn->client_ssl,
+                                             conn->c2b.data + conn->c2b.tail, space, &want_io);
+                if (r > 0) {
+                    conn->c2b.tail += (size_t)r;
+                    conn->last_activity = time(NULL);
+                } else if (r == 0 && !want_io) {
+                    conn->client_closed = true;
+                } else if (r < 0) {
+                    worker_close_conn(worker, conn);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    if (fd == conn->backend_fd) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(conn->backend_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+            int failure_code = (err != 0) ? err : errno;
+            char b_ip[INET_ADDRSTRLEN];
+            int b_port = 0;
+            pthread_mutex_lock(&g_backend_mutex);
+            strncpy(b_ip, g_backends[conn->backend_idx].ip, sizeof(b_ip));
+            b_port = g_backends[conn->backend_idx].port;
+            pthread_mutex_unlock(&g_backend_mutex);
+
+            add_log("\033[1;33m[WARN]\033[0m Backend [%d] %s:%d async connect failed: %s (errno %d)",
+                    conn->backend_idx, b_ip, b_port, strerror(failure_code), failure_code);
+            record_backend_failure(conn->backend_idx);
+
+            worker_retry_backend_connect(worker, conn);
+            return;
+        }
+
+        record_backend_success(conn->backend_idx);
+        worker_on_backend_connected(worker, conn);
+    }
 }
 
 static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *conn) {
@@ -630,6 +743,12 @@ static void worker_check_timeouts(WorkerThread *worker) {
         } else if (curr->state == CONN_STATE_SSL_HANDSHAKE && (now - curr->hs_start >= 5)) {
             add_log("\033[1;33m[TIMEOUT]\033[0m SSL handshake timeout (>5s)");
             worker_close_conn(worker, curr);
+        } else if (curr->state == CONN_STATE_BACKEND_CONNECTING && (now - curr->last_activity >= 2)) {
+            add_log("\033[1;33m[TIMEOUT]\033[0m Backend connect timeout (>2s)");
+            if (curr->backend_idx >= 0) {
+                record_backend_failure(curr->backend_idx);
+            }
+            worker_retry_backend_connect(worker, curr);
         }
         curr = next;
     }
@@ -785,6 +904,8 @@ static void *worker_event_loop(void *arg) {
 
             if (conn->state == CONN_STATE_SSL_HANDSHAKE) {
                 worker_step_ssl_handshake(worker, conn);
+            } else if (conn->state == CONN_STATE_BACKEND_CONNECTING) {
+                worker_handle_backend_connecting(worker, conn, curr_fd, ev_mask);
             } else if (conn->state == CONN_STATE_FORWARDING) {
                 worker_handle_forwarding_io(worker, conn, curr_fd, ev_mask);
             }

@@ -22,6 +22,10 @@ int net_create_udp_server(int port);
 int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
                             const struct sockaddr_in *bind_client_addr,
                             bool enable_transparent);
+int net_connect_tcp_nonblocking(const char *ip, int port,
+                                const struct sockaddr_in *bind_client_addr,
+                                bool enable_transparent,
+                                bool *in_progress);
 
 // Socket options tuning
 int net_set_nonblocking(int fd);

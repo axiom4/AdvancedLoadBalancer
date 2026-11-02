@@ -121,9 +121,12 @@ int net_create_udp_server(int port) {
     return udp_fd;
 }
 
-int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
-                            const struct sockaddr_in *bind_client_addr,
-                            bool enable_transparent) {
+int net_connect_tcp_nonblocking(const char *ip, int port,
+                                const struct sockaddr_in *bind_client_addr,
+                                bool enable_transparent,
+                                bool *in_progress) {
+    if (in_progress) *in_progress = false;
+
     int fd;
     while ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         if (errno == EINTR) continue;
@@ -138,6 +141,7 @@ int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
 
     // IP transparency support (Linux TPROXY)
     if (enable_transparent && bind_client_addr != NULL) {
+#if defined(__linux__) && defined(IP_TRANSPARENT)
         int opt = 1;
         if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) == 0) {
             struct sockaddr_in bind_addr;
@@ -152,6 +156,7 @@ int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
                 break;
             }
         }
+#endif
     }
 
     if (net_set_nonblocking(fd) < 0) {
@@ -170,14 +175,28 @@ int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
 
     int res;
     while ((res = connect(fd, (struct sockaddr *)&addr, sizeof(addr))) < 0) {
-        if (errno == EINTR || errno == EINPROGRESS) {
-            break;
+        if (errno == EINTR) continue;
+        if (errno == EINPROGRESS) {
+            if (in_progress) *in_progress = true;
+            return fd;
         }
         close(fd);
         return -1;
     }
 
-    if (res == 0) {
+    // res == 0: connected immediately
+    if (in_progress) *in_progress = false;
+    return fd;
+}
+
+int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
+                            const struct sockaddr_in *bind_client_addr,
+                            bool enable_transparent) {
+    bool in_progress = false;
+    int fd = net_connect_tcp_nonblocking(ip, port, bind_client_addr, enable_transparent, &in_progress);
+    if (fd < 0) return -1;
+
+    if (!in_progress) {
         int flags = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
         return fd;

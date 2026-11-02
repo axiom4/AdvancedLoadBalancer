@@ -38,6 +38,10 @@ int connect_with_timeout_transparent(const char *ip, int port, int timeout_ms, c
     return net_connect_tcp_timeout(ip, port, timeout_ms, client_addr, g_config.enable_transparent_mode);
 }
 
+int connect_nonblocking_transparent(const char *ip, int port, const struct sockaddr_in *client_addr, bool *in_progress) {
+    return net_connect_tcp_nonblocking(ip, port, client_addr, g_config.enable_transparent_mode, in_progress);
+}
+
 int create_tcp_server_socket(int port) {
     return net_create_tcp_server(port, SOMAXCONN);
 }
