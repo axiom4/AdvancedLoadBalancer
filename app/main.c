@@ -102,6 +102,7 @@ int main(int argc, char *argv[]) {
         cleanup_tui();
         printf("\n[SHUTDOWN] UDP Load Balancer shutdown complete.\n");
         if (g_global_server_fd >= 0) close(g_global_server_fd);
+        log_shutdown();
         return 0;
     }
 
@@ -182,6 +183,7 @@ int main(int argc, char *argv[]) {
         close(g_global_server_fd);
     }
     cleanup_ssl_context();
+    log_shutdown();
 
     return 0;
 }
