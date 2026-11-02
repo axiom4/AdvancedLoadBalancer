@@ -178,14 +178,17 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
         return NULL;
     }
 
-    char b_ip[INET_ADDRSTRLEN];
+    char b_ip[INET6_ADDRSTRLEN];
     int b_port;
     pthread_mutex_lock(&g_backend_mutex);
     strncpy(b_ip, g_backends[backend_idx].ip, sizeof(b_ip));
     b_port = g_backends[backend_idx].port;
     pthread_mutex_unlock(&g_backend_mutex);
 
-    int bfd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct in6_addr a6;
+    bool is_v6 = (inet_pton(AF_INET6, b_ip, &a6) == 1);
+
+    int bfd = socket(is_v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
     if (bfd < 0) {
         release_backend(backend_idx);
         pthread_mutex_unlock(&s_udp_session_mutex);
@@ -193,13 +196,24 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
     }
     set_nonblocking(bfd);
 
-    struct sockaddr_in b_addr;
-    memset(&b_addr, 0, sizeof(b_addr));
-    b_addr.sin_family = AF_INET;
-    b_addr.sin_port = htons((uint16_t)b_port);
-    inet_pton(AF_INET, b_ip, &b_addr.sin_addr);
+    int cr;
+    if (is_v6) {
+        struct sockaddr_in6 b_addr6;
+        memset(&b_addr6, 0, sizeof(b_addr6));
+        b_addr6.sin6_family = AF_INET6;
+        b_addr6.sin6_port = htons((uint16_t)b_port);
+        b_addr6.sin6_addr = a6;
+        cr = connect(bfd, (struct sockaddr *)&b_addr6, sizeof(b_addr6));
+    } else {
+        struct sockaddr_in b_addr;
+        memset(&b_addr, 0, sizeof(b_addr));
+        b_addr.sin_family = AF_INET;
+        b_addr.sin_port = htons((uint16_t)b_port);
+        inet_pton(AF_INET, b_ip, &b_addr.sin_addr);
+        cr = connect(bfd, (struct sockaddr *)&b_addr, sizeof(b_addr));
+    }
 
-    if (connect(bfd, (struct sockaddr *)&b_addr, sizeof(b_addr)) < 0) {
+    if (cr < 0) {
         close(bfd);
         release_backend(backend_idx);
         pthread_mutex_unlock(&s_udp_session_mutex);
@@ -277,6 +291,12 @@ void run_udp_proxy_loop(int master_udp_fd) {
     while (g_server_running) {
         int nfds = epoll_wait(epfd, events, 64, 1000);
         time_t now = time(NULL);
+
+        if (g_reload_requested) {
+            g_reload_requested = 0;
+            add_log("\033[1;36m[SYSTEM]\033[0m SIGHUP received: reloading configuration...");
+            config_reload();
+        }
 
         if (now - last_cleanup >= 2) {
             cleanup_expired_udp_sessions(epfd);

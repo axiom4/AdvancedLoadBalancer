@@ -8,7 +8,7 @@
 SSL_CTX *g_global_ssl_ctx = NULL;
 
 #ifndef NO_SSL
-SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
+static SSL_CTX *create_and_configure_ssl_ctx(const char *cert_path, const char *key_path, bool fatal_on_error) {
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
@@ -16,9 +16,12 @@ SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
     const SSL_METHOD *method = TLS_server_method();
     SSL_CTX *ctx = SSL_CTX_new(method);
     if (!ctx) {
-        cleanup_tui();
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
+        if (fatal_on_error) {
+            cleanup_tui();
+            ERR_print_errors_fp(stderr);
+            exit(EXIT_FAILURE);
+        }
+        return NULL;
     }
 
     // 1. Enforce minimum TLS 1.2 protocol version (disables SSLv2, SSLv3, TLS 1.0, TLS 1.1)
@@ -42,8 +45,6 @@ SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
     SSL_CTX_set_options(ctx, ssl_opts);
 
     // 3. Modern Cipher Suites configuration (Mozilla Intermediate Profile)
-    // Strictly require forward secrecy (ECDHE/DHE) and authenticated encryption (GCM/ChaCha20)
-    // Exclude insecure ciphers (NULL, EXPORT, DES, 3DES, RC4, MD5, PSK)
     const char *tls12_ciphers = "ECDHE-ECDSA-AES128-GCM-SHA256:"
                                 "ECDHE-RSA-AES128-GCM-SHA256:"
                                 "ECDHE-ECDSA-AES256-GCM-SHA384:"
@@ -54,10 +55,14 @@ SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
                                 "DHE-RSA-AES256-GCM-SHA384:"
                                 "!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!aECDH:!3DES";
     if (SSL_CTX_set_cipher_list(ctx, tls12_ciphers) <= 0) {
-        cleanup_tui();
-        ERR_print_errors_fp(stderr);
-        fprintf(stderr, "Error configuring TLS 1.2 cipher suites\n");
-        exit(EXIT_FAILURE);
+        if (fatal_on_error) {
+            cleanup_tui();
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "Error configuring TLS 1.2 cipher suites\n");
+            exit(EXIT_FAILURE);
+        }
+        SSL_CTX_free(ctx);
+        return NULL;
     }
 
     // TLS 1.3 ciphersuites (RFC 8446)
@@ -80,42 +85,79 @@ SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
     struct stat key_stat;
     if (stat(key_path, &key_stat) == 0) {
         if (!S_ISREG(key_stat.st_mode)) {
-            cleanup_tui();
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key '%s' is not a regular file\n", key_path);
-            exit(EXIT_FAILURE);
+            if (fatal_on_error) {
+                cleanup_tui();
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key '%s' is not a regular file\n", key_path);
+                exit(EXIT_FAILURE);
+            }
+            SSL_CTX_free(ctx);
+            return NULL;
         }
         if ((key_stat.st_mode & 0077) != 0) {
-            cleanup_tui();
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Insecure file permissions on SSL private key '%s' (%04o).\n",
-                    key_path, (unsigned int)(key_stat.st_mode & 0777));
-            fprintf(stderr, "SSL private keys must not be accessible by group or others (required: 0600 or 0400).\n");
-            fprintf(stderr, "Hint: fix with 'chmod 600 %s'\n", key_path);
-            exit(EXIT_FAILURE);
+            if (fatal_on_error) {
+                cleanup_tui();
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Insecure file permissions on SSL private key '%s' (%04o).\n",
+                        key_path, (unsigned int)(key_stat.st_mode & 0777));
+                fprintf(stderr, "SSL private keys must not be accessible by group or others (required: 0600 or 0400).\n");
+                fprintf(stderr, "Hint: fix with 'chmod 600 %s'\n", key_path);
+                exit(EXIT_FAILURE);
+            }
+            SSL_CTX_free(ctx);
+            return NULL;
         }
     }
 
     if (SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) <= 0) {
-        cleanup_tui();
-        ERR_print_errors_fp(stderr);
-        fprintf(stderr, "Error loading certificate: %s\n", cert_path);
-        exit(EXIT_FAILURE);
+        if (fatal_on_error) {
+            cleanup_tui();
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "Error loading certificate: %s\n", cert_path);
+            exit(EXIT_FAILURE);
+        }
+        SSL_CTX_free(ctx);
+        return NULL;
     }
 
     if (SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) <= 0) {
-        cleanup_tui();
-        ERR_print_errors_fp(stderr);
-        fprintf(stderr, "Error loading private key: %s\n", key_path);
-        exit(EXIT_FAILURE);
+        if (fatal_on_error) {
+            cleanup_tui();
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "Error loading private key: %s\n", key_path);
+            exit(EXIT_FAILURE);
+        }
+        SSL_CTX_free(ctx);
+        return NULL;
     }
 
     if (!SSL_CTX_check_private_key(ctx)) {
-        cleanup_tui();
-        fprintf(stderr, "Private key does not match the provided certificate!\n");
-        exit(EXIT_FAILURE);
+        if (fatal_on_error) {
+            cleanup_tui();
+            fprintf(stderr, "Private key does not match the provided certificate!\n");
+            exit(EXIT_FAILURE);
+        }
+        SSL_CTX_free(ctx);
+        return NULL;
     }
 
-    g_global_ssl_ctx = ctx;
     return ctx;
+}
+
+SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
+    g_global_ssl_ctx = create_and_configure_ssl_ctx(cert_path, key_path, true);
+    return g_global_ssl_ctx;
+}
+
+bool reload_ssl_certificates(const char *cert_path, const char *key_path) {
+    SSL_CTX *new_ctx = create_and_configure_ssl_ctx(cert_path, key_path, false);
+    if (!new_ctx) {
+        return false;
+    }
+    SSL_CTX *old_ctx = g_global_ssl_ctx;
+    g_global_ssl_ctx = new_ctx;
+    if (old_ctx) {
+        SSL_CTX_free(old_ctx);
+    }
+    return true;
 }
 #else
 SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
@@ -124,6 +166,12 @@ SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
     cleanup_tui();
     fprintf(stderr, "\033[1;31m[ERROR] Program was compiled without OpenSSL support (-DNO_SSL).\033[0m\n");
     exit(EXIT_FAILURE);
+}
+
+bool reload_ssl_certificates(const char *cert_path, const char *key_path) {
+    (void)cert_path;
+    (void)key_path;
+    return false;
 }
 #endif
 

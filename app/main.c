@@ -24,6 +24,11 @@
 #include "advlb/tui.h"
 #include "advlb/cli.h"
 
+static void handle_sighup(int sig) {
+    (void)sig;
+    g_reload_requested = 1;
+}
+
 int main(int argc, char *argv[]) {
     g_start_time = time(NULL);
     srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
@@ -50,6 +55,13 @@ int main(int argc, char *argv[]) {
     sa_pipe.sa_handler = SIG_IGN;
     sigemptyset(&sa_pipe.sa_mask);
     sigaction(SIGPIPE, &sa_pipe, NULL);
+
+    struct sigaction sa_hup;
+    memset(&sa_hup, 0, sizeof(sa_hup));
+    sa_hup.sa_handler = handle_sighup;
+    sigemptyset(&sa_hup.sa_mask);
+    sa_hup.sa_flags = 0;
+    sigaction(SIGHUP, &sa_hup, NULL);
 
     // Initialize SSL context if requested (TCP only)
     if (g_config.enable_ssl_offloading) {
@@ -148,12 +160,23 @@ int main(int argc, char *argv[]) {
     }
 
     while (g_server_running) {
+        if (g_reload_requested) {
+            g_reload_requested = 0;
+            add_log("\033[1;36m[SYSTEM]\033[0m SIGHUP received: reloading configuration and certificates...");
+            config_reload();
+        }
+
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             if (!g_server_running) break;
+            if (g_reload_requested) {
+                g_reload_requested = 0;
+                add_log("\033[1;36m[SYSTEM]\033[0m SIGHUP received: reloading configuration and certificates...");
+                config_reload();
+            }
             if (errno == EINTR) continue;
             if (errno == ECONNABORTED || errno == EPROTO) continue;
             continue;
