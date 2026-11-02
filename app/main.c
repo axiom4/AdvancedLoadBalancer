@@ -79,17 +79,19 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 
-        int udp_fd = create_udp_server_socket(g_config.listen_port);
-        if (udp_fd < 0) {
+        int workers = g_config.num_workers > 0 ? g_config.num_workers : 1;
+        if (!udp_worker_pool_start(workers, g_config.listen_port)) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to start UDP multi-worker pool on port %d\n", g_config.listen_port);
             exit(EXIT_FAILURE);
         }
-        g_global_server_fd = udp_fd;
 
         if (g_config.enable_tui) {
             init_tui();
-            add_log("\033[1;32m[SYSTEM]\033[0m UDP Load Balancer started in Full-Screen TUI mode on port %d.", g_config.listen_port);
+            add_log("\033[1;32m[SYSTEM]\033[0m UDP Load Balancer started on port %d (%d workers with SO_REUSEPORT).",
+                    g_config.listen_port, workers);
         } else {
-            printf("[SYSTEM] UDP Load Balancer started on port %d (TUI disabled).\n", g_config.listen_port);
+            printf("[SYSTEM] UDP Load Balancer started on port %d (%d workers with SO_REUSEPORT, TUI disabled).\n",
+                   g_config.listen_port, workers);
         }
 
         perform_health_check_cycle(true);
@@ -110,11 +112,20 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        run_udp_proxy_loop(udp_fd);
+        while (g_server_running) {
+            if (g_reload_requested) {
+                g_reload_requested = 0;
+                add_log("\033[1;36m[SYSTEM]\033[0m SIGHUP received: reloading configuration...");
+                config_reload();
+            }
+            struct timespec ts = {0, 100000000L}; // 100ms
+            nanosleep(&ts, NULL);
+        }
+
+        udp_worker_pool_stop();
 
         cleanup_tui();
         printf("\n[SHUTDOWN] UDP Load Balancer shutdown complete.\n");
-        if (g_global_server_fd >= 0) close(g_global_server_fd);
         log_shutdown();
         return 0;
     }

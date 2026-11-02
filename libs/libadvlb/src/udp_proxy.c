@@ -16,8 +16,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-#define MAX_UDP_SESSIONS 2048
-#define UDP_HASH_BUCKETS 1024
+#define MAX_UDP_WORKERS 32
+#define MAX_UDP_SESSIONS_PER_WORKER 2048
+#define UDP_HASH_BUCKETS_PER_WORKER 1024
 #define MAX_UDP_SESSIONS_PER_IP 64
 
 typedef struct UdpSession {
@@ -30,24 +31,37 @@ typedef struct UdpSession {
     struct UdpSession *hash_next;
 } UdpSession;
 
-static UdpSession s_udp_sessions[MAX_UDP_SESSIONS] = {{0}};
-static UdpSession *s_hash_table[UDP_HASH_BUCKETS] = {NULL};
-static pthread_mutex_t s_udp_session_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct UdpWorker {
+    int id;
+    int port;
+    int server_fd;
+    int epfd;
+    pthread_t thread;
+    volatile bool running;
+
+    UdpSession sessions[MAX_UDP_SESSIONS_PER_WORKER];
+    UdpSession *hash_table[UDP_HASH_BUCKETS_PER_WORKER];
+    pthread_mutex_t mutex;
+} UdpWorker;
+
+static UdpWorker s_udp_workers[MAX_UDP_WORKERS];
+static int s_num_udp_workers = 0;
+static volatile bool s_udp_pool_active = false;
 
 static inline uint32_t udp_session_hash(const struct sockaddr_in *addr) {
     uint32_t h = (uint32_t)addr->sin_addr.s_addr ^ ((uint32_t)addr->sin_port * 2654435761u);
-    return h % UDP_HASH_BUCKETS;
+    return h % UDP_HASH_BUCKETS_PER_WORKER;
 }
 
-static void hash_insert(UdpSession *session) {
+static void worker_hash_insert(UdpWorker *w, UdpSession *session) {
     uint32_t h = udp_session_hash(&session->client_addr);
-    session->hash_next = s_hash_table[h];
-    s_hash_table[h] = session;
+    session->hash_next = w->hash_table[h];
+    w->hash_table[h] = session;
 }
 
-static void hash_remove(UdpSession *session) {
+static void worker_hash_remove(UdpWorker *w, UdpSession *session) {
     uint32_t h = udp_session_hash(&session->client_addr);
-    UdpSession **curr = &s_hash_table[h];
+    UdpSession **curr = &w->hash_table[h];
     while (*curr) {
         if (*curr == session) {
             *curr = session->hash_next;
@@ -58,9 +72,9 @@ static void hash_remove(UdpSession *session) {
     }
 }
 
-static UdpSession *hash_find(const struct sockaddr_in *client_addr) {
+static UdpSession *worker_hash_find(UdpWorker *w, const struct sockaddr_in *client_addr) {
     uint32_t h = udp_session_hash(client_addr);
-    UdpSession *curr = s_hash_table[h];
+    UdpSession *curr = w->hash_table[h];
     while (curr) {
         if (curr->in_use &&
             curr->client_addr.sin_addr.s_addr == client_addr->sin_addr.s_addr &&
@@ -72,23 +86,22 @@ static UdpSession *hash_find(const struct sockaddr_in *client_addr) {
     return NULL;
 }
 
-static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in *client_addr) {
-    pthread_mutex_lock(&s_udp_session_mutex);
+static UdpSession *worker_find_or_create_session(UdpWorker *w, const struct sockaddr_in *client_addr) {
+    pthread_mutex_lock(&w->mutex);
     time_t now = time(NULL);
 
-    // Fast O(1) hash table lookup
-    UdpSession *existing = hash_find(client_addr);
+    UdpSession *existing = worker_hash_find(w, client_addr);
     if (existing) {
         if (atomic_load_explicit(&g_backends[existing->backend_idx].is_alive, memory_order_relaxed)) {
             existing->last_activity = now;
-            pthread_mutex_unlock(&s_udp_session_mutex);
+            pthread_mutex_unlock(&w->mutex);
             return existing;
         }
         // Backend went DOWN: remove socket and reassign
-        epoll_ctl(epfd, EPOLL_CTL_DEL, existing->backend_fd, NULL);
+        epoll_ctl(w->epfd, EPOLL_CTL_DEL, existing->backend_fd, NULL);
         close(existing->backend_fd);
         release_backend(existing->backend_idx);
-        hash_remove(existing);
+        worker_hash_remove(w, existing);
         existing->in_use = false;
     }
 
@@ -99,30 +112,27 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
     time_t oldest_expired_time = now + 1;
     int ip_sessions = 0;
 
-    // Single-pass scan: find free slot, count per-IP sessions, and identify LRU candidates
-    for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
-        if (!s_udp_sessions[i].in_use) {
+    for (int i = 0; i < MAX_UDP_SESSIONS_PER_WORKER; i++) {
+        if (!w->sessions[i].in_use) {
             if (free_slot == -1) free_slot = i;
         } else {
-            if (s_udp_sessions[i].client_addr.sin_addr.s_addr == client_addr->sin_addr.s_addr) {
+            if (w->sessions[i].client_addr.sin_addr.s_addr == client_addr->sin_addr.s_addr) {
                 ip_sessions++;
             }
-            // Track absolute oldest for emergency LRU eviction under heavy flood
-            if (s_udp_sessions[i].last_activity < oldest_time) {
-                oldest_time = s_udp_sessions[i].last_activity;
+            if (w->sessions[i].last_activity < oldest_time) {
+                oldest_time = w->sessions[i].last_activity;
                 oldest_slot = i;
             }
-            // Track oldest expired session (idle > timeout)
-            if ((now - s_udp_sessions[i].last_activity) >= g_config.udp_session_timeout_sec) {
-                if (s_udp_sessions[i].last_activity < oldest_expired_time) {
-                    oldest_expired_time = s_udp_sessions[i].last_activity;
+            if ((now - w->sessions[i].last_activity) >= g_config.udp_session_timeout_sec) {
+                if (w->sessions[i].last_activity < oldest_expired_time) {
+                    oldest_expired_time = w->sessions[i].last_activity;
                     expired_slot = i;
                 }
             }
         }
     }
 
-    // 1. Enforce per-IP concurrent session limit (mitigates IP-spoofing / state exhaustion DoS)
+    // 1. Enforce per-IP concurrent session limit
     if (ip_sessions >= MAX_UDP_SESSIONS_PER_IP) {
         static time_t last_ip_drop = 0;
         if (now - last_ip_drop >= 2) {
@@ -132,49 +142,36 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
                     c_ip, MAX_UDP_SESSIONS_PER_IP);
             last_ip_drop = now;
         }
-        pthread_mutex_unlock(&s_udp_session_mutex);
+        pthread_mutex_unlock(&w->mutex);
         return NULL;
     }
 
-    // 2. Select slot to use: free slot, oldest expired slot, or emergency LRU eviction
+    // 2. Select slot to use
     int slot_to_use = free_slot;
     if (slot_to_use == -1 && expired_slot != -1) {
         slot_to_use = expired_slot;
     } else if (slot_to_use == -1 && oldest_slot != -1) {
         slot_to_use = oldest_slot;
-        static time_t last_evict = 0;
-        if (now - last_evict >= 2) {
-            add_log("\033[1;33m[UDP EVICT]\033[0m Table saturated (%d sessions): evicting LRU idle session",
-                    MAX_UDP_SESSIONS);
-            last_evict = now;
-        }
     }
 
     if (slot_to_use == -1) {
-        static time_t last_drop = 0;
-        if (now - last_drop >= 2) {
-            add_log("\033[1;31m[UDP DROP]\033[0m UDP session table full (max %d)", MAX_UDP_SESSIONS);
-            last_drop = now;
-        }
-        pthread_mutex_unlock(&s_udp_session_mutex);
+        pthread_mutex_unlock(&w->mutex);
         return NULL;
     }
 
-    // If recycling an in-use slot (expired or LRU evicted), cleanly close prior resources
-    if (s_udp_sessions[slot_to_use].in_use) {
-        epoll_ctl(epfd, EPOLL_CTL_DEL, s_udp_sessions[slot_to_use].backend_fd, NULL);
-        close(s_udp_sessions[slot_to_use].backend_fd);
-        release_backend(s_udp_sessions[slot_to_use].backend_idx);
-        hash_remove(&s_udp_sessions[slot_to_use]);
-        s_udp_sessions[slot_to_use].in_use = false;
+    if (w->sessions[slot_to_use].in_use) {
+        epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->sessions[slot_to_use].backend_fd, NULL);
+        close(w->sessions[slot_to_use].backend_fd);
+        release_backend(w->sessions[slot_to_use].backend_idx);
+        worker_hash_remove(w, &w->sessions[slot_to_use]);
+        w->sessions[slot_to_use].in_use = false;
     }
 
     free_slot = slot_to_use;
 
     int backend_idx = get_healthy_backend(client_addr);
     if (backend_idx < 0) {
-        pthread_mutex_unlock(&s_udp_session_mutex);
-        add_log("\033[1;31m[UDP DROP]\033[0m No healthy UDP backend available");
+        pthread_mutex_unlock(&w->mutex);
         return NULL;
     }
 
@@ -191,7 +188,7 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
     int bfd = socket(is_v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
     if (bfd < 0) {
         release_backend(backend_idx);
-        pthread_mutex_unlock(&s_udp_session_mutex);
+        pthread_mutex_unlock(&w->mutex);
         return NULL;
     }
     set_nonblocking(bfd);
@@ -216,80 +213,62 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
     if (cr < 0) {
         close(bfd);
         release_backend(backend_idx);
-        pthread_mutex_unlock(&s_udp_session_mutex);
+        pthread_mutex_unlock(&w->mutex);
         return NULL;
     }
 
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLERR;
     ev.data.fd = free_slot;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, bfd, &ev) < 0) {
+    if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, bfd, &ev) < 0) {
         close(bfd);
         release_backend(backend_idx);
-        pthread_mutex_unlock(&s_udp_session_mutex);
+        pthread_mutex_unlock(&w->mutex);
         return NULL;
     }
 
-    s_udp_sessions[free_slot].in_use = true;
-    s_udp_sessions[free_slot].slot_id = free_slot;
-    s_udp_sessions[free_slot].client_addr = *client_addr;
-    s_udp_sessions[free_slot].backend_idx = backend_idx;
-    s_udp_sessions[free_slot].backend_fd = bfd;
-    s_udp_sessions[free_slot].last_activity = now;
-    hash_insert(&s_udp_sessions[free_slot]);
+    w->sessions[free_slot].in_use = true;
+    w->sessions[free_slot].slot_id = free_slot;
+    w->sessions[free_slot].client_addr = *client_addr;
+    w->sessions[free_slot].backend_idx = backend_idx;
+    w->sessions[free_slot].backend_fd = bfd;
+    w->sessions[free_slot].last_activity = now;
+    worker_hash_insert(w, &w->sessions[free_slot]);
 
     char c_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr->sin_addr), c_ip, sizeof(c_ip));
-    add_log("\033[1;36m[UDP FLOW]\033[0m Client %s:%d -> Backend [%d] %s:%d",
-            c_ip, ntohs(client_addr->sin_port), backend_idx, b_ip, b_port);
+    add_log("\033[1;36m[UDP FLOW]\033[0m Client %s:%d -> Backend [%d] %s:%d (Worker %d)",
+            c_ip, ntohs(client_addr->sin_port), backend_idx, b_ip, b_port, w->id);
 
-    UdpSession *ret = &s_udp_sessions[free_slot];
-    pthread_mutex_unlock(&s_udp_session_mutex);
+    UdpSession *ret = &w->sessions[free_slot];
+    pthread_mutex_unlock(&w->mutex);
     return ret;
 }
 
-static void cleanup_expired_udp_sessions(int epfd) {
-    pthread_mutex_lock(&s_udp_session_mutex);
+static void worker_cleanup_expired_sessions(UdpWorker *w) {
+    pthread_mutex_lock(&w->mutex);
     time_t now = time(NULL);
-    for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
-        if (s_udp_sessions[i].in_use && (now - s_udp_sessions[i].last_activity) >= g_config.udp_session_timeout_sec) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, s_udp_sessions[i].backend_fd, NULL);
-            close(s_udp_sessions[i].backend_fd);
-            release_backend(s_udp_sessions[i].backend_idx);
-            hash_remove(&s_udp_sessions[i]);
-            s_udp_sessions[i].in_use = false;
-
-            char c_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &(s_udp_sessions[i].client_addr.sin_addr), c_ip, sizeof(c_ip));
-            add_log("\033[1;30m[UDP DISC]\033[0m UDP session expired for %s:%d (idle for %ds)",
-                    c_ip, ntohs(s_udp_sessions[i].client_addr.sin_port), g_config.udp_session_timeout_sec);
+    for (int i = 0; i < MAX_UDP_SESSIONS_PER_WORKER; i++) {
+        if (w->sessions[i].in_use && (now - w->sessions[i].last_activity) >= g_config.udp_session_timeout_sec) {
+            epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->sessions[i].backend_fd, NULL);
+            close(w->sessions[i].backend_fd);
+            release_backend(w->sessions[i].backend_idx);
+            worker_hash_remove(w, &w->sessions[i]);
+            w->sessions[i].in_use = false;
         }
     }
-    pthread_mutex_unlock(&s_udp_session_mutex);
+    pthread_mutex_unlock(&w->mutex);
 }
 
-void run_udp_proxy_loop(int master_udp_fd) {
-    int epfd = epoll_create1(0);
-    if (epfd < 0) {
-        perror("epoll_create1 UDP");
-        return;
-    }
-
-    struct epoll_event ev_master;
-    ev_master.events = EPOLLIN | EPOLLERR;
-    ev_master.data.fd = -1;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, master_udp_fd, &ev_master) < 0) {
-        perror("epoll_ctl master_udp_fd");
-        close(epfd);
-        return;
-    }
+static void *udp_worker_thread_func(void *arg) {
+    UdpWorker *w = (UdpWorker *)arg;
 
     char buffer[65536];
     struct epoll_event events[64];
     time_t last_cleanup = time(NULL);
 
-    while (g_server_running) {
-        int nfds = epoll_wait(epfd, events, 64, 1000);
+    while (w->running && g_server_running) {
+        int nfds = epoll_wait(w->epfd, events, 64, 1000);
         time_t now = time(NULL);
 
         if (g_reload_requested) {
@@ -299,13 +278,13 @@ void run_udp_proxy_loop(int master_udp_fd) {
         }
 
         if (now - last_cleanup >= 2) {
-            cleanup_expired_udp_sessions(epfd);
+            worker_cleanup_expired_sessions(w);
             last_cleanup = now;
         }
 
         if (nfds < 0) {
             if (errno == EINTR) {
-                if (!g_server_running) break;
+                if (!g_server_running || !w->running) break;
                 continue;
             }
             break;
@@ -313,10 +292,11 @@ void run_udp_proxy_loop(int master_udp_fd) {
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == -1) {
+                // Incoming client datagram on worker server_fd
                 while (1) {
                     struct sockaddr_in client_addr;
                     socklen_t client_len = sizeof(client_addr);
-                    ssize_t bytes = recvfrom(master_udp_fd, buffer, sizeof(buffer), 0,
+                    ssize_t bytes = recvfrom(w->server_fd, buffer, sizeof(buffer), 0,
                                              (struct sockaddr *)&client_addr, &client_len);
                     if (bytes < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
@@ -324,16 +304,17 @@ void run_udp_proxy_loop(int master_udp_fd) {
                     }
                     if (bytes == 0) break;
 
-                    UdpSession *session = find_or_create_udp_session(epfd, &client_addr);
+                    UdpSession *session = worker_find_or_create_session(w, &client_addr);
                     if (session) {
                         send(session->backend_fd, buffer, (size_t)bytes, 0);
                     }
                 }
             } else {
+                // Response datagram from backend
                 int slot = events[i].data.fd;
-                pthread_mutex_lock(&s_udp_session_mutex);
-                if (slot >= 0 && slot < MAX_UDP_SESSIONS && s_udp_sessions[slot].in_use) {
-                    UdpSession *session = &s_udp_sessions[slot];
+                pthread_mutex_lock(&w->mutex);
+                if (slot >= 0 && slot < MAX_UDP_SESSIONS_PER_WORKER && w->sessions[slot].in_use) {
+                    UdpSession *session = &w->sessions[slot];
                     while (1) {
                         ssize_t bytes = read(session->backend_fd, buffer, sizeof(buffer));
                         if (bytes < 0) {
@@ -343,26 +324,121 @@ void run_udp_proxy_loop(int master_udp_fd) {
                         if (bytes == 0) break;
 
                         session->last_activity = now;
-                        sendto(master_udp_fd, buffer, (size_t)bytes, 0,
+                        sendto(w->server_fd, buffer, (size_t)bytes, 0,
                                (struct sockaddr *)&(session->client_addr), sizeof(session->client_addr));
                     }
                 }
-                pthread_mutex_unlock(&s_udp_session_mutex);
+                pthread_mutex_unlock(&w->mutex);
             }
         }
     }
 
-    pthread_mutex_lock(&s_udp_session_mutex);
-    for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
-        if (s_udp_sessions[i].in_use) {
-            close(s_udp_sessions[i].backend_fd);
-            release_backend(s_udp_sessions[i].backend_idx);
-            s_udp_sessions[i].in_use = false;
+    // Cleanup worker sessions on thread exit
+    pthread_mutex_lock(&w->mutex);
+    for (int i = 0; i < MAX_UDP_SESSIONS_PER_WORKER; i++) {
+        if (w->sessions[i].in_use) {
+            close(w->sessions[i].backend_fd);
+            release_backend(w->sessions[i].backend_idx);
+            w->sessions[i].in_use = false;
         }
     }
-    memset(s_hash_table, 0, sizeof(s_hash_table));
-    pthread_mutex_unlock(&s_udp_session_mutex);
+    memset(w->hash_table, 0, sizeof(w->hash_table));
+    pthread_mutex_unlock(&w->mutex);
 
-    close(epfd);
+    return NULL;
 }
 
+bool udp_worker_pool_start(int num_workers, int port) {
+    if (num_workers <= 0) num_workers = 1;
+    if (num_workers > MAX_UDP_WORKERS) num_workers = MAX_UDP_WORKERS;
+
+    s_num_udp_workers = num_workers;
+
+    for (int i = 0; i < num_workers; i++) {
+        UdpWorker *w = &s_udp_workers[i];
+        memset(w, 0, sizeof(UdpWorker));
+        w->id = i;
+        w->port = port;
+        pthread_mutex_init(&w->mutex, NULL);
+
+        // Bind with SO_REUSEPORT
+        w->server_fd = create_udp_server_socket(port);
+        if (w->server_fd < 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to bind SO_REUSEPORT UDP socket for worker %d on port %d\n", i, port);
+            udp_worker_pool_stop();
+            return false;
+        }
+
+        w->epfd = epoll_create1(0);
+        if (w->epfd < 0) {
+            close(w->server_fd);
+            udp_worker_pool_stop();
+            return false;
+        }
+
+        struct epoll_event ev_server;
+        ev_server.events = EPOLLIN | EPOLLERR;
+        ev_server.data.fd = -1; // -1 represents the listening worker server_fd
+        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->server_fd, &ev_server) < 0) {
+            close(w->server_fd);
+            close(w->epfd);
+            udp_worker_pool_stop();
+            return false;
+        }
+
+        w->running = true;
+        if (pthread_create(&w->thread, NULL, udp_worker_thread_func, w) != 0) {
+            w->running = false;
+            close(w->server_fd);
+            close(w->epfd);
+            udp_worker_pool_stop();
+            return false;
+        }
+    }
+
+    s_udp_pool_active = true;
+    return true;
+}
+
+void udp_worker_pool_stop(void) {
+    if (!s_udp_pool_active) return;
+    s_udp_pool_active = false;
+
+    for (int i = 0; i < s_num_udp_workers; i++) {
+        UdpWorker *w = &s_udp_workers[i];
+        w->running = false;
+        if (w->server_fd >= 0) {
+            close(w->server_fd);
+            w->server_fd = -1;
+        }
+        pthread_join(w->thread, NULL);
+        if (w->epfd >= 0) {
+            close(w->epfd);
+            w->epfd = -1;
+        }
+        pthread_mutex_destroy(&w->mutex);
+    }
+    s_num_udp_workers = 0;
+}
+
+void run_udp_proxy_loop(int master_udp_fd) {
+    // Backwards compatible single-thread fallback
+    UdpWorker w;
+    memset(&w, 0, sizeof(UdpWorker));
+    w.id = 0;
+    w.server_fd = master_udp_fd;
+    pthread_mutex_init(&w.mutex, NULL);
+    w.epfd = epoll_create1(0);
+    if (w.epfd < 0) return;
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLERR;
+    ev.data.fd = -1;
+    epoll_ctl(w.epfd, EPOLL_CTL_ADD, master_udp_fd, &ev);
+
+    w.running = true;
+    udp_worker_thread_func(&w);
+
+    close(w.epfd);
+    pthread_mutex_destroy(&w.mutex);
+}
