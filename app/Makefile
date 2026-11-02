@@ -32,14 +32,16 @@ TARGET = $(BIN_DIR)/advanced_load_balancer
 
 all: static
 
+static: $(TARGET)
+
 $(OBJ): $(SRC)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Default static link
-static: $(OBJ)
+# Default static link target
+$(TARGET): $(OBJ) $(LB_LIB_DIR)/libadvlb.a $(NET_LIB_DIR)/libadvnet.a
 	$(CC) $(CFLAGS) $(OBJ) $(LB_LIB_DIR)/libadvlb.a $(NET_LIB_DIR)/libadvnet.a -o $(TARGET) $(LDFLAGS) $(LDLIBS)
 
-# Dynamic link
+# Dynamic link target
 dynamic: $(OBJ)
 	$(CC) $(CFLAGS) $(OBJ) -L$(LB_LIB_DIR) -L$(NET_LIB_DIR) -ladvlb -ladvnet $(RPATH_BIN) -o $(TARGET) $(LDFLAGS) $(LDLIBS)
 
