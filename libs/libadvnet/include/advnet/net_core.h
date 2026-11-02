@@ -10,6 +10,7 @@ extern "C" {
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#define ADVNET_LISTEN_BACKLOG 4096
 #if !defined(SOMAXCONN) || (SOMAXCONN < 4096)
 #undef SOMAXCONN
 #define SOMAXCONN 4096

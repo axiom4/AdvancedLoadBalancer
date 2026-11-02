@@ -6,6 +6,11 @@
 #include <stdbool.h>
 #include <netinet/in.h>
 
+#if !defined(SOMAXCONN) || (SOMAXCONN < 4096)
+#undef SOMAXCONN
+#define SOMAXCONN 4096
+#endif
+
 int set_nonblocking(int fd);
 ssize_t write_all(int fd, const char *buf, size_t len);
 ssize_t read_retry(int fd, char *buf, size_t len);

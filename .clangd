@@ -1,0 +1,9 @@
+CompileFlags:
+  Add:
+    - -Iinclude
+    - -Ilibs/libadvlb/include
+    - -Ilibs/libadvnet/include
+    - -Wall
+    - -Wextra
+    - -std=gnu11
+
