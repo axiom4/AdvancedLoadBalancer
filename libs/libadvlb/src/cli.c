@@ -36,6 +36,7 @@ void print_help(const char *prog_name) {
     printf("      --udp-timeout SEC     UDP session inactivity timeout in seconds (default: 30)\n\n");
     printf("Health Check Options:\n");
     printf("      --hc-type TYPE        Health check type: tcp (default), http, payload\n");
+    printf("                            (Note: for UDP-only services, configure --hc-type payload or http)\n");
     printf("      --http-hc             Enable HTTP L7 health check (alias for --hc-type http)\n");
     printf("      --hc-path PATH        HTTP probe path (default: /)\n");
     printf("      --hc-send STR         Payload string sent for probe (default: PING\\r\\n)\n");

@@ -18,7 +18,7 @@
 
 const char *health_check_name(HealthCheckType type) {
     switch (type) {
-        case HC_TYPE_TCP:     return g_config.enable_udp_mode ? "UDP (L4)" : "TCP (L4)";
+        case HC_TYPE_TCP:     return "TCP (L4)";
         case HC_TYPE_HTTP:    return "HTTP (L7)";
         case HC_TYPE_PAYLOAD: return g_config.enable_udp_mode ? "UDP Payload" : "Payload";
         default:              return "Unknown";
@@ -96,7 +96,7 @@ void perform_health_check_cycle(bool is_startup) {
         port = g_backends[i].port;
         pthread_mutex_unlock(&g_backend_mutex);
 
-        int sock_type = (g_config.enable_udp_mode && g_config.current_hc_type != HC_TYPE_HTTP) ? SOCK_DGRAM : SOCK_STREAM;
+        int sock_type = (g_config.enable_udp_mode && g_config.current_hc_type == HC_TYPE_PAYLOAD) ? SOCK_DGRAM : SOCK_STREAM;
         int sfd = socket(AF_INET, sock_type, 0);
         if (sfd < 0) continue;
 
