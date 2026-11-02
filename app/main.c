@@ -114,11 +114,11 @@ int main(int argc, char *argv[]) {
 
     if (g_config.enable_tui) {
         init_tui();
-        add_log("\033[1;32m[SYSTEM]\033[0m Load Balancer started in Full-Screen TUI mode on port %d (max-conns: %d).",
-                g_config.listen_port, g_config.max_connections);
+        add_log("\033[1;32m[SYSTEM]\033[0m Load Balancer started in Full-Screen TUI mode on port %d (workers: %d, max-conns: %d).",
+                g_config.listen_port, g_config.num_workers, g_config.max_connections);
     } else {
-        printf("[SYSTEM] Load Balancer started on port %d (max-conns: %d, TUI disabled).\n",
-               g_config.listen_port, g_config.max_connections);
+        printf("[SYSTEM] Load Balancer started on port %d (workers: %d, max-conns: %d, TUI disabled).\n",
+               g_config.listen_port, g_config.num_workers, g_config.max_connections);
     }
 
     perform_health_check_cycle(true);
@@ -139,12 +139,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Configure thread attributes with compact stack size (512KB) for optimized scalability
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    size_t stack_size = 512 * 1024;
-    pthread_attr_setstacksize(&attr, stack_size);
+    // Initialize epoll worker pool
+    if (!worker_pool_init(g_config.num_workers)) {
+        fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to initialize worker pool (%d workers)\n", g_config.num_workers);
+        exit(EXIT_FAILURE);
+    }
 
     while (g_server_running) {
         struct sockaddr_in client_addr;
@@ -171,25 +170,11 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        ClientContext *ctx = malloc(sizeof(ClientContext));
-        if (!ctx) {
-            close(client_fd);
-            continue;
-        }
-        ctx->client_fd = client_fd;
-        ctx->client_addr = client_addr;
-
         atomic_fetch_add_explicit(&g_active_clients, 1, memory_order_relaxed);
-
-        pthread_t client_tid;
-        if (pthread_create(&client_tid, &attr, client_handler_thread, ctx) != 0) {
-            atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
-            close(client_fd);
-            free(ctx);
-        }
+        worker_pool_dispatch(client_fd, &client_addr);
     }
 
-    pthread_attr_destroy(&attr);
+    worker_pool_shutdown();
 
     cleanup_tui();
     printf("\n[SHUTDOWN] Load Balancer shutdown complete.\n");

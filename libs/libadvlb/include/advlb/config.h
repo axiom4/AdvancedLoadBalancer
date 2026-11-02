@@ -9,6 +9,8 @@
 typedef struct {
     int listen_port;
     int max_connections;
+    int num_workers;
+    int inactivity_timeout_sec;
     bool enable_transparent_mode;
     bool enable_ssl_offloading;
     bool enable_proxy_protocol_v1;

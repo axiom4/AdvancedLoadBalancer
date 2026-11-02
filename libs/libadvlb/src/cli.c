@@ -54,6 +54,8 @@ void print_help(const char *prog_name) {
     printf("      --key FILE            SSL RSA private key file (required with --ssl)\n\n");
     printf("Other Options:\n");
     printf("  -m, --max-connections NUM Maximum concurrent connections limit (default: 4096)\n");
+    printf("  -w, --workers NUM         Number of epoll worker threads (default: CPU cores)\n");
+    printf("      --timeout SEC         TCP connection inactivity timeout in seconds (default: 30)\n");
     printf("  -t, --transparent         Enable IP transparency (requires root/CAP_NET_ADMIN privileges)\n");
     printf("      --no-tui              Disable full-screen TUI dashboard (plain logs on stdout)\n");
     printf("  -h, --help                Show this help message and exit\n\n");
@@ -210,6 +212,8 @@ int parse_cli_args(int argc, char *argv[]) {
         {"udp-timeout", required_argument, 0, 1019},
         {"max-connections", required_argument, 0, 'm'},
         {"max-conns",   required_argument, 0, 'm'},
+        {"workers",     required_argument, 0, 'w'},
+        {"timeout",     required_argument, 0, 1020},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -217,8 +221,20 @@ int parse_cli_args(int argc, char *argv[]) {
     int c;
     int option_index = 0;
 
-    while ((c = getopt_long(argc, argv, "p:b:sthPum:", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:b:sthPum:w:", long_options, &option_index)) != -1) {
         switch (c) {
+            case 'w':
+                g_config.num_workers = atoi(optarg);
+                if (g_config.num_workers <= 0) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid value for --workers: '%s' (must be > 0)\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                if (g_config.num_workers > 64) g_config.num_workers = 64;
+                break;
+            case 1020: // --timeout
+                g_config.inactivity_timeout_sec = atoi(optarg);
+                if (g_config.inactivity_timeout_sec <= 0) g_config.inactivity_timeout_sec = 30;
+                break;
             case 'm':
                 g_config.max_connections = atoi(optarg);
                 if (g_config.max_connections <= 0) {
