@@ -26,6 +26,10 @@ void conn_pool_init(void) {
     pthread_mutex_unlock(&s_pool_init_lock);
 }
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 // Checks if a socket is still alive, open, and has no stale pending data
 static bool is_socket_healthy(int fd) {
     if (fd < 0) return false;
@@ -34,6 +38,13 @@ static bool is_socket_healthy(int fd) {
     socklen_t len = sizeof(so_error);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
         return false;
+    }
+
+    // Verify socket is not half-closed for writing (EPIPE guard)
+    if (send(fd, "", 0, MSG_DONTWAIT | MSG_NOSIGNAL) < 0) {
+        if (errno == EPIPE || errno == ENOTCONN || errno == ECONNRESET) {
+            return false;
+        }
     }
 
     char peek_buf[1];

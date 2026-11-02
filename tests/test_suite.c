@@ -572,6 +572,17 @@ static void test_upstream_connection_pooling(void) {
     TEST_ASSERT(conn_pool_get_backend_idle(1) == 0, "conn_pool_purge_backend successfully cleared all sockets for backend [1]");
     close(sv2[1]);
 
+    // 11d. Half-closed socket rejection (SHUT_WR protection)
+    int sv3[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv3) == 0, "Created third socketpair for half-closed test");
+    set_nonblocking(sv3[0]);
+    set_nonblocking(sv3[1]);
+    shutdown(sv3[0], SHUT_WR);
+    bool shut_released = conn_pool_release(0, sv3[0]);
+    TEST_ASSERT(shut_released == false, "conn_pool_release safely rejects half-closed socket (SHUT_WR)");
+    TEST_ASSERT(conn_pool_get_backend_idle(0) == 0, "Pool remains clean with 0 sockets after rejection");
+    close(sv3[1]);
+
     conn_pool_destroy();
 }
 
@@ -625,6 +636,71 @@ static void test_worker_pool_lifecycle(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test Suite 14: Concurrent SWRR Stress Test (Lock-Free)                     */
+/* -------------------------------------------------------------------------- */
+typedef struct {
+    int thread_id;
+    int selections;
+    atomic_int *counts;
+} SwrrStressArg;
+
+static void *swrr_stress_worker(void *arg) {
+    SwrrStressArg *a = (SwrrStressArg *)arg;
+    struct sockaddr_storage dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.ss_family = AF_INET;
+
+    for (int i = 0; i < a->selections; i++) {
+        int b = get_healthy_backend(&dummy);
+        if (b >= 0 && b < 3) {
+            atomic_fetch_add_explicit(&a->counts[b], 1, memory_order_relaxed);
+            release_backend(b);
+        }
+    }
+    return NULL;
+}
+
+static void test_swrr_concurrent_stress(void) {
+    printf("\n=== Running Test Suite: Concurrent SWRR Stress Test (Lock-Free) ===\n");
+    reset_test_backends(3);
+    g_backends[0].weight = 5;
+    g_backends[1].weight = 3;
+    g_backends[2].weight = 2;
+    balancer_rebuild_wrr_schedule();
+    g_config.current_algorithm = ALG_WEIGHTED_RR;
+
+    atomic_int counts[3];
+    atomic_init(&counts[0], 0);
+    atomic_init(&counts[1], 0);
+    atomic_init(&counts[2], 0);
+
+    const int num_threads = 8;
+    const int per_thread = 12500; // total 100,000 selections
+    pthread_t th[8];
+    SwrrStressArg args[8];
+
+    for (int i = 0; i < num_threads; i++) {
+        args[i].thread_id = i;
+        args[i].selections = per_thread;
+        args[i].counts = counts;
+        pthread_create(&th[i], NULL, swrr_stress_worker, &args[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(th[i], NULL);
+    }
+
+    int c0 = atomic_load(&counts[0]);
+    int c1 = atomic_load(&counts[1]);
+    int c2 = atomic_load(&counts[2]);
+    int total = c0 + c1 + c2;
+
+    TEST_ASSERT(total == 100000, "100,000 concurrent lock-free selections completed without drop");
+    TEST_ASSERT(c0 == 50000 && c1 == 30000 && c2 == 20000,
+                "Concurrent SWRR preserved exact 5:3:2 proportionality under race conditions (50k/30k/20k)");
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main Test Runner                                                           */
 /* -------------------------------------------------------------------------- */
 int main(void) {
@@ -649,6 +725,7 @@ int main(void) {
     test_upstream_connection_pooling();
     test_udp_multi_worker_reuseport();
     test_worker_pool_lifecycle();
+    test_swrr_concurrent_stress();
 
     printf("\n====================================================================\n");
     printf("TEST RESULTS: %d Run | \033[1;32m%d Passed\033[0m | \033[1;%sm%d Failed\033[0m\n",
