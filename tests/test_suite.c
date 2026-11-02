@@ -506,17 +506,24 @@ static void test_sighup_and_hot_reload(void) {
 
     // 10b. TLS Certificate Hot Swap
 #ifndef NO_SSL
-    if (access("certs/server.crt", R_OK) == 0 && access("certs/server.key", R_OK) == 0) {
-        SSL_CTX *ctx = init_ssl_context("certs/server.crt", "certs/server.key");
+    const char *cert_path = "certs/server.crt";
+    const char *key_path = "certs/server.key";
+    if (access(cert_path, R_OK) != 0 && access("../certs/server.crt", R_OK) == 0) {
+        cert_path = "../certs/server.crt";
+        key_path = "../certs/server.key";
+    }
+
+    if (access(cert_path, R_OK) == 0 && access(key_path, R_OK) == 0) {
+        SSL_CTX *ctx = init_ssl_context(cert_path, key_path);
         TEST_ASSERT(ctx != NULL, "init_ssl_context initialized valid TLS context");
         TEST_ASSERT(g_global_ssl_ctx == ctx, "g_global_ssl_ctx points to initialized context");
 
-        bool cert_reload_ok = reload_ssl_certificates("certs/server.crt", "certs/server.key");
+        bool cert_reload_ok = reload_ssl_certificates(cert_path, key_path);
         TEST_ASSERT(cert_reload_ok == true, "reload_ssl_certificates succeeded with valid certificate and key");
         TEST_ASSERT(g_global_ssl_ctx != NULL, "g_global_ssl_ctx points to newly swapped SSL context");
 
         // Attempt reload with invalid path (must fail gracefully without breaking existing context)
-        bool invalid_reload = reload_ssl_certificates("certs/non_existent.crt", "certs/server.key");
+        bool invalid_reload = reload_ssl_certificates("certs/non_existent.crt", key_path);
         TEST_ASSERT(invalid_reload == false, "reload_ssl_certificates gracefully rejected invalid certificate path");
         TEST_ASSERT(g_global_ssl_ctx != NULL, "Existing active SSL context retained intact after failed reload");
 

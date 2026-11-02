@@ -4,8 +4,8 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg)](#system-requirements)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Epoll%20%2F%20Kqueue%20Worker%20Pool-orange.svg)](#system-architecture)
-[![Concurrency](https://img.shields.io/badge/Concurrency-Lock--Free%20MPSC-brightgreen.svg)](#load-balancing-algorithms)
-[![Tests](https://img.shields.io/badge/Tests-60%20Passed-success.svg)](#automated-test-suite-make-test)
+[![Concurrency](https://img.shields.io/badge/Concurrency-Lock--Free%20MPSC%20%26%20SWRR-brightgreen.svg)](#load-balancing-algorithms)
+[![Tests](https://img.shields.io/badge/Tests-107%20Passed-success.svg)](#automated-test-suite-make-test)
 
 **Advanced Load Balancer (ADLB)** is a high-performance, low-latency network load balancer for **Layer 4 (TCP / UDP)** and **Layer 7 (HTTP / HTTPS)** traffic, engineered in modern **C11** with a modular library architecture, non-blocking **epoll / kqueue** worker pools, **lock-free** backend routing, and constant-memory asynchronous logging.
 
@@ -67,8 +67,15 @@ ADLB is designed around a modular architecture that cleanly separates network I/
 ## Key Features
 
 - **Epoll / Kqueue Worker Thread Pool**: Replaces legacy blocking "thread-per-connection" designs with $N$ independent event loops matching CPU cores. Each worker maintains an $O(1)$ socket-to-connection table and bidirectional streaming ring buffers with automatic backpressure.
-- **100% Non-Blocking Asynchronous Backend Connect**: Eliminates worker thread stalls. Upstream connections are initiated non-blockingly via `EINPROGRESS` and monitored through epoll/kqueue for `EPOLLOUT`. Ingress client payloads are buffered in pipelined buffers and immediately forwarded upon socket establishment.
-- **Lock-Free Routing Algorithms**: Algorithms such as Round-Robin, Least-Connections, IP-Hash, Least-Latency, and Random-2 select backends and update active metric counters without acquiring any global mutexes, relying strictly on C11 atomic operations (`atomic_fetch_add_explicit`).
+- **Kernel-Level Multi-Accept via `SO_REUSEPORT`**: Worker threads bind and listen on identical TCP and UDP ports simultaneously using `SO_REUSEPORT`. The Linux/macOS kernel hashes incoming 4-tuples directly to worker CPU cores, eliminating single-thread accept bottlenecks and pipe IPC overhead.
+- **Upstream TCP Keep-Alive Connection Pooling**: Maintains an idle pool of pre-established, validated TCP sockets to real servers. Reusing hot sockets eliminates three-way handshake RTT latency and prevents local ephemeral port exhaustion (`TIME_WAIT`). Includes proactive write-channel health probes against half-closed (`SHUT_WR`) sockets.
+- **Lock-Free Smooth Weighted Round-Robin (SWRR)**: Precomputes an interleaved schedule using GCD reduction. Worker threads select weighted backends in $O(1)$ lock-free time via atomic sequence increments (`atomic_fetch_add_explicit`), delivering over 100,000 req/s under high multicore contention without mutex contention.
+- **Zero-Copy Circular Ring-Buffer (`StreamBuffer`)**: Monotonic 64-bit pointers with power-of-two bitmask indexing (`& (BUFFER_SIZE - 1)`) completely eliminate `memmove()` memory-shifting overhead during high-volume proxy streaming.
+- **Worker-Local Slab Allocator / Object Pool**: Pre-allocates `ProxyConnection` slab structures per worker thread, eliminating runtime `malloc()` / `free()` heap fragmentation and glibc/jemalloc allocator locks.
+- **100% Non-Blocking Asynchronous Backend Connect**: Eliminates worker thread stalls. Upstream connections are initiated non-blockingly via `EINPROGRESS` and monitored through epoll/kqueue for `EPOLLOUT`. Ingress client payloads are buffered in pipelined ring buffers and immediately forwarded upon socket establishment.
+- **Slowloris-Proof Non-Blocking PROXY Protocol v1**: Event-driven `CONN_STATE_PROXY_PROTOCOL` state machine decodes incoming HAProxy v1 headers via non-blocking stream inspection (`MSG_PEEK`), completely immune to Slowloris attacks.
+- **Dual-Stack IPv6 Support**: Native `struct sockaddr_storage` architecture supporting standard IPv4, bracketed IPv6 notation (e.g. `[::1]:9001:3`), and FNV-1a 128-bit client hashing for sticky sessions.
+- **Zero-Downtime Hot Reload via `SIGHUP`**: Reloads configuration files (`advlb.conf`) and performs atomic TLS certificate hot-swapping (`reload_ssl_certificates()`) without dropping existing streaming connections.
 - **Lock-Free MPSC Async Logging**: `add_log()` formats messages and enqueues them into a 4096-slot lock-free multi-producer single-consumer ring buffer in nanoseconds. A dedicated background worker thread flushes logs to standard output or the TUI buffer without adding latency to network workers.
 - **Modern SSL/TLS Offloading**: High-throughput TLS termination via OpenSSL supporting modern ciphersuites (TLS 1.2 / TLS 1.3), non-blocking asynchronous handshakes, and side-channel attack protection.
 - **PROXY Protocol v1 Support (RFC-Compliant)**:
@@ -372,15 +379,20 @@ Run the complete test suite with zero external dependencies:
 make test
 ```
 
-### Test Coverage Highlights (60 Automated Tests):
-- **PROXY Protocol v1**: Serialization and stream decoding verification using UNIX `socketpair()` across fragmented payloads.
-- **IPv4 & IPv6 RFC Validation**: Bounds and syntax checking for valid and malformed IPv4 and IPv6 addresses.
-- **Dual-Stack & Bracketed IPv6**: Verification of bracketed IPv6 backend notation (`[::1]:9005:3`) and address normalization.
-- **Configuration File Parser (`advlb.conf`)**: Parsing network, SSL, health check, workers, and upstream servers from disk.
-- **Algorithm Verification**: Cycle correctness for Round-Robin, load balancing under variable active connections for Least-Connections, deterministic affinity for IP-Hash, and sampling under Random-2.
-- **Circuit Breaker Transitions**: Threshold trips (`UP -> DOWN`), routing bypass around dead backends, and restoration on successful probe.
-- **Underflow Protection**: Clamping guards preventing negative active connection counters on over-release.
-- **MPSC Logger Stress**: High-contention concurrency validation (800 writes across 8 concurrent pthreads without race conditions or memory corruption).
+### Test Coverage Highlights (107 Automated Tests across 14 Suites):
+- **PROXY Protocol v1 Serialization & Parsing**: HAProxy v1 specification compliance, stream preservation, and fragmented TCP4/TCP6 header parsing.
+- **Slowloris DoS Immunity**: Non-blocking `CONN_STATE_PROXY_PROTOCOL` incremental stream inspection using `MSG_PEEK | MSG_DONTWAIT` with zero worker thread stalls.
+- **IPv4 & IPv6 RFC Validation**: Dual-stack validation, bracketed IPv6 notation (`[::1]:9005:3`), link-local address handling, and boundary checks.
+- **Load Balancing Algorithms**: Deterministic round-robin rotation, least-connections active load steering, 128-bit IPv6 FNV-1a sticky IP-hash affinity, and power-of-two random selection.
+- **Circuit Breaker State Machine**: Trip threshold enforcement (`UP -> DOWN`), traffic bypass around dead servers, and instant restoration upon probe recovery.
+- **Active Connections Underflow Guard**: Clamping guards preventing negative counters under concurrent race conditions.
+- **Concurrent MPSC Logger**: Multithreaded lock-free ring-buffer stress test (800 concurrent writes across 8 pthreads without drops or corrupted lines).
+- **Configuration File Parser (`advlb.conf`)**: Parsing global settings, TLS paths, multi-backend definitions, and health check intervals from disk.
+- **Dynamic Reload & TLS Hot Swap**: SIGHUP configuration reload and atomic SSL context replacement without disconnecting active client streams.
+- **Upstream Connection Pooling (Keep-Alive)**: Socket acquisition, idle count tracking, dead socket remote EOF rejection, backend purge, and half-closed (`SHUT_WR`) socket rejection.
+- **UDP Multi-Worker Scalability (`SO_REUSEPORT`)**: Multi-socket kernel binding, datagram dispatching, and clean shutdown.
+- **TCP Worker Pool Lifecycle, `SO_REUSEPORT` & Slab Allocator**: Spawning worker threads with individual listening sockets, slab pool allocation, and clean termination.
+- **Concurrent SWRR Stress Test (Lock-Free)**: 100,000 concurrent selections across 8 threads validating exact 5:3:2 weighted distribution under extreme race conditions with zero locks.
 
 ---
 
@@ -390,12 +402,14 @@ The codebase incorporates defenses derived from formal security and code reviews
 - **SEC-01**: Descriptors exhaustion defense via automatic kernel soft-limit elevation (`increase_fd_limit()` on `RLIMIT_NOFILE`).
 - **SEC-02**: Concurrent client threshold enforcement (`--max-connections`) with non-blocking drops to mitigate SYN-flood attacks.
 - **SEC-03**: Strict CRLF injection sanitization within HTTP probe paths.
-- **SEC-04**: RFC compliance verification and anti-fragmentation guards during PROXY Protocol v1 decoding.
+- **SEC-04**: Non-blocking PROXY Protocol v1 state machine preventing Slowloris connection pool exhaustion.
 - **SEC-05**: Modern hardened TLS profile (SSLv2, SSLv3, TLS 1.0, and TLS 1.1 disabled; AEAD ciphers prioritized; CRIME compression disabled).
 - **SEC-06**: Spoofed datagram and NAT session starvation protection for UDP traffic.
 - **SEC-07**: Strict input validation and DNS resolution for configured backend addresses.
 - **SEC-08**: Reentrant, thread-safe UTF-8 terminal formatting (`mbrtowc`) in TUI routines.
 - **SEC-09**: Mandatory private key file permission enforcement (`0600` or `0400`).
+- **SEC-10**: Upstream Keep-Alive pool write-half health probe (`send(fd, "", 0)`) guarding against half-closed socket leaks and `EPIPE` crashes.
+- **SEC-11**: Full `struct sockaddr_storage` dual-stack support preventing IPv6 memory truncation on ingress.
 
 ---
 
@@ -403,29 +417,30 @@ The codebase incorporates defenses derived from formal security and code reviews
 
 ```
 adlb/
-├── Makefile                 # Master hierarchical Makefile
+├── Makefile                 # Master hierarchical Makefile (all, nossl, debug, test, client)
 ├── README.md                # Official project documentation (English)
 ├── LICENSE                  # Open-source MIT license
+├── advlb.conf               # Sample production configuration file
 ├── app/                     # Main executable application
 │   ├── Makefile
 │   └── main.c               # Entry-point, signal orchestration, worker dispatch
 ├── include/                 # Unified headers
-│   ├── advlb/
-│   └── advnet/
+│   ├── advlb/               # balancer.h, config.h, conn_pool.h, health_check.h, log.h, proxy.h, tui.h, udp_proxy.h
+│   └── advnet/              # net_core.h, net_epoll.h, net_proxy_proto.h
 ├── libs/
 │   ├── libadvnet/           # Core Network Library
-│   │   ├── include/advnet/  # net_core.h, net_epoll.h, net_proxy_proto.h
+│   │   ├── include/advnet/  # Unified networking primitives
 │   │   └── src/             # epoll/kqueue translation, sockets, PROXY protocol
 │   └── libadvlb/            # Load Balancer Engine
-│       ├── include/advlb/   # balancer.h, config.h, health_check.h, log.h, proxy.h, tui.h
-│       └── src/             # Worker pool, lock-free routing, MPSC logging, TUI
+│       ├── include/advlb/   # Engine interfaces
+│       └── src/             # Worker pool, slab allocator, conn pool, SWRR, MPSC logging, TUI
 ├── tools/                   # Benchmarking and mock backends
 │   ├── Makefile
 │   ├── test_client.c        # Multithreaded benchmarking client (C11)
 │   └── mock_server.py       # Multithreaded HTTP mock server (Python 3)
 ├── tests/                   # Automated test suite (make test)
 │   ├── Makefile
-│   └── test_suite.c         # 33 unit and integration test assertions
+│   └── test_suite.c         # 107 unit, regression, and concurrent stress test assertions
 └── certs/                   # Sample test certificates
     ├── server.crt
     └── server.key
