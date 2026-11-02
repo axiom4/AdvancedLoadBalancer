@@ -46,7 +46,7 @@ typedef struct {
     int port;
     int weight;
     int current_weight;
-    bool is_alive;
+    atomic_bool is_alive;
     int consecutive_successes;
     int consecutive_failures;
     double latency_ms;

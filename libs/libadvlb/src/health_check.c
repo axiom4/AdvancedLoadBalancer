@@ -290,7 +290,7 @@ void perform_health_check_cycle(bool is_startup) {
 
         if (is_startup) {
             if (is_healthy[i]) {
-                g_backends[i].is_alive = true;
+                atomic_store_explicit(&g_backends[i].is_alive, true, memory_order_relaxed);
                 g_backends[i].consecutive_successes = RISE_THRESHOLD;
                 g_backends[i].consecutive_failures = 0;
                 g_backends[i].latency_ms = rtt_ms;
@@ -301,7 +301,7 @@ void perform_health_check_cycle(bool is_startup) {
                 log_events[event_count].latency = rtt_ms;
                 event_count++;
             } else {
-                g_backends[i].is_alive = false;
+                atomic_store_explicit(&g_backends[i].is_alive, false, memory_order_relaxed);
                 g_backends[i].consecutive_successes = 0;
                 g_backends[i].consecutive_failures = FALL_THRESHOLD;
                 log_events[event_count].idx = i;
@@ -316,8 +316,8 @@ void perform_health_check_cycle(bool is_startup) {
                 g_backends[i].consecutive_failures = 0;
                 g_backends[i].latency_ms = rtt_ms;
 
-                if (!g_backends[i].is_alive && g_backends[i].consecutive_successes >= RISE_THRESHOLD) {
-                    g_backends[i].is_alive = true;
+                if (!atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed) && g_backends[i].consecutive_successes >= RISE_THRESHOLD) {
+                    atomic_store_explicit(&g_backends[i].is_alive, true, memory_order_relaxed);
                     log_events[event_count].idx = i;
                     log_events[event_count].event_type = 3;
                     strncpy(log_events[event_count].ip, g_backends[i].ip, sizeof(log_events[event_count].ip));
@@ -329,8 +329,8 @@ void perform_health_check_cycle(bool is_startup) {
                 g_backends[i].consecutive_failures++;
                 g_backends[i].consecutive_successes = 0;
 
-                if (g_backends[i].is_alive && g_backends[i].consecutive_failures >= FALL_THRESHOLD) {
-                    g_backends[i].is_alive = false;
+                if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed) && g_backends[i].consecutive_failures >= FALL_THRESHOLD) {
+                    atomic_store_explicit(&g_backends[i].is_alive, false, memory_order_relaxed);
                     log_events[event_count].idx = i;
                     log_events[event_count].event_type = 4;
                     strncpy(log_events[event_count].ip, g_backends[i].ip, sizeof(log_events[event_count].ip));

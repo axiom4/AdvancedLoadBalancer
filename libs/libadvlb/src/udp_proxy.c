@@ -79,7 +79,7 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
     // Fast O(1) hash table lookup
     UdpSession *existing = hash_find(client_addr);
     if (existing) {
-        if (g_backends[existing->backend_idx].is_alive) {
+        if (atomic_load_explicit(&g_backends[existing->backend_idx].is_alive, memory_order_relaxed)) {
             existing->last_activity = now;
             pthread_mutex_unlock(&s_udp_session_mutex);
             return existing;

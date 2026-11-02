@@ -377,7 +377,7 @@ void render_tui(void) {
         }
 
         char lat_buf[16];
-        if (g_backends[i].is_alive) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             snprintf(lat_buf, sizeof(lat_buf), "%6.2f ms", g_backends[i].latency_ms);
         } else {
             snprintf(lat_buf, sizeof(lat_buf), "    --   ");
@@ -403,7 +403,7 @@ void render_tui(void) {
         printw("│ ");
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
 
-        if (g_backends[i].is_alive) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             attron(COLOR_PAIR(CP_GREEN) | A_BOLD);
             printw("● UP     ");
             attroff(COLOR_PAIR(CP_GREEN) | A_BOLD);

@@ -13,7 +13,7 @@
 BackendServer g_backends[MAX_BACKENDS];
 int g_num_backends = 0;
 pthread_mutex_t g_backend_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int s_round_robin_index = 0;
+static atomic_uint s_round_robin_counter = 0;
 
 const char *algorithm_name(BalancerAlgorithm alg) {
     switch (alg) {
@@ -86,7 +86,7 @@ bool add_backend(const char *ip, int port, int weight) {
     g_backends[idx].port = port;
     g_backends[idx].weight = (weight > 0) ? weight : 1;
     g_backends[idx].current_weight = 0;
-    g_backends[idx].is_alive = false;
+    atomic_init(&g_backends[idx].is_alive, false);
     g_backends[idx].consecutive_failures = 0;
     g_backends[idx].consecutive_successes = 0;
     g_backends[idx].latency_ms = 0.0;
@@ -97,25 +97,26 @@ bool add_backend(const char *ip, int port, int weight) {
     return true;
 }
 
-// 1. Round-Robin: sequential cyclic selection
-static int select_backend_round_robin_locked(void) {
-    for (int attempts = 0; attempts < g_num_backends; attempts++) {
-        int idx = s_round_robin_index;
-        s_round_robin_index = (s_round_robin_index + 1) % g_num_backends;
-        if (g_backends[idx].is_alive) {
+// 1. Round-Robin: sequential cyclic selection (Lock-Free)
+static int select_backend_round_robin_lockfree(int num_backends) {
+    if (num_backends <= 0) return -1;
+    unsigned int base = atomic_fetch_add_explicit(&s_round_robin_counter, 1, memory_order_relaxed);
+    for (int attempts = 0; attempts < num_backends; attempts++) {
+        int idx = (int)((base + (unsigned int)attempts) % (unsigned int)num_backends);
+        if (atomic_load_explicit(&g_backends[idx].is_alive, memory_order_relaxed)) {
             return idx;
         }
     }
     return -1;
 }
 
-// 2. Least-Connections: select server with lowest active connection count
-static int select_backend_least_connections_locked(void) {
+// 2. Least-Connections: select server with lowest active connection count (Lock-Free)
+static int select_backend_least_connections_lockfree(int num_backends) {
     int best_index = -1;
     int min_connections = 1e9;
 
-    for (int i = 0; i < g_num_backends; i++) {
-        if (g_backends[i].is_alive) {
+    for (int i = 0; i < num_backends; i++) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             int conns = atomic_load_explicit(&g_backends[i].active_connections, memory_order_relaxed);
             if (conns < min_connections) {
                 min_connections = conns;
@@ -126,13 +127,13 @@ static int select_backend_least_connections_locked(void) {
     return best_index;
 }
 
-// 3. IP Hash: client IP sticky sessions with active backend fallback
-static int select_backend_ip_hash_locked(const struct sockaddr_in *client_addr) {
+// 3. IP Hash: client IP sticky sessions with active backend fallback (Lock-Free)
+static int select_backend_ip_hash_lockfree(const struct sockaddr_in *client_addr, int num_backends) {
     int healthy_list[MAX_BACKENDS];
     int healthy_count = 0;
 
-    for (int i = 0; i < g_num_backends; i++) {
-        if (g_backends[i].is_alive) {
+    for (int i = 0; i < num_backends; i++) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             healthy_list[healthy_count++] = i;
         }
     }
@@ -150,18 +151,18 @@ static int select_backend_ip_hash_locked(const struct sockaddr_in *client_addr) 
     return healthy_list[hash % (uint32_t)healthy_count];
 }
 
-// 4. Least-Latency: route to server with lowest measured real-time RTT latency
-static int select_backend_least_latency_locked(void) {
+// 4. Least-Latency: route to server with lowest measured real-time RTT latency (Lock-Free)
+static int select_backend_least_latency_lockfree(int num_backends) {
     int best_index = -1;
     double min_lat = 1e9;
     int min_conns = 1e9;
 
-    for (int i = 0; i < g_num_backends; i++) {
-        if (g_backends[i].is_alive) {
+    for (int i = 0; i < num_backends; i++) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             int conns = atomic_load_explicit(&g_backends[i].active_connections, memory_order_relaxed);
-            if (g_backends[i].latency_ms < min_lat - 0.1 ||
-                (g_backends[i].latency_ms <= min_lat + 0.1 && conns < min_conns)) {
-                min_lat = g_backends[i].latency_ms;
+            double lat = g_backends[i].latency_ms;
+            if (lat < min_lat - 0.1 || (lat <= min_lat + 0.1 && conns < min_conns)) {
+                min_lat = lat;
                 min_conns = conns;
                 best_index = i;
             }
@@ -170,13 +171,13 @@ static int select_backend_least_latency_locked(void) {
     return best_index;
 }
 
-// 5. Smooth Weighted Round-Robin: weighted balancing algorithm
-static int select_backend_weighted_rr_locked(void) {
+// 5. Smooth Weighted Round-Robin: weighted balancing algorithm (Mutex-Protected)
+static int select_backend_weighted_rr_locked(int num_backends) {
     int best_index = -1;
     int total_weight = 0;
 
-    for (int i = 0; i < g_num_backends; i++) {
-        if (g_backends[i].is_alive) {
+    for (int i = 0; i < num_backends; i++) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             g_backends[i].current_weight += g_backends[i].weight;
             total_weight += g_backends[i].weight;
             if (best_index == -1 || g_backends[i].current_weight > g_backends[best_index].current_weight) {
@@ -190,13 +191,13 @@ static int select_backend_weighted_rr_locked(void) {
     return best_index;
 }
 
-// 6. Random (Power of Two Choices: pick 2 random nodes and route to the less loaded one)
-static int select_backend_random_2_locked(void) {
+// 6. Random (Power of Two Choices: pick 2 random nodes and route to the less loaded one) (Lock-Free)
+static int select_backend_random_2_lockfree(int num_backends) {
     int healthy_list[MAX_BACKENDS];
     int healthy_count = 0;
 
-    for (int i = 0; i < g_num_backends; i++) {
-        if (g_backends[i].is_alive) {
+    for (int i = 0; i < num_backends; i++) {
+        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             healthy_list[healthy_count++] = i;
         }
     }
@@ -217,27 +218,32 @@ static int select_backend_random_2_locked(void) {
 }
 
 int get_healthy_backend(const struct sockaddr_in *client_addr) {
-    pthread_mutex_lock(&g_backend_mutex);
-    int selected = -1;
+    int num_backends = g_num_backends;
+    if (num_backends <= 0) return -1;
 
-    switch (g_config.current_algorithm) {
+    int selected = -1;
+    BalancerAlgorithm alg = g_config.current_algorithm;
+
+    switch (alg) {
         case ALG_ROUND_ROBIN:
-            selected = select_backend_round_robin_locked();
+            selected = select_backend_round_robin_lockfree(num_backends);
             break;
         case ALG_LEAST_CONNECTIONS:
-            selected = select_backend_least_connections_locked();
+            selected = select_backend_least_connections_lockfree(num_backends);
             break;
         case ALG_IP_HASH:
-            selected = select_backend_ip_hash_locked(client_addr);
+            selected = select_backend_ip_hash_lockfree(client_addr, num_backends);
             break;
         case ALG_LEAST_LATENCY:
-            selected = select_backend_least_latency_locked();
-            break;
-        case ALG_WEIGHTED_RR:
-            selected = select_backend_weighted_rr_locked();
+            selected = select_backend_least_latency_lockfree(num_backends);
             break;
         case ALG_RANDOM_2:
-            selected = select_backend_random_2_locked();
+            selected = select_backend_random_2_lockfree(num_backends);
+            break;
+        case ALG_WEIGHTED_RR:
+            pthread_mutex_lock(&g_backend_mutex);
+            selected = select_backend_weighted_rr_locked(num_backends);
+            pthread_mutex_unlock(&g_backend_mutex);
             break;
     }
 
@@ -245,7 +251,6 @@ int get_healthy_backend(const struct sockaddr_in *client_addr) {
         atomic_fetch_add_explicit(&g_backends[selected].active_connections, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_backends[selected].total_requests_handled, 1, memory_order_relaxed);
     }
-    pthread_mutex_unlock(&g_backend_mutex);
     return selected;
 }
 
@@ -269,7 +274,7 @@ void record_backend_failure(int index) {
         g_backends[index].consecutive_successes = 0;
         int fails = g_backends[index].consecutive_failures;
         if (fails >= FALL_THRESHOLD) {
-            g_backends[index].is_alive = false;
+            atomic_store_explicit(&g_backends[index].is_alive, false, memory_order_relaxed);
         }
         char b_ip[INET_ADDRSTRLEN];
         int b_port = g_backends[index].port;
