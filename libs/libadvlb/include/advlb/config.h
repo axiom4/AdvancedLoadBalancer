@@ -22,6 +22,10 @@ typedef struct {
     char key_file[256];
     char config_file[256];
 
+    bool enable_upstream_pooling;
+    int upstream_pool_size;
+    int upstream_pool_idle_sec;
+
     BalancerAlgorithm current_algorithm;
     HealthCheckType current_hc_type;
     char hc_http_path[256];

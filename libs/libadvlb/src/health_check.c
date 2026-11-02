@@ -5,6 +5,7 @@
 #include "advlb/log.h"
 #include "advlb/net_utils.h"
 #include "advlb/compat_epoll.h"
+#include "advlb/conn_pool.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -343,6 +344,7 @@ void perform_health_check_cycle(bool is_startup) {
 
                 if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed) && g_backends[i].consecutive_failures >= FALL_THRESHOLD) {
                     atomic_store_explicit(&g_backends[i].is_alive, false, memory_order_relaxed);
+                    conn_pool_purge_backend(i);
                     log_events[event_count].idx = i;
                     log_events[event_count].event_type = 4;
                     strncpy(log_events[event_count].ip, g_backends[i].ip, sizeof(log_events[event_count].ip));
@@ -382,6 +384,9 @@ void *health_check_thread(void *arg) {
         }
         if (!g_server_running) break;
         perform_health_check_cycle(false);
+        if (g_config.enable_upstream_pooling) {
+            conn_pool_cleanup_expired(g_config.upstream_pool_idle_sec);
+        }
     }
     return NULL;
 }

@@ -46,6 +46,10 @@ void config_init_defaults(LbConfig *cfg) {
     cfg->hc_expect_explicitly_set = false;
     cfg->hc_interval_sec = HEALTH_CHECK_INTERVAL_SEC;
     cfg->hc_timeout_ms = HEALTH_CHECK_TIMEOUT_MS;
+
+    cfg->enable_upstream_pooling = true;
+    cfg->upstream_pool_size = 16;
+    cfg->upstream_pool_idle_sec = 30;
 }
 
 static bool parse_bool_val(const char *val) {
@@ -179,6 +183,15 @@ bool config_load_file(const char *filepath, LbConfig *cfg) {
             cfg->hc_interval_sec = atoi(val);
         } else if (strcasecmp(key, "hc_timeout") == 0) {
             cfg->hc_timeout_ms = atoi(val);
+        } else if (strcasecmp(key, "pool") == 0 || strcasecmp(key, "upstream_pooling") == 0 || strcasecmp(key, "upstream_keepalive") == 0) {
+            cfg->enable_upstream_pooling = parse_bool_val(val);
+        } else if (strcasecmp(key, "pool_size") == 0 || strcasecmp(key, "upstream_pool_size") == 0) {
+            cfg->upstream_pool_size = atoi(val);
+            if (cfg->upstream_pool_size < 0) cfg->upstream_pool_size = 0;
+            if (cfg->upstream_pool_size > 32) cfg->upstream_pool_size = 32;
+        } else if (strcasecmp(key, "pool_idle_timeout") == 0 || strcasecmp(key, "pool_timeout") == 0) {
+            cfg->upstream_pool_idle_sec = atoi(val);
+            if (cfg->upstream_pool_idle_sec <= 0) cfg->upstream_pool_idle_sec = 30;
         }
     }
 

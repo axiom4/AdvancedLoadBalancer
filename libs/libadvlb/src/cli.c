@@ -61,6 +61,8 @@ void print_help(const char *prog_name) {
     printf("      --timeout SEC         TCP connection inactivity timeout in seconds (default: 30)\n");
     printf("  -t, --transparent         Enable IP transparency (requires root/CAP_NET_ADMIN privileges)\n");
     printf("      --no-tui              Disable full-screen TUI dashboard (plain logs on stdout)\n");
+    printf("      --no-pool             Disable upstream TCP Keep-Alive connection pooling\n");
+    printf("      --pool-size NUM       Maximum idle pooled connections per backend (default: 16)\n");
     printf("  -h, --help                Show this help message and exit\n\n");
     printf("Usage Examples:\n");
     printf("  %s -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002\n", prog_name);
@@ -247,6 +249,8 @@ int parse_cli_args(int argc, char *argv[]) {
         {"max-conns",   required_argument, 0, 'm'},
         {"workers",     required_argument, 0, 'w'},
         {"timeout",     required_argument, 0, 1020},
+        {"no-pool",     no_argument,       0, 1021},
+        {"pool-size",   required_argument, 0, 1022},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -381,6 +385,14 @@ int parse_cli_args(int argc, char *argv[]) {
                 break;
             case 't':
                 g_config.enable_transparent_mode = true;
+                break;
+            case 1021: // --no-pool
+                g_config.enable_upstream_pooling = false;
+                break;
+            case 1022: // --pool-size
+                g_config.upstream_pool_size = atoi(optarg);
+                if (g_config.upstream_pool_size < 0) g_config.upstream_pool_size = 0;
+                if (g_config.upstream_pool_size > 32) g_config.upstream_pool_size = 32;
                 break;
             case 'h':
                 print_help(argv[0]);

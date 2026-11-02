@@ -7,6 +7,7 @@
 #include "advlb/proxy_proto.h"
 #include "advlb/compat_epoll.h"
 #include "advlb/ssl_engine.h"
+#include "advlb/conn_pool.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,7 +258,20 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
     if (conn->backend_fd >= 0) {
         epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
         worker_clear_fd(worker, conn->backend_fd);
-        close(conn->backend_fd);
+
+        bool pooled = false;
+        if (g_config.enable_upstream_pooling &&
+            conn->backend_idx >= 0 &&
+            !conn->backend_closed &&
+            conn->state == CONN_STATE_FORWARDING &&
+            buffer_available(&conn->c2b) == 0 &&
+            buffer_available(&conn->b2c) == 0) {
+            pooled = conn_pool_release(conn->backend_idx, conn->backend_fd);
+        }
+
+        if (!pooled) {
+            close(conn->backend_fd);
+        }
         conn->backend_fd = -1;
     }
 
@@ -456,6 +470,20 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
         int b_idx = get_healthy_backend(&conn->client_addr);
         if (b_idx < 0) {
             break;
+        }
+
+        // Try to acquire an established, idle Keep-Alive socket from the connection pool
+        int pooled_fd = -1;
+        if (g_config.enable_upstream_pooling) {
+            pooled_fd = conn_pool_acquire(b_idx);
+        }
+        if (pooled_fd >= 0) {
+            conn->backend_idx = b_idx;
+            conn->backend_fd = pooled_fd;
+            worker_set_fd(worker, pooled_fd, conn);
+            record_backend_success(b_idx);
+            worker_on_backend_connected(worker, conn);
+            return;
         }
 
         char b_ip[INET6_ADDRSTRLEN];
@@ -1037,6 +1065,7 @@ void worker_pool_shutdown(void) {
             n = tmp;
         }
     }
+    conn_pool_destroy();
     free(s_workers);
     s_workers = NULL;
     s_num_workers = 0;

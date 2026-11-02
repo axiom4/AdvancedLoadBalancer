@@ -2,6 +2,7 @@
 #include "advlb/balancer.h"
 #include "advlb/config.h"
 #include "advlb/log.h"
+#include "advlb/conn_pool.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -309,6 +310,7 @@ void record_backend_failure(int index) {
         int fails = g_backends[index].consecutive_failures;
         if (fails >= CLIENT_FALL_THRESHOLD) {
             atomic_store_explicit(&g_backends[index].is_alive, false, memory_order_relaxed);
+            conn_pool_purge_backend(index);
         }
         char b_ip[INET_ADDRSTRLEN];
         int b_port = g_backends[index].port;

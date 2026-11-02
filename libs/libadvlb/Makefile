@@ -43,6 +43,7 @@ SRCS = $(SRC_DIR)/config.c \
        $(SRC_DIR)/ssl_engine.c \
        $(SRC_DIR)/balancer.c \
        $(SRC_DIR)/health_check.c \
+       $(SRC_DIR)/conn_pool.c \
        $(SRC_DIR)/proxy.c \
        $(SRC_DIR)/udp_proxy.c \
        $(SRC_DIR)/tui.c \
