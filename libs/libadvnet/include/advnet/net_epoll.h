@@ -46,10 +46,11 @@ static inline int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
             EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, (void *)(intptr_t)event->data.fd);
         }
     } else if (op == EPOLL_CTL_MOD) {
-        struct kevent del_kev[2];
-        EV_SET(&del_kev[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        EV_SET(&del_kev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-        kevent(epfd, del_kev, 2, NULL, 0, NULL);
+        struct kevent d;
+        EV_SET(&d, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        kevent(epfd, &d, 1, NULL, 0, NULL);
+        EV_SET(&d, fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        kevent(epfd, &d, 1, NULL, 0, NULL);
 
         if (event->events & EPOLLIN) {
             EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, (void *)(intptr_t)event->data.fd);
@@ -58,8 +59,11 @@ static inline int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
             EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, (void *)(intptr_t)event->data.fd);
         }
     } else if (op == EPOLL_CTL_DEL) {
-        EV_SET(&kev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        struct kevent d;
+        EV_SET(&d, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        kevent(epfd, &d, 1, NULL, 0, NULL);
+        EV_SET(&d, fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        return kevent(epfd, &d, 1, NULL, 0, NULL);
     }
     return kevent(epfd, kev, n, NULL, 0, NULL);
 }

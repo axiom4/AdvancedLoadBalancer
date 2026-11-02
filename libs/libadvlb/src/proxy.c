@@ -118,7 +118,6 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
 
 typedef enum {
     CONN_STATE_SSL_HANDSHAKE,
-    CONN_STATE_CONNECTING_BACKEND,
     CONN_STATE_FORWARDING
 } ConnectionState;
 
@@ -189,10 +188,8 @@ static void worker_remove_conn(WorkerThread *worker, ProxyConnection *conn);
 static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn);
 static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn);
 static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *conn);
-static void worker_retry_backend(WorkerThread *worker, ProxyConnection *conn);
 static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *conn);
 static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *conn);
-static void worker_step_backend_connect(WorkerThread *worker, ProxyConnection *conn, uint32_t ev_mask);
 static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events);
 static void worker_check_timeouts(WorkerThread *worker);
 static void worker_process_new_conns(WorkerThread *worker);
@@ -285,103 +282,60 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
     atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
 }
 
-static int net_connect_nonblocking(const char *ip, int port, const struct sockaddr_in *bind_client_addr,
-                                  bool enable_transparent, bool *out_connected) {
-    *out_connected = false;
-    int fd;
-    while ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        if (errno == EINTR) continue;
-        return -1;
-    }
-
-    int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-#ifdef SO_NOSIGPIPE
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flag, sizeof(int));
-#endif
-
-    if (enable_transparent && bind_client_addr != NULL) {
-        int opt = 1;
-        if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) == 0) {
-            struct sockaddr_in bind_addr;
-            memset(&bind_addr, 0, sizeof(bind_addr));
-            bind_addr.sin_family = AF_INET;
-            bind_addr.sin_addr = bind_client_addr->sin_addr;
-            bind_addr.sin_port = htons(0);
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            while (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-                if (errno == EINTR) continue;
-                break;
-            }
-        }
-    }
-
-    if (set_nonblocking(fd) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-        close(fd);
-        return -1;
-    }
-
-    int res = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-    if (res == 0) {
-        *out_connected = true;
-        return fd;
-    }
-    if (res < 0 && (errno == EINPROGRESS || errno == EINTR)) {
-        *out_connected = false;
-        return fd;
-    }
-
-    close(fd);
-    return -1;
-}
-
 static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn) {
     if (conn->state != CONN_STATE_FORWARDING) return;
 
     // Configure client epoll interest mask (Automatic Backpressure)
-    uint32_t client_mask = EPOLLERR | EPOLLHUP;
+    uint32_t client_mask = 0;
     if (!conn->client_closed && buffer_space(&conn->c2b) > 0) client_mask |= EPOLLIN;
     if (buffer_available(&conn->b2c) > 0) client_mask |= EPOLLOUT;
+    if (client_mask != 0) client_mask |= (EPOLLERR | EPOLLHUP);
 
     if (client_mask != conn->last_client_ev) {
-        struct epoll_event ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.data.fd = conn->client_fd;
-        ev.events = client_mask;
-        if (conn->last_client_ev == 0) {
-            epoll_ctl(worker->epfd, EPOLL_CTL_ADD, conn->client_fd, &ev);
+        if (client_mask == 0) {
+            if (conn->last_client_ev != 0) {
+                epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->client_fd, NULL);
+                conn->last_client_ev = 0;
+            }
         } else {
-            epoll_ctl(worker->epfd, EPOLL_CTL_MOD, conn->client_fd, &ev);
+            struct epoll_event ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.data.fd = conn->client_fd;
+            ev.events = client_mask;
+            if (conn->last_client_ev == 0) {
+                epoll_ctl(worker->epfd, EPOLL_CTL_ADD, conn->client_fd, &ev);
+            } else {
+                epoll_ctl(worker->epfd, EPOLL_CTL_MOD, conn->client_fd, &ev);
+            }
+            conn->last_client_ev = client_mask;
         }
-        conn->last_client_ev = client_mask;
     }
 
     // Configure backend epoll interest mask (Automatic Backpressure)
     if (conn->backend_fd >= 0) {
-        uint32_t backend_mask = EPOLLERR | EPOLLHUP;
+        uint32_t backend_mask = 0;
         if (!conn->backend_closed && buffer_space(&conn->b2c) > 0) backend_mask |= EPOLLIN;
         if (buffer_available(&conn->c2b) > 0) backend_mask |= EPOLLOUT;
+        if (backend_mask != 0) backend_mask |= (EPOLLERR | EPOLLHUP);
 
         if (backend_mask != conn->last_backend_ev) {
-            struct epoll_event ev;
-            memset(&ev, 0, sizeof(ev));
-            ev.data.fd = conn->backend_fd;
-            ev.events = backend_mask;
-            if (conn->last_backend_ev == 0) {
-                epoll_ctl(worker->epfd, EPOLL_CTL_ADD, conn->backend_fd, &ev);
+            if (backend_mask == 0) {
+                if (conn->last_backend_ev != 0) {
+                    epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
+                    conn->last_backend_ev = 0;
+                }
             } else {
-                epoll_ctl(worker->epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev);
+                struct epoll_event ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.data.fd = conn->backend_fd;
+                ev.events = backend_mask;
+                if (conn->last_backend_ev == 0) {
+                    epoll_ctl(worker->epfd, EPOLL_CTL_ADD, conn->backend_fd, &ev);
+                } else {
+                    epoll_ctl(worker->epfd, EPOLL_CTL_MOD, conn->backend_fd, &ev);
+                }
+                conn->last_backend_ev = backend_mask;
             }
-            conn->last_backend_ev = backend_mask;
         }
     }
 }
@@ -444,24 +398,6 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
     worker_update_conn_epoll(worker, conn);
 }
 
-static void worker_retry_backend(WorkerThread *worker, ProxyConnection *conn) {
-    if (conn->backend_fd >= 0) {
-        epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
-        worker_clear_fd(worker, conn->backend_fd);
-        close(conn->backend_fd);
-        conn->backend_fd = -1;
-        conn->last_backend_ev = 0;
-    }
-
-    if (conn->backend_idx >= 0) {
-        record_backend_failure(conn->backend_idx);
-        release_backend(conn->backend_idx);
-        conn->backend_idx = -1;
-    }
-
-    worker_start_backend_connect(worker, conn);
-}
-
 static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *conn) {
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(conn->client_addr.sin_addr), client_ip, sizeof(client_ip));
@@ -481,31 +417,19 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
         b_port = g_backends[b_idx].port;
         pthread_mutex_unlock(&g_backend_mutex);
 
-        bool connected = false;
-        int bfd = net_connect_nonblocking(b_ip, b_port, &conn->client_addr, g_config.enable_transparent_mode, &connected);
-        if (bfd < 0) {
-            record_backend_failure(b_idx);
-            release_backend(b_idx);
-            continue;
-        }
-
-        conn->backend_idx = b_idx;
-        conn->backend_fd = bfd;
-        worker_set_fd(worker, bfd, conn);
-
-        if (connected) {
+        int bfd = connect_with_timeout_transparent(b_ip, b_port, 1000, &conn->client_addr);
+        if (bfd >= 0) {
+            conn->backend_idx = b_idx;
+            conn->backend_fd = bfd;
+            set_nonblocking(bfd);
+            int flag = 1;
+            setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+            worker_set_fd(worker, bfd, conn);
             worker_on_backend_connected(worker, conn);
             return;
-        } else {
-            conn->state = CONN_STATE_CONNECTING_BACKEND;
-            struct epoll_event ev;
-            memset(&ev, 0, sizeof(ev));
-            ev.data.fd = bfd;
-            ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
-            conn->last_backend_ev = ev.events;
-            epoll_ctl(worker->epfd, EPOLL_CTL_ADD, bfd, &ev);
-            return;
         }
+
+        record_backend_failure(b_idx);
     }
 
     add_log("\033[1;31m[DROP]\033[0m No healthy backend available for %s:%d", client_ip, client_port);
@@ -545,22 +469,6 @@ static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *con
         worker_close_conn(worker, conn);
         return;
     }
-}
-
-static void worker_step_backend_connect(WorkerThread *worker, ProxyConnection *conn, uint32_t ev_mask) {
-    if (ev_mask & EPOLLERR) {
-        worker_retry_backend(worker, conn);
-        return;
-    }
-
-    int err = 0;
-    socklen_t len = sizeof(err);
-    if (getsockopt(conn->backend_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-        worker_retry_backend(worker, conn);
-        return;
-    }
-
-    worker_on_backend_connected(worker, conn);
 }
 
 static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events) {
@@ -874,8 +782,6 @@ static void *worker_event_loop(void *arg) {
 
             if (conn->state == CONN_STATE_SSL_HANDSHAKE) {
                 worker_step_ssl_handshake(worker, conn);
-            } else if (conn->state == CONN_STATE_CONNECTING_BACKEND) {
-                worker_step_backend_connect(worker, conn, ev_mask);
             } else if (conn->state == CONN_STATE_FORWARDING) {
                 worker_handle_forwarding_io(worker, conn, curr_fd, ev_mask);
             }
