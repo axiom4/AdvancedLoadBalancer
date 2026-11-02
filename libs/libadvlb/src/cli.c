@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <strings.h>
+#include <sys/stat.h>
 
 void print_help(const char *prog_name) {
     printf("\n\033[1;36mADVANCED LOAD BALANCER (C / EPOLL / MULTITHREAD / TUI)\033[0m\n\n");
@@ -366,8 +367,10 @@ int parse_cli_args(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // 3. If --ssl (-s) is active, both --cert and --key are REQUIRED
-    if (g_config.enable_ssl_offloading) {
+    // 3. If --ssl (-s) is active, or if --cert / --key were supplied, both are REQUIRED
+    if (g_config.enable_ssl_offloading || g_config.cert_file[0] != '\0' || g_config.key_file[0] != '\0') {
+        g_config.enable_ssl_offloading = true;
+
         if (g_config.cert_file[0] == '\0' || g_config.key_file[0] == '\0') {
             fprintf(stderr, "\033[1;31m[ERROR]\033[0m With --ssl (-s), both --cert and --key must be specified:\n");
             fprintf(stderr, "  --cert <file.crt>   Path to X.509 SSL certificate file\n");
@@ -376,14 +379,47 @@ int parse_cli_args(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 
-        if (access(g_config.cert_file, R_OK) != 0) {
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL certificate file not found or not readable: '%s' (%s)\n",
+        struct stat st_cert;
+        if (stat(g_config.cert_file, &st_cert) != 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL certificate file '%s' not found: %s\n",
                     g_config.cert_file, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        if (access(g_config.key_file, R_OK) != 0) {
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key file not found or not readable: '%s' (%s)\n",
+        if (!S_ISREG(st_cert.st_mode)) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL certificate '%s' is not a regular file\n",
+                    g_config.cert_file);
+            exit(EXIT_FAILURE);
+        }
+        if (access(g_config.cert_file, R_OK) != 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL certificate file '%s' is not readable: %s\n",
+                    g_config.cert_file, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+
+        struct stat st_key;
+        if (stat(g_config.key_file, &st_key) != 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key file '%s' not found: %s\n",
                     g_config.key_file, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        if (!S_ISREG(st_key.st_mode)) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key '%s' is not a regular file\n",
+                    g_config.key_file);
+            exit(EXIT_FAILURE);
+        }
+        if (access(g_config.key_file, R_OK) != 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key file '%s' is not readable: %s\n",
+                    g_config.key_file, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+
+        // SEC-09: Enforce secure file permissions on private key (must be 0600 or 0400).
+        // Reject files accessible by group (0070) or world/others (0007).
+        if ((st_key.st_mode & 0077) != 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Insecure permissions on SSL private key '%s' (%04o).\n",
+                    g_config.key_file, (unsigned int)(st_key.st_mode & 0777));
+            fprintf(stderr, "SSL private keys must not be accessible by group or others (required: 0600 or 0400).\n");
+            fprintf(stderr, "Hint: fix with 'chmod 600 %s'\n\n", g_config.key_file);
             exit(EXIT_FAILURE);
         }
     }

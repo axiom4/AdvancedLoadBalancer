@@ -3,6 +3,7 @@
 #include "advlb/tui.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 SSL_CTX *g_global_ssl_ctx = NULL;
 
@@ -76,6 +77,22 @@ SSL_CTX *init_ssl_context(const char *cert_path, const char *key_path) {
     SSL_CTX_set_session_id_context(ctx, session_ctx_id, sizeof(session_ctx_id) - 1);
 
     // 6. Certificate and private key loading
+    struct stat key_stat;
+    if (stat(key_path, &key_stat) == 0) {
+        if (!S_ISREG(key_stat.st_mode)) {
+            cleanup_tui();
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m SSL private key '%s' is not a regular file\n", key_path);
+            exit(EXIT_FAILURE);
+        }
+        if ((key_stat.st_mode & 0077) != 0) {
+            cleanup_tui();
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Insecure file permissions on SSL private key '%s' (%04o).\n",
+                    key_path, (unsigned int)(key_stat.st_mode & 0777));
+            fprintf(stderr, "SSL private keys must not be accessible by group or others (required: 0600 or 0400).\n");
+            fprintf(stderr, "Hint: fix with 'chmod 600 %s'\n", key_path);
+            exit(EXIT_FAILURE);
+        }
+    }
 
     if (SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) <= 0) {
         cleanup_tui();
