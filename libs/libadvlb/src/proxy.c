@@ -356,7 +356,7 @@ void *client_handler_thread(void *arg) {
 
     // If accepting PROXY Protocol v1 from upstream client/proxy is enabled
     if (g_config.enable_accept_proxy) {
-        struct sockaddr_in real_client_addr;
+        struct sockaddr_in real_client_addr = client_addr;
         if (parse_proxy_protocol_v1(client_fd, &real_client_addr)) {
             client_addr = real_client_addr;
             add_log("\033[1;35m[PPv1 IN]\033[0m Decoded real client IP: %s:%d",
