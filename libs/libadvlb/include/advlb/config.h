@@ -20,6 +20,7 @@ typedef struct {
     bool enable_tui;
     char cert_file[256];
     char key_file[256];
+    char config_file[256];
 
     BalancerAlgorithm current_algorithm;
     HealthCheckType current_hc_type;
@@ -39,8 +40,11 @@ extern int g_global_server_fd;
 extern time_t g_start_time;
 extern volatile bool g_confirming_exit;
 extern volatile int g_exit_popup_focus;
+extern volatile sig_atomic_t g_reload_requested;
 
 void config_init_defaults(LbConfig *cfg);
+bool config_load_file(const char *filepath, LbConfig *cfg);
+bool config_reload(void);
 
 #endif /* ADVLB_CONFIG_H */
 

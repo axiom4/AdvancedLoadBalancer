@@ -17,11 +17,14 @@
 void print_help(const char *prog_name) {
     printf("\n\033[1;36mADVANCED LOAD BALANCER (C / EPOLL / MULTITHREAD / TUI)\033[0m\n\n");
     printf("Usage:\n");
-    printf("  %s -p PORT -b IP:PORT[:WEIGHT] [OPTIONS]\n\n", prog_name);
-    printf("Required Parameters:\n");
+    printf("  %s -p PORT -b IP:PORT[:WEIGHT] [OPTIONS]\n", prog_name);
+    printf("  %s -c /path/to/advlb.conf [OPTIONS]\n\n", prog_name);
+    printf("Configuration File:\n");
+    printf("  -c, --config FILE         Load configuration and backends from file (e.g. advlb.conf)\n\n");
+    printf("Required Parameters (unless set in config file):\n");
     printf("  -p, --port PORT           Listening port for Load Balancer (1-65535) [\033[1;31mREQUIRED\033[0m]\n");
     printf("  -b, --backend IP:PORT[:W] Add a Real Server with optional weight (default weight: 1)\n");
-    printf("                            Repeatable or comma-separated. E.g. -b 127.0.0.1:9001:3\n\n");
+    printf("                            Repeatable or comma-separated. E.g. -b 127.0.0.1:9001:3 or -b [::1]:9001\n\n");
     printf("Load Balancing Algorithms:\n");
     printf("      --algo NAME           Select initial balancing algorithm:\n");
     printf("                            * rr        : Sequential Round-Robin\n");
@@ -86,33 +89,50 @@ void parse_backend_arg(const char *arg) {
             continue;
         }
 
-        char *first_colon = strchr(token, ':');
-        if (first_colon) {
-            *first_colon = '\0';
-            char *ip = token;
-            char *rest = first_colon + 1;
-            char *second_colon = strchr(rest, ':');
-            int port = 0;
-            int weight = 1;
-            if (second_colon) {
-                *second_colon = '\0';
-                port = atoi(rest);
-                weight = atoi(second_colon + 1);
-                if (weight <= 0) weight = 1;
-            } else {
-                port = atoi(rest);
-            }
+        char *ip = NULL;
+        char *rest = NULL;
 
-            if (port > 0 && port <= 65535 && strlen(ip) > 0) {
-                if (!add_backend(ip, port, weight)) {
-                    exit(EXIT_FAILURE);
-                }
+        if (token[0] == '[') {
+            // Bracketed IPv6 notation: [2001:db8::1]:8080[:weight]
+            char *closing = strchr(token, ']');
+            if (!closing || *(closing + 1) != ':') {
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid IPv6 backend format: '%s' (expected [IPv6]:PORT[:WEIGHT])\n", token);
+                exit(EXIT_FAILURE);
+            }
+            *closing = '\0';
+            ip = token + 1; // Content inside brackets
+            rest = closing + 2; // Content after ']:'
+        } else {
+            // IPv4 or hostname notation: 127.0.0.1:8080[:weight]
+            char *first_colon = strchr(token, ':');
+            if (first_colon) {
+                *first_colon = '\0';
+                ip = token;
+                rest = first_colon + 1;
             } else {
-                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend '%s': port must be 1-65535\n", ip);
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend format: '%s' (expected IP:PORT or [IPv6]:PORT)\n", token);
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        char *second_colon = strchr(rest, ':');
+        int port = 0;
+        int weight = 1;
+        if (second_colon) {
+            *second_colon = '\0';
+            port = atoi(rest);
+            weight = atoi(second_colon + 1);
+            if (weight <= 0) weight = 1;
+        } else {
+            port = atoi(rest);
+        }
+
+        if (port > 0 && port <= 65535 && strlen(ip) > 0) {
+            if (!add_backend(ip, port, weight)) {
                 exit(EXIT_FAILURE);
             }
         } else {
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend format: '%s' (expected IP:PORT or IP:PORT:WEIGHT)\n", token);
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend '%s': port must be 1-65535\n", ip);
             exit(EXIT_FAILURE);
         }
         token = strtok_r(NULL, ",", &saveptr);
@@ -182,7 +202,20 @@ bool is_valid_http_path(const char *path) {
 }
 
 int parse_cli_args(int argc, char *argv[]) {
+    // Pre-scan for config file (-c / --config) to load base configuration before CLI overrides
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) && (i + 1 < argc)) {
+            strncpy(g_config.config_file, argv[i + 1], sizeof(g_config.config_file) - 1);
+            if (!config_load_file(argv[i + 1], &g_config)) {
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Cannot open or parse config file '%s'\n", argv[i + 1]);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        }
+    }
+
     static struct option long_options[] = {
+        {"config",      required_argument, 0, 'c'},
         {"port",        required_argument, 0, 'p'},
         {"backend",     required_argument, 0, 'b'},
         {"ssl",         no_argument,       0, 's'},
@@ -221,8 +254,11 @@ int parse_cli_args(int argc, char *argv[]) {
     int c;
     int option_index = 0;
 
-    while ((c = getopt_long(argc, argv, "p:b:sthPum:w:", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:p:b:sthPum:w:", long_options, &option_index)) != -1) {
         switch (c) {
+            case 'c':
+                // Already loaded in pre-scan, ignore here
+                break;
             case 'w':
                 g_config.num_workers = atoi(optarg);
                 if (g_config.num_workers <= 0) {
