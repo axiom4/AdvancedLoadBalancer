@@ -134,6 +134,8 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 
     bool client_closed = false;
     bool backend_closed = false;
+    bool backend_shut_wr = false;
+    bool client_shut_wr = false;
 
     uint32_t last_client_ev = 0;
     uint32_t last_backend_ev = 0;
@@ -197,16 +199,18 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
             }
         }
 
-        // Check connection completion / half-close
-        if (client_closed && buffer_available(&c2b) == 0 && !backend_closed) {
+        // Check connection completion / half-close (send FIN exactly once per direction)
+        if (client_closed && buffer_available(&c2b) == 0 && !backend_shut_wr) {
             shutdown(backend_fd, SHUT_WR);
+            backend_shut_wr = true;
         }
-        if (backend_closed && buffer_available(&b2c) == 0 && !client_closed) {
+        if (backend_closed && buffer_available(&b2c) == 0 && !client_shut_wr) {
             if (client_ssl) {
                 SSL_shutdown(client_ssl);
             } else {
                 shutdown(client_fd, SHUT_WR);
             }
+            client_shut_wr = true;
         }
         if (client_closed && backend_closed && buffer_available(&c2b) == 0 && buffer_available(&b2c) == 0) {
             break; // Both streams gracefully finished
