@@ -37,40 +37,60 @@ bool add_backend(const char *ip, int port, int weight) {
         return false;
     }
 
-    char resolved_ip[INET_ADDRSTRLEN];
-    struct in_addr test_addr;
+    char clean_ip[64];
+    strncpy(clean_ip, ip, sizeof(clean_ip) - 1);
+    clean_ip[sizeof(clean_ip) - 1] = '\0';
+    size_t cip_len = strlen(clean_ip);
+    if (clean_ip[0] == '[' && clean_ip[cip_len - 1] == ']') {
+        clean_ip[cip_len - 1] = '\0';
+        memmove(clean_ip, clean_ip + 1, cip_len);
+    }
 
-    // 1. Fast-path: Check if already a valid IPv4 dotted-decimal address
-    if (inet_pton(AF_INET, ip, &test_addr) == 1) {
-        if (inet_ntop(AF_INET, &test_addr, resolved_ip, sizeof(resolved_ip)) == NULL) {
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to format IPv4 address for '%s'\n", ip);
+    char resolved_ip[INET6_ADDRSTRLEN];
+    struct in_addr test_addr4;
+    struct in6_addr test_addr6;
+
+    // 1. Fast-path: Check if valid IPv4 address
+    if (inet_pton(AF_INET, clean_ip, &test_addr4) == 1) {
+        if (inet_ntop(AF_INET, &test_addr4, resolved_ip, sizeof(resolved_ip)) == NULL) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to format IPv4 address for '%s'\n", clean_ip);
+            return false;
+        }
+    } else if (inet_pton(AF_INET6, clean_ip, &test_addr6) == 1) {
+        // 2. Fast-path: Check if valid IPv6 address
+        if (inet_ntop(AF_INET6, &test_addr6, resolved_ip, sizeof(resolved_ip)) == NULL) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to format IPv6 address for '%s'\n", clean_ip);
             return false;
         }
     } else {
-        // 2. Not a dotted-decimal IPv4: resolve via DNS getaddrinfo
+        // 3. Hostname resolution via getaddrinfo (supports both IPv4 and IPv6)
         struct addrinfo hints;
         struct addrinfo *res = NULL;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET; // IPv4
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
 
-        int rc = getaddrinfo(ip, NULL, &hints, &res);
+        int rc = getaddrinfo(clean_ip, NULL, &hints, &res);
         if (rc != 0 || res == NULL) {
             fprintf(stderr, "\033[1;31m[ERROR]\033[0m Cannot resolve backend '%s': %s\n",
-                    ip, (rc != 0) ? gai_strerror(rc) : "No IPv4 address returned");
+                    clean_ip, (rc != 0) ? gai_strerror(rc) : "Host not found");
             if (res) freeaddrinfo(res);
             return false;
         }
 
-        struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
-        if (inet_ntop(AF_INET, &sin->sin_addr, resolved_ip, sizeof(resolved_ip)) == NULL) {
+        if (res->ai_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, resolved_ip, sizeof(resolved_ip));
+        } else if (res->ai_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)res->ai_addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, resolved_ip, sizeof(resolved_ip));
+        } else {
             freeaddrinfo(res);
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to convert resolved address for '%s'\n", ip);
             return false;
         }
         freeaddrinfo(res);
 
-        printf("[INFO] Resolved backend hostname '%s' -> %s\n", ip, resolved_ip);
+        printf("[INFO] Resolved backend hostname '%s' -> %s\n", clean_ip, resolved_ip);
     }
 
     pthread_mutex_lock(&g_backend_mutex);

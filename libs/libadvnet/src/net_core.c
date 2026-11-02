@@ -62,8 +62,42 @@ bool net_validate_ipv4(const char *ip) {
     return inet_pton(AF_INET, ip, &addr) == 1;
 }
 
+bool net_validate_ip(const char *ip) {
+    if (!ip || strlen(ip) == 0) return false;
+    struct in_addr addr4;
+    if (inet_pton(AF_INET, ip, &addr4) == 1) return true;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET6, ip, &addr6) == 1) return true;
+    return false;
+}
+
 int net_create_tcp_server(int port, int backlog) {
-    int server_fd;
+    int server_fd = -1;
+    int bl = (backlog > 0) ? backlog : SOMAXCONN;
+
+    // 1. Try Dual-Stack IPv6 + IPv4 socket (RFC 3493)
+    server_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (server_fd >= 0) {
+        int v6only = 0; // 0 = accept both IPv6 and IPv4 (IPv4-mapped)
+        setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        net_set_reuse(server_fd, 1, 1);
+
+        struct sockaddr_in6 address6;
+        memset(&address6, 0, sizeof(address6));
+        address6.sin6_family = AF_INET6;
+        address6.sin6_addr = in6addr_any;
+        address6.sin6_port = htons((uint16_t)port);
+
+        if (bind(server_fd, (struct sockaddr *)&address6, sizeof(address6)) == 0) {
+            if (listen(server_fd, bl) == 0) {
+                return server_fd;
+            }
+        }
+        close(server_fd);
+        server_fd = -1;
+    }
+
+    // 2. Fallback to standard IPv4 socket if IPv6 dual-stack is unavailable
     while ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         if (errno == EINTR) continue;
         perror("TCP server socket error");
@@ -85,7 +119,6 @@ int net_create_tcp_server(int port, int backlog) {
         return -1;
     }
 
-    int bl = (backlog > 0) ? backlog : SOMAXCONN;
     while (listen(server_fd, bl) < 0) {
         if (errno == EINTR) continue;
         perror("TCP listen error");
@@ -127,8 +160,11 @@ int net_connect_tcp_nonblocking(const char *ip, int port,
                                 bool *in_progress) {
     if (in_progress) *in_progress = false;
 
+    struct in6_addr addr6_check;
+    bool is_ipv6 = (inet_pton(AF_INET6, ip, &addr6_check) == 1);
+
     int fd;
-    while ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    while ((fd = socket(is_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)) < 0) {
         if (errno == EINTR) continue;
         return -1;
     }
@@ -140,7 +176,7 @@ int net_connect_tcp_nonblocking(const char *ip, int port,
 #endif
 
     // IP transparency support (Linux TPROXY)
-    if (enable_transparent && bind_client_addr != NULL) {
+    if (!is_ipv6 && enable_transparent && bind_client_addr != NULL) {
 #if defined(__linux__) && defined(IP_TRANSPARENT)
         int opt = 1;
         if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) == 0) {
@@ -164,24 +200,42 @@ int net_connect_tcp_nonblocking(const char *ip, int port,
         return -1;
     }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-        close(fd);
-        return -1;
-    }
-
     int res;
-    while ((res = connect(fd, (struct sockaddr *)&addr, sizeof(addr))) < 0) {
-        if (errno == EINTR) continue;
-        if (errno == EINPROGRESS) {
-            if (in_progress) *in_progress = true;
-            return fd;
+    if (is_ipv6) {
+        struct sockaddr_in6 addr6;
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons((uint16_t)port);
+        addr6.sin6_addr = addr6_check;
+
+        while ((res = connect(fd, (struct sockaddr *)&addr6, sizeof(addr6))) < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EINPROGRESS) {
+                if (in_progress) *in_progress = true;
+                return fd;
+            }
+            close(fd);
+            return -1;
         }
-        close(fd);
-        return -1;
+    } else {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+            close(fd);
+            return -1;
+        }
+
+        while ((res = connect(fd, (struct sockaddr *)&addr, sizeof(addr))) < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EINPROGRESS) {
+                if (in_progress) *in_progress = true;
+                return fd;
+            }
+            close(fd);
+            return -1;
+        }
     }
 
     // res == 0: connected immediately

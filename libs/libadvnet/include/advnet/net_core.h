@@ -34,8 +34,9 @@ int net_set_timeouts(int fd, int timeout_sec);
 int net_set_reuse(int fd, int reuse_addr, int reuse_port);
 int net_set_keepalive(int fd, int enable);
 
-// IP address validation
+// IP address validation (IPv4 and IPv6)
 bool net_validate_ipv4(const char *ip);
+bool net_validate_ip(const char *ip);
 
 #ifdef __cplusplus
 }

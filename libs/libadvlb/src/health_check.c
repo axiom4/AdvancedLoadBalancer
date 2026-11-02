@@ -89,28 +89,40 @@ void perform_health_check_cycle(bool is_startup) {
         is_healthy[i] = false;
         probe_stage[i] = 2; // default DONE
 
-        char ip[INET_ADDRSTRLEN];
+        char ip[INET6_ADDRSTRLEN];
         int port;
         pthread_mutex_lock(&g_backend_mutex);
         strncpy(ip, g_backends[i].ip, sizeof(ip));
         port = g_backends[i].port;
         pthread_mutex_unlock(&g_backend_mutex);
 
+        struct in6_addr a6;
+        bool is_v6 = (inet_pton(AF_INET6, ip, &a6) == 1);
+
         int sock_type = (g_config.enable_udp_mode && g_config.current_hc_type == HC_TYPE_PAYLOAD) ? SOCK_DGRAM : SOCK_STREAM;
-        int sfd = socket(AF_INET, sock_type, 0);
+        int sfd = socket(is_v6 ? AF_INET6 : AF_INET, sock_type, 0);
         if (sfd < 0) continue;
 
         set_nonblocking(sfd);
 
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons((uint16_t)port);
-        inet_pton(AF_INET, ip, &addr.sin_addr);
-
         clock_gettime(CLOCK_MONOTONIC, &start_times[i]);
 
-        int res = connect(sfd, (struct sockaddr *)&addr, sizeof(addr));
+        int res;
+        if (is_v6) {
+            struct sockaddr_in6 addr6;
+            memset(&addr6, 0, sizeof(addr6));
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_port = htons((uint16_t)port);
+            addr6.sin6_addr = a6;
+            res = connect(sfd, (struct sockaddr *)&addr6, sizeof(addr6));
+        } else {
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((uint16_t)port);
+            inet_pton(AF_INET, ip, &addr.sin_addr);
+            res = connect(sfd, (struct sockaddr *)&addr, sizeof(addr));
+        }
         if (res == 0) {
             probe_fds[i] = sfd;
             if (g_config.current_hc_type == HC_TYPE_TCP) {
@@ -194,7 +206,7 @@ void perform_health_check_cycle(bool is_startup) {
                     probe_stage[idx] = 2; // DONE
                     active_probes--;
                 } else {
-                    char ip[INET_ADDRSTRLEN];
+                    char ip[INET6_ADDRSTRLEN];
                     int port;
                     pthread_mutex_lock(&g_backend_mutex);
                     strncpy(ip, g_backends[idx].ip, sizeof(ip));
@@ -268,7 +280,7 @@ void perform_health_check_cycle(bool is_startup) {
     struct {
         int idx;
         int event_type; // 0=none, 1=init_up, 2=init_down, 3=regime_up, 4=regime_down
-        char ip[INET_ADDRSTRLEN];
+        char ip[INET6_ADDRSTRLEN];
         int port;
         double latency;
         int fails;

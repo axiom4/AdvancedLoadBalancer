@@ -42,7 +42,7 @@ typedef enum {
 } HealthCheckType;
 
 typedef struct {
-    char ip[INET_ADDRSTRLEN];
+    char ip[64];
     int port;
     int weight;
     int current_weight;

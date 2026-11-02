@@ -348,7 +348,7 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
     inet_ntop(AF_INET, &(conn->client_addr.sin_addr), client_ip, sizeof(client_ip));
     int client_port = ntohs(conn->client_addr.sin_port);
 
-    char b_ip[INET_ADDRSTRLEN];
+    char b_ip[INET6_ADDRSTRLEN];
     int b_port;
     pthread_mutex_lock(&g_backend_mutex);
     strncpy(b_ip, g_backends[conn->backend_idx].ip, sizeof(b_ip));
@@ -458,7 +458,7 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
             break;
         }
 
-        char b_ip[INET_ADDRSTRLEN];
+        char b_ip[INET6_ADDRSTRLEN];
         int b_port;
         pthread_mutex_lock(&g_backend_mutex);
         strncpy(b_ip, g_backends[b_idx].ip, sizeof(b_ip));
@@ -532,7 +532,7 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
         socklen_t len = sizeof(err);
         if (getsockopt(conn->backend_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
             int failure_code = (err != 0) ? err : errno;
-            char b_ip[INET_ADDRSTRLEN];
+            char b_ip[INET6_ADDRSTRLEN];
             int b_port = 0;
             pthread_mutex_lock(&g_backend_mutex);
             strncpy(b_ip, g_backends[conn->backend_idx].ip, sizeof(b_ip));
@@ -1383,7 +1383,7 @@ void *client_handler_thread(void *arg) {
         backend_idx = get_healthy_backend(&client_addr);
         if (backend_idx < 0) break;
 
-        char b_ip[INET_ADDRSTRLEN];
+        char b_ip[INET6_ADDRSTRLEN];
         int b_port;
         pthread_mutex_lock(&g_backend_mutex);
         strncpy(b_ip, g_backends[backend_idx].ip, sizeof(b_ip));
