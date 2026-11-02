@@ -56,7 +56,7 @@ typedef struct {
 
 typedef struct {
     int client_fd;
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
 } ClientContext;
 
 #endif /* ADVLB_TYPES_H */

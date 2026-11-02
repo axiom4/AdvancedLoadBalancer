@@ -12,7 +12,7 @@ extern pthread_mutex_t g_backend_mutex;
 
 const char *algorithm_name(BalancerAlgorithm alg);
 bool add_backend(const char *ip, int port, int weight);
-int get_healthy_backend(const struct sockaddr_in *client_addr);
+int get_healthy_backend(const struct sockaddr_storage *client_addr);
 void release_backend(int index);
 void record_backend_success(int index);
 void record_backend_failure(int index);

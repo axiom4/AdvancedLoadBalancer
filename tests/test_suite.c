@@ -78,8 +78,26 @@ static void test_proxy_protocol_v1_build(void) {
     // Test with NULL addresses (UNKNOWN fallback)
     len = build_proxy_protocol_v1_header(buf, sizeof(buf), NULL, NULL);
     TEST_ASSERT(len > 0, "build_proxy_protocol_v1_header handles NULL without crashing");
-    TEST_ASSERT(strstr(buf, "PROXY TCP4 UNKNOWN UNKNOWN 0 0\r\n") != NULL,
+    TEST_ASSERT(strstr(buf, "PROXY UNKNOWN\r\n") != NULL,
                 "Header gracefully falls back to UNKNOWN endpoints");
+
+    // Test TCP6 serialization
+    struct sockaddr_storage c6, l6;
+    memset(&c6, 0, sizeof(c6));
+    memset(&l6, 0, sizeof(l6));
+    c6.ss_family = AF_INET6;
+    l6.ss_family = AF_INET6;
+    struct sockaddr_in6 *sin6_c = (struct sockaddr_in6 *)&c6;
+    struct sockaddr_in6 *sin6_l = (struct sockaddr_in6 *)&l6;
+    inet_pton(AF_INET6, "2001:db8::1", &sin6_c->sin6_addr);
+    sin6_c->sin6_port = htons(50000);
+    inet_pton(AF_INET6, "2001:db8::2", &sin6_l->sin6_addr);
+    sin6_l->sin6_port = htons(8443);
+
+    len = build_proxy_protocol_v1_header_storage(buf, sizeof(buf), &c6, &l6);
+    TEST_ASSERT(len > 0, "build_proxy_protocol_v1_header_storage formats TCP6 positive length");
+    TEST_ASSERT(strstr(buf, "PROXY TCP6 2001:db8::1 2001:db8::2 50000 8443\r\n") != NULL,
+                "Header format exactly matches HAProxy TCP6 specification");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -124,6 +142,43 @@ static void test_proxy_protocol_v1_parse(void) {
 
     close(sv[0]);
     close(sv[1]);
+
+    // Case 2c: Non-blocking partial read & Slowloris resilience
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "Created third socketpair for Slowloris test");
+    const char *partial_part1 = "PROXY TCP4 198.51.100.2 ";
+    (void)write(sv[0], partial_part1, strlen(partial_part1));
+
+    struct sockaddr_storage nonblock_addr;
+    memset(&nonblock_addr, 0, sizeof(nonblock_addr));
+    bool need_more = false;
+    bool parsed_ok = try_parse_proxy_protocol_v1(sv[1], &nonblock_addr, &need_more);
+    TEST_ASSERT(parsed_ok == false && need_more == true,
+                "try_parse_proxy_protocol_v1 returns need_more=true on partial header without blocking");
+
+    const char *partial_part2 = "192.0.2.1 44321 80\r\nRestOfStream";
+    (void)write(sv[0], partial_part2, strlen(partial_part2));
+    parsed_ok = try_parse_proxy_protocol_v1(sv[1], &nonblock_addr, &need_more);
+    TEST_ASSERT(parsed_ok == true && need_more == false,
+                "try_parse_proxy_protocol_v1 succeeds once CRLF terminates PROXY header");
+    TEST_ASSERT(nonblock_addr.ss_family == AF_INET, "Parsed address family is AF_INET");
+
+    memset(remaining, 0, sizeof(remaining));
+    r = read(sv[1], remaining, sizeof(remaining) - 1);
+    TEST_ASSERT(r == 12 && strcmp(remaining, "RestOfStream") == 0,
+                "Stream payload following partial PROXY header is completely preserved");
+
+    close(sv[0]);
+    close(sv[1]);
+
+    // Case 2d: TCP6 parsing
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "Created fourth socketpair for TCP6 parsing");
+    const char *tcp6_hdr = "PROXY TCP6 2001:db8::5 2001:db8::6 54321 443\r\n";
+    (void)write(sv[0], tcp6_hdr, strlen(tcp6_hdr));
+    parsed_ok = try_parse_proxy_protocol_v1(sv[1], &nonblock_addr, &need_more);
+    TEST_ASSERT(parsed_ok == true && nonblock_addr.ss_family == AF_INET6,
+                "try_parse_proxy_protocol_v1 successfully parses TCP6 IPv6 address");
+    close(sv[0]);
+    close(sv[1]);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -152,11 +207,12 @@ static void test_load_balancer_algorithms(void) {
     printf("\n=== Running Test Suite: Load Balancing Algorithms ===\n");
 
     reset_test_backends(3);
-    struct sockaddr_in client;
+    struct sockaddr_storage client;
     memset(&client, 0, sizeof(client));
-    client.sin_family = AF_INET;
-    inet_pton(AF_INET, "192.168.1.50", &client.sin_addr);
-    client.sin_port = htons(12345);
+    client.ss_family = AF_INET;
+    struct sockaddr_in *sin = (struct sockaddr_in *)&client;
+    inet_pton(AF_INET, "192.168.1.50", &sin->sin_addr);
+    sin->sin_port = htons(12345);
 
     // 4a. Round-Robin
     g_config.current_algorithm = ALG_ROUND_ROBIN;
@@ -202,6 +258,27 @@ static void test_load_balancer_algorithms(void) {
     TEST_ASSERT(consistent == true, "ALG_IP_HASH delivers 100% deterministic session affinity for same client IP");
     release_backend(first_choice);
 
+    // 4c2. IPv6 IP Hash Affinity
+    struct sockaddr_storage client6;
+    memset(&client6, 0, sizeof(client6));
+    client6.ss_family = AF_INET6;
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&client6;
+    inet_pton(AF_INET6, "2001:db8:85a3::8a2e:370:7334", &sin6->sin6_addr);
+    sin6->sin6_port = htons(49152);
+
+    int first_choice6 = get_healthy_backend(&client6);
+    bool consistent6 = true;
+    for (int i = 0; i < 20; i++) {
+        int next_choice6 = get_healthy_backend(&client6);
+        release_backend(next_choice6);
+        if (next_choice6 != first_choice6) {
+            consistent6 = false;
+            break;
+        }
+    }
+    TEST_ASSERT(consistent6 == true, "ALG_IP_HASH delivers 100% deterministic session affinity for 128-bit IPv6 client address");
+    release_backend(first_choice6);
+
     // 4d. Random-2 (Power of Two Random Choices)
     reset_test_backends(3);
     atomic_store(&g_backends[0].active_connections, 100);
@@ -223,10 +300,11 @@ static void test_circuit_breaker(void) {
     reset_test_backends(2);
     g_config.current_algorithm = ALG_ROUND_ROBIN;
 
-    struct sockaddr_in client;
+    struct sockaddr_storage client;
     memset(&client, 0, sizeof(client));
-    client.sin_family = AF_INET;
-    inet_pton(AF_INET, "127.0.0.1", &client.sin_addr);
+    client.ss_family = AF_INET;
+    struct sockaddr_in *sin_cb = (struct sockaddr_in *)&client;
+    inet_pton(AF_INET, "127.0.0.1", &sin_cb->sin_addr);
 
     // Backend 0 experiences client connection failures
     for (int i = 0; i < 19; i++) {

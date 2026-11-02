@@ -177,7 +177,7 @@ int main(int argc, char *argv[]) {
             config_reload();
         }
 
-        struct sockaddr_in client_addr;
+        struct sockaddr_storage client_addr;
         socklen_t client_len = sizeof(client_addr);
 
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);

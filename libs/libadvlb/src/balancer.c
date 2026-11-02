@@ -149,7 +149,7 @@ static int select_backend_least_connections_lockfree(int num_backends) {
 }
 
 // 3. IP Hash: client IP sticky sessions with active backend fallback (Lock-Free)
-static int select_backend_ip_hash_lockfree(const struct sockaddr_in *client_addr, int num_backends) {
+static int select_backend_ip_hash_lockfree(const struct sockaddr_storage *client_addr, int num_backends) {
     int healthy_list[MAX_BACKENDS];
     int healthy_count = 0;
 
@@ -160,13 +160,23 @@ static int select_backend_ip_hash_lockfree(const struct sockaddr_in *client_addr
     }
     if (healthy_count == 0) return -1;
 
-    // 32-bit FNV-1a hash algorithm on client IPv4 address
+    // 32-bit FNV-1a hash algorithm on client IP address (supports both IPv4 and IPv6)
     uint32_t hash = 2166136261u;
     if (client_addr != NULL) {
-        const unsigned char *p = (const unsigned char *)&(client_addr->sin_addr.s_addr);
-        for (int i = 0; i < 4; i++) {
-            hash ^= p[i];
-            hash *= 16777619u;
+        if (client_addr->ss_family == AF_INET6) {
+            const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)client_addr;
+            const unsigned char *p = (const unsigned char *)&s6->sin6_addr;
+            for (size_t i = 0; i < sizeof(s6->sin6_addr); i++) {
+                hash ^= p[i];
+                hash *= 16777619u;
+            }
+        } else {
+            const struct sockaddr_in *s4 = (const struct sockaddr_in *)client_addr;
+            const unsigned char *p = (const unsigned char *)&s4->sin_addr.s_addr;
+            for (size_t i = 0; i < sizeof(s4->sin_addr.s_addr); i++) {
+                hash ^= p[i];
+                hash *= 16777619u;
+            }
         }
     }
     return healthy_list[hash % (uint32_t)healthy_count];
@@ -238,7 +248,7 @@ static int select_backend_random_2_lockfree(int num_backends) {
     return (c1 <= c2) ? idx1 : idx2;
 }
 
-int get_healthy_backend(const struct sockaddr_in *client_addr) {
+int get_healthy_backend(const struct sockaddr_storage *client_addr) {
     int num_backends = g_num_backends;
     if (num_backends <= 0) return -1;
 

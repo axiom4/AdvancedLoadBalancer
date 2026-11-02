@@ -117,7 +117,23 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
  * WORKER POOL ARCHITECTURE (Epoll Event-Loop per Worker)
  * ============================================================================ */
 
+static inline void get_client_ip_port(const struct sockaddr_storage *ss, char *ip_buf, size_t ip_len, int *port) {
+    if (ss && ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ip_buf, (socklen_t)ip_len);
+        if (port) *port = ntohs(sin6->sin6_port);
+    } else if (ss && ss->ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+        inet_ntop(AF_INET, &sin->sin_addr, ip_buf, (socklen_t)ip_len);
+        if (port) *port = ntohs(sin->sin_port);
+    } else {
+        snprintf(ip_buf, ip_len, "unknown");
+        if (port) *port = 0;
+    }
+}
+
 typedef enum {
+    CONN_STATE_PROXY_PROTOCOL,
     CONN_STATE_SSL_HANDSHAKE,
     CONN_STATE_BACKEND_CONNECTING,
     CONN_STATE_FORWARDING
@@ -132,7 +148,7 @@ typedef struct ProxyConnection {
     int retry_count;
     ConnectionState state;
 
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     SSL *client_ssl;
 
     StreamBuffer c2b; // client to backend
@@ -156,7 +172,7 @@ typedef struct ProxyConnection {
 
 typedef struct NewConnNode {
     int client_fd;
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     struct NewConnNode *next;
 } NewConnNode;
 
@@ -251,18 +267,21 @@ static void worker_remove_conn(WorkerThread *worker, ProxyConnection *conn) {
 }
 
 static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(conn->client_addr.sin_addr), client_ip, sizeof(client_ip));
-    int client_port = ntohs(conn->client_addr.sin_port);
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port = 0;
+    get_client_ip_port(&conn->client_addr, client_ip, sizeof(client_ip), &client_port);
 
     if (conn->backend_fd >= 0) {
         epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
         worker_clear_fd(worker, conn->backend_fd);
 
         bool pooled = false;
+        // Do not pool half-closed connections (backend_shut_wr) or when PROXY Protocol v1 is active
         if (g_config.enable_upstream_pooling &&
             conn->backend_idx >= 0 &&
             !conn->backend_closed &&
+            !conn->backend_shut_wr &&
+            !g_config.enable_proxy_protocol_v1 &&
             conn->state == CONN_STATE_FORWARDING &&
             buffer_available(&conn->c2b) == 0 &&
             buffer_available(&conn->b2c) == 0) {
@@ -358,9 +377,9 @@ static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn
 }
 
 static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *conn) {
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(conn->client_addr.sin_addr), client_ip, sizeof(client_ip));
-    int client_port = ntohs(conn->client_addr.sin_port);
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port = 0;
+    get_client_ip_port(&conn->client_addr, client_ip, sizeof(client_ip), &client_port);
 
     char b_ip[INET6_ADDRSTRLEN];
     int b_port;
@@ -376,15 +395,15 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
 
     // If PROXY Protocol v1 is enabled towards backend, prepend header to c2b buffer
     if (g_config.enable_proxy_protocol_v1) {
-        struct sockaddr_in lb_addr;
+        struct sockaddr_storage lb_addr;
         socklen_t lb_len = sizeof(lb_addr);
         if (getsockname(conn->client_fd, (struct sockaddr *)&lb_addr, &lb_len) != 0) {
             memset(&lb_addr, 0, sizeof(lb_addr));
-            lb_addr.sin_family = AF_INET;
-            lb_addr.sin_port = htons((uint16_t)g_config.listen_port);
+            lb_addr.ss_family = AF_INET;
+            ((struct sockaddr_in *)&lb_addr)->sin_port = htons((uint16_t)g_config.listen_port);
         }
         char pp_hdr[128];
-        int pp_len = build_proxy_protocol_v1_header(pp_hdr, sizeof(pp_hdr), &conn->client_addr, &lb_addr);
+        int pp_len = build_proxy_protocol_v1_header_storage(pp_hdr, sizeof(pp_hdr), &conn->client_addr, &lb_addr);
         if (pp_len > 0) {
             size_t avail = buffer_available(&conn->c2b);
             if (conn->c2b.head >= (size_t)pp_len) {
@@ -451,9 +470,9 @@ static void worker_retry_backend_connect(WorkerThread *worker, ProxyConnection *
 }
 
 static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *conn) {
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(conn->client_addr.sin_addr), client_ip, sizeof(client_ip));
-    int client_port = ntohs(conn->client_addr.sin_port);
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port = 0;
+    get_client_ip_port(&conn->client_addr, client_ip, sizeof(client_ip), &client_port);
 
     // Register client_fd in epoll if not yet monitored so initial client data can be buffered
     if (conn->client_fd >= 0 && conn->last_client_ev == 0) {
@@ -768,6 +787,9 @@ static void worker_check_timeouts(WorkerThread *worker) {
             add_log("\033[1;33m[TIMEOUT]\033[0m Connection closed due to inactivity (>%ds) Slowloris protection",
                     timeout_sec);
             worker_close_conn(worker, curr);
+        } else if (curr->state == CONN_STATE_PROXY_PROTOCOL && (now - curr->last_activity >= 3)) {
+            add_log("\033[1;33m[TIMEOUT]\033[0m PROXY protocol header timeout (>3s) Slowloris protection");
+            worker_close_conn(worker, curr);
         } else if (curr->state == CONN_STATE_SSL_HANDSHAKE && (now - curr->hs_start >= 5)) {
             add_log("\033[1;33m[TIMEOUT]\033[0m SSL handshake timeout (>5s)");
             worker_close_conn(worker, curr);
@@ -782,7 +804,7 @@ static void worker_check_timeouts(WorkerThread *worker) {
     }
 }
 
-static void worker_accept_connection(WorkerThread *worker, int client_fd, const struct sockaddr_in *client_addr) {
+static void worker_accept_connection(WorkerThread *worker, int client_fd, const struct sockaddr_storage *client_addr) {
     set_nonblocking(client_fd);
     int flag = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
@@ -801,24 +823,35 @@ static void worker_accept_connection(WorkerThread *worker, int client_fd, const 
     conn->last_activity = time(NULL);
     conn->worker = worker;
 
-    // Check if PROXY Protocol v1 is expected from upstream client
+    worker_set_fd(worker, client_fd, conn);
+    worker_add_conn(worker, conn);
+
+    // Check if PROXY Protocol v1 is expected from upstream client (Non-blocking & Slowloris resilient)
     if (g_config.enable_accept_proxy) {
-        struct sockaddr_in real_addr = *client_addr;
-        if (parse_proxy_protocol_v1(client_fd, &real_addr)) {
+        bool need_more = false;
+        struct sockaddr_storage real_addr = *client_addr;
+        if (try_parse_proxy_protocol_v1(client_fd, &real_addr, &need_more)) {
             conn->client_addr = real_addr;
-            add_log("\033[1;35m[PPv1 IN]\033[0m Decoded real client IP: %s:%d",
-                    inet_ntoa(conn->client_addr.sin_addr), ntohs(conn->client_addr.sin_port));
+            char real_ip[INET6_ADDRSTRLEN];
+            int real_port = 0;
+            get_client_ip_port(&conn->client_addr, real_ip, sizeof(real_ip), &real_port);
+            add_log("\033[1;35m[PPv1 IN]\033[0m Decoded real client IP: %s:%d", real_ip, real_port);
+        } else if (need_more) {
+            // Header incomplete: wait for more data non-blockingly via epoll
+            conn->state = CONN_STATE_PROXY_PROTOCOL;
+            struct epoll_event ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.data.fd = client_fd;
+            ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+            conn->last_client_ev = ev.events;
+            epoll_ctl(worker->epfd, EPOLL_CTL_ADD, client_fd, &ev);
+            return;
         } else {
             add_log("\033[1;31m[PPv1 ERR]\033[0m Connection rejected: missing or invalid PROXY v1 header");
-            close(client_fd);
-            free(conn);
-            atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
+            worker_close_conn(worker, conn);
             return;
         }
     }
-
-    worker_set_fd(worker, client_fd, conn);
-    worker_add_conn(worker, conn);
 
     if (g_config.enable_ssl_offloading) {
         conn->client_ssl = SSL_new(g_global_ssl_ctx);
@@ -930,7 +963,43 @@ static void *worker_event_loop(void *arg) {
             ProxyConnection *conn = worker_get_fd(worker, curr_fd);
             if (!conn) continue;
 
-            if (conn->state == CONN_STATE_SSL_HANDSHAKE) {
+            if (conn->state == CONN_STATE_PROXY_PROTOCOL) {
+                if (ev_mask & (EPOLLERR | EPOLLHUP)) {
+                    worker_close_conn(worker, conn);
+                    continue;
+                }
+                bool need_more = false;
+                struct sockaddr_storage real_addr = conn->client_addr;
+                if (try_parse_proxy_protocol_v1(conn->client_fd, &real_addr, &need_more)) {
+                    conn->client_addr = real_addr;
+                    char real_ip[INET6_ADDRSTRLEN];
+                    int real_port = 0;
+                    get_client_ip_port(&conn->client_addr, real_ip, sizeof(real_ip), &real_port);
+                    add_log("\033[1;35m[PPv1 IN]\033[0m Decoded real client IP: %s:%d", real_ip, real_port);
+
+                    conn->last_activity = time(NULL);
+                    if (g_config.enable_ssl_offloading) {
+                        conn->client_ssl = SSL_new(g_global_ssl_ctx);
+                        if (!conn->client_ssl) {
+                            worker_close_conn(worker, conn);
+                            continue;
+                        }
+                        SSL_set_fd(conn->client_ssl, conn->client_fd);
+                        conn->state = CONN_STATE_SSL_HANDSHAKE;
+                        conn->hs_start = time(NULL);
+                        worker_step_ssl_handshake(worker, conn);
+                    } else {
+                        epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->client_fd, NULL);
+                        conn->last_client_ev = 0;
+                        worker_start_backend_connect(worker, conn);
+                    }
+                } else if (need_more) {
+                    conn->last_activity = time(NULL);
+                } else {
+                    add_log("\033[1;31m[PPv1 ERR]\033[0m Connection rejected: malformed PROXY v1 header");
+                    worker_close_conn(worker, conn);
+                }
+            } else if (conn->state == CONN_STATE_SSL_HANDSHAKE) {
                 worker_step_ssl_handshake(worker, conn);
             } else if (conn->state == CONN_STATE_BACKEND_CONNECTING) {
                 worker_handle_backend_connecting(worker, conn, curr_fd, ev_mask);
@@ -1007,7 +1076,7 @@ bool worker_pool_init(int num_workers) {
     return true;
 }
 
-void worker_pool_dispatch(int client_fd, const struct sockaddr_in *client_addr) {
+void worker_pool_dispatch(int client_fd, const struct sockaddr_storage *client_addr) {
     if (s_num_workers <= 0 || !s_workers) {
         close(client_fd);
         atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
@@ -1306,15 +1375,19 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 void *client_handler_thread(void *arg) {
     ClientContext *ctx = (ClientContext *)arg;
     int client_fd = ctx->client_fd;
-    struct sockaddr_in client_addr = ctx->client_addr;
+    struct sockaddr_storage client_addr = ctx->client_addr;
     free(ctx);
 
     if (g_config.enable_accept_proxy) {
-        struct sockaddr_in real_client_addr = client_addr;
-        if (parse_proxy_protocol_v1(client_fd, &real_client_addr)) {
-            client_addr = real_client_addr;
-            add_log("\033[1;35m[PPv1 IN]\033[0m Decoded real client IP: %s:%d",
-                    inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+        // In legacy blocking thread mode, parse_proxy_protocol_v1
+        struct sockaddr_in real_in;
+        if (parse_proxy_protocol_v1(client_fd, &real_in)) {
+            memset(&client_addr, 0, sizeof(client_addr));
+            memcpy(&client_addr, &real_in, sizeof(real_in));
+            char real_ip[INET6_ADDRSTRLEN];
+            int real_port = 0;
+            get_client_ip_port(&client_addr, real_ip, sizeof(real_ip), &real_port);
+            add_log("\033[1;35m[PPv1 IN]\033[0m Decoded real client IP: %s:%d", real_ip, real_port);
         } else {
             add_log("\033[1;31m[PPv1 ERR]\033[0m Connection rejected: missing or invalid PROXY v1 header");
             close(client_fd);
@@ -1322,9 +1395,9 @@ void *client_handler_thread(void *arg) {
         }
     }
 
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
-    int client_port = ntohs(client_addr.sin_port);
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port = 0;
+    get_client_ip_port(&client_addr, client_ip, sizeof(client_ip), &client_port);
 
     SSL *client_ssl = NULL;
 
@@ -1435,15 +1508,15 @@ void *client_handler_thread(void *arg) {
 
     if (backend_fd >= 0) {
         if (g_config.enable_proxy_protocol_v1) {
-            struct sockaddr_in lb_addr;
+            struct sockaddr_storage lb_addr;
             socklen_t lb_len = sizeof(lb_addr);
             if (getsockname(client_fd, (struct sockaddr *)&lb_addr, &lb_len) != 0) {
                 memset(&lb_addr, 0, sizeof(lb_addr));
-                lb_addr.sin_family = AF_INET;
-                lb_addr.sin_port = htons((uint16_t)g_config.listen_port);
+                lb_addr.ss_family = AF_INET;
+                ((struct sockaddr_in *)&lb_addr)->sin_port = htons((uint16_t)g_config.listen_port);
             }
             char pp_hdr[128];
-            int pp_len = build_proxy_protocol_v1_header(pp_hdr, sizeof(pp_hdr), &client_addr, &lb_addr);
+            int pp_len = build_proxy_protocol_v1_header_storage(pp_hdr, sizeof(pp_hdr), &client_addr, &lb_addr);
             if (write_all(backend_fd, pp_hdr, (size_t)pp_len) <= 0) {
                 add_log("\033[1;31m[PPv1 ERR]\033[0m Failed sending PROXY v1 to backend [%d]", backend_idx);
             }

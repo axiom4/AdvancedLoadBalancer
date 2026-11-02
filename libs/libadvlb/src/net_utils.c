@@ -34,11 +34,11 @@ ssize_t read_retry(int fd, char *buf, size_t len) {
     return net_read_retry(fd, buf, len);
 }
 
-int connect_with_timeout_transparent(const char *ip, int port, int timeout_ms, const struct sockaddr_in *client_addr) {
+int connect_with_timeout_transparent(const char *ip, int port, int timeout_ms, const struct sockaddr_storage *client_addr) {
     return net_connect_tcp_timeout(ip, port, timeout_ms, client_addr, g_config.enable_transparent_mode);
 }
 
-int connect_nonblocking_transparent(const char *ip, int port, const struct sockaddr_in *client_addr, bool *in_progress) {
+int connect_nonblocking_transparent(const char *ip, int port, const struct sockaddr_storage *client_addr, bool *in_progress) {
     return net_connect_tcp_nonblocking(ip, port, client_addr, g_config.enable_transparent_mode, in_progress);
 }
 

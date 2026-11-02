@@ -169,7 +169,10 @@ static UdpSession *worker_find_or_create_session(UdpWorker *w, const struct sock
 
     free_slot = slot_to_use;
 
-    int backend_idx = get_healthy_backend(client_addr);
+    struct sockaddr_storage client_ss;
+    memset(&client_ss, 0, sizeof(client_ss));
+    memcpy(&client_ss, client_addr, sizeof(struct sockaddr_in));
+    int backend_idx = get_healthy_backend(&client_ss);
     if (backend_idx < 0) {
         pthread_mutex_unlock(&w->mutex);
         return NULL;

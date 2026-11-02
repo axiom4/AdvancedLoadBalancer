@@ -155,7 +155,7 @@ int net_create_udp_server(int port) {
 }
 
 int net_connect_tcp_nonblocking(const char *ip, int port,
-                                const struct sockaddr_in *bind_client_addr,
+                                const struct sockaddr_storage *bind_client_addr,
                                 bool enable_transparent,
                                 bool *in_progress) {
     if (in_progress) *in_progress = false;
@@ -176,22 +176,41 @@ int net_connect_tcp_nonblocking(const char *ip, int port,
 #endif
 
     // IP transparency support (Linux TPROXY)
-    if (!is_ipv6 && enable_transparent && bind_client_addr != NULL) {
+    if (enable_transparent && bind_client_addr != NULL) {
 #if defined(__linux__) && defined(IP_TRANSPARENT)
         int opt = 1;
-        if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) == 0) {
-            struct sockaddr_in bind_addr;
-            memset(&bind_addr, 0, sizeof(bind_addr));
-            bind_addr.sin_family = AF_INET;
-            bind_addr.sin_addr = bind_client_addr->sin_addr;
-            bind_addr.sin_port = htons(0);
+        if (!is_ipv6 && bind_client_addr->ss_family == AF_INET) {
+            if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &opt, sizeof(opt)) == 0) {
+                struct sockaddr_in bind_addr;
+                memset(&bind_addr, 0, sizeof(bind_addr));
+                bind_addr.sin_family = AF_INET;
+                bind_addr.sin_addr = ((const struct sockaddr_in *)bind_client_addr)->sin_addr;
+                bind_addr.sin_port = htons(0);
 
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            while (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-                if (errno == EINTR) continue;
-                break;
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                while (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
             }
         }
+#if defined(IPV6_TRANSPARENT)
+        else if (is_ipv6 && bind_client_addr->ss_family == AF_INET6) {
+            if (setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &opt, sizeof(opt)) == 0) {
+                struct sockaddr_in6 bind_addr6;
+                memset(&bind_addr6, 0, sizeof(bind_addr6));
+                bind_addr6.sin6_family = AF_INET6;
+                bind_addr6.sin6_addr = ((const struct sockaddr_in6 *)bind_client_addr)->sin6_addr;
+                bind_addr6.sin6_port = htons(0);
+
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+                while (bind(fd, (struct sockaddr *)&bind_addr6, sizeof(bind_addr6)) < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+            }
+        }
+#endif
 #endif
     }
 
@@ -244,7 +263,7 @@ int net_connect_tcp_nonblocking(const char *ip, int port,
 }
 
 int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
-                            const struct sockaddr_in *bind_client_addr,
+                            const struct sockaddr_storage *bind_client_addr,
                             bool enable_transparent) {
     bool in_progress = false;
     int fd = net_connect_tcp_nonblocking(ip, port, bind_client_addr, enable_transparent, &in_progress);
