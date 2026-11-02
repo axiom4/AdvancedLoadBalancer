@@ -1,6 +1,7 @@
 CC ?= gcc
 
-CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11 -I../include -I../libs/libadvlb/include -I../libs/libadvnet/include
+CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11
+override CFLAGS += -I../include -I../libs/libadvlb/include -I../libs/libadvnet/include
 UNAME_S := $(shell uname -s)
 
 NET_LIB_DIR ?= ../libs/libadvnet/lib
@@ -10,7 +11,7 @@ BIN_DIR     ?= ..
 ifeq ($(UNAME_S),Darwin)
     OPENSSL_PREFIX := $(shell brew --prefix openssl 2>/dev/null || brew --prefix openssl@3 2>/dev/null || brew --prefix openssl@4 2>/dev/null || echo /opt/homebrew/opt/openssl)
     ifneq ($(findstring -DNO_SSL,$(CFLAGS)),-DNO_SSL)
-        CFLAGS += -I$(OPENSSL_PREFIX)/include
+        override CFLAGS += -I$(OPENSSL_PREFIX)/include
         LDLIBS = -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto -lncurses
     else
         LDLIBS = -lncurses

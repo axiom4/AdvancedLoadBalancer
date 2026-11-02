@@ -2,6 +2,7 @@
 advanced_load_balancer
 load_balancer_advanced
 test_client
+test_suite
 
 # Directory e oggetti di build
 build/

@@ -9,12 +9,21 @@ LIBS_NET_DIR = $(ROOT_DIR)/libs/libadvnet
 LIBS_LB_DIR  = $(ROOT_DIR)/libs/libadvlb
 APP_DIR      = $(ROOT_DIR)/app
 TOOLS_DIR    = $(ROOT_DIR)/tools
+TESTS_DIR    = $(ROOT_DIR)/tests
 
 TARGET = advanced_load_balancer
 CLIENT_TARGET = test_client
+TEST_TARGET = test_suite
 
 # Default: build all libraries (static/shared), main application and test client
 all: directories net-lib lb-lib app-target client
+
+# Run automated test suite
+test test-suite: directories net-lib lb-lib
+	@$(MAKE) -C $(TESTS_DIR) run
+
+build-tests: directories net-lib lb-lib
+	@$(MAKE) -C $(TESTS_DIR) all
 
 directories:
 	@mkdir -p $(LIB_DIR)
@@ -48,10 +57,11 @@ nossl: clean directories
 
 # Debug build with AddressSanitizer and UndefinedBehaviorSanitizer
 debug: clean directories
-	@$(MAKE) -C $(LIBS_NET_DIR) ROOT_LIB_DIR=$(LIB_DIR) CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -Iinclude -fsanitize=address,undefined" all
-	@$(MAKE) -C $(LIBS_LB_DIR) ROOT_LIB_DIR=$(LIB_DIR) NET_LIB_DIR=$(LIBS_NET_DIR)/lib CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -Iinclude -I../libadvnet/include -fsanitize=address,undefined" all
+	@$(MAKE) -C $(LIBS_NET_DIR) ROOT_LIB_DIR=$(LIB_DIR) CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -Iinclude -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" all
+	@$(MAKE) -C $(LIBS_LB_DIR) ROOT_LIB_DIR=$(LIB_DIR) NET_LIB_DIR=$(LIBS_NET_DIR)/lib CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -Iinclude -I../libadvnet/include -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" all
 	@$(MAKE) -C $(APP_DIR) CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -I../include -I../libs/libadvlb/include -I../libs/libadvnet/include -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" static
 	@$(MAKE) -C $(TOOLS_DIR) CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" all
+	@$(MAKE) -C $(TESTS_DIR) CFLAGS="-Wall -Wextra -pthread -g -O0 -std=gnu11 -I../include -I../libs/libadvlb/include -I../libs/libadvnet/include -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined" all
 
 # Clean all modules
 clean:
@@ -59,6 +69,7 @@ clean:
 	@$(MAKE) -C $(LIBS_LB_DIR) clean || true
 	@$(MAKE) -C $(APP_DIR) clean || true
 	@$(MAKE) -C $(TOOLS_DIR) clean || true
-	rm -rf $(LIB_DIR) build $(TARGET) $(CLIENT_TARGET)
+	@$(MAKE) -C $(TESTS_DIR) clean || true
+	rm -rf $(LIB_DIR) build $(TARGET) $(CLIENT_TARGET) $(TEST_TARGET)
 
-.PHONY: all directories net net-lib lb lb-lib app app-target client test-client dynamic dynamic-bin nossl debug clean
+.PHONY: all directories net net-lib lb lb-lib app app-target client test-client dynamic dynamic-bin nossl debug test test-suite build-tests clean

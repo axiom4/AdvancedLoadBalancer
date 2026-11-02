@@ -41,7 +41,7 @@ $(STATIC_LIB): $(OBJS)
 
 shared dynamic: directories $(SHARED_LIB)
 $(SHARED_LIB): $(OBJS)
-	$(CC) $(SHARED_FLAGS) $(OBJS) -o $@
+	$(CC) $(SHARED_FLAGS) $(OBJS) -o $@ $(LDFLAGS)
 
 export: static shared
 	@if [ -d "$(ROOT_LIB_DIR)" ]; then \

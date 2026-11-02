@@ -2,7 +2,8 @@ CC ?= gcc
 AR ?= ar
 ARFLAGS = rcs
 
-CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11 -Iinclude -I../libadvnet/include
+CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11
+override CFLAGS += -Iinclude -I../libadvnet/include
 UNAME_S := $(shell uname -s)
 
 NET_LIB_DIR ?= ../libadvnet/lib
@@ -11,7 +12,7 @@ ROOT_LIB_DIR = ../../lib
 ifeq ($(UNAME_S),Darwin)
     OPENSSL_PREFIX := $(shell brew --prefix openssl 2>/dev/null || brew --prefix openssl@3 2>/dev/null || brew --prefix openssl@4 2>/dev/null || echo /opt/homebrew/opt/openssl)
     ifneq ($(findstring -DNO_SSL,$(CFLAGS)),-DNO_SSL)
-        CFLAGS += -I$(OPENSSL_PREFIX)/include
+        override CFLAGS += -I$(OPENSSL_PREFIX)/include
         LDLIBS = -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto -lncurses
     else
         LDLIBS = -lncurses
