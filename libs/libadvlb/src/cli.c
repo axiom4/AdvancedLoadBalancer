@@ -63,12 +63,25 @@ void print_help(const char *prog_name) {
 }
 
 void parse_backend_arg(const char *arg) {
+    if (!arg || !*arg) return;
     char copy[512];
     strncpy(copy, arg, sizeof(copy) - 1);
     copy[sizeof(copy) - 1] = '\0';
 
-    char *token = strtok(copy, ",");
+    char *saveptr = NULL;
+    char *token = strtok_r(copy, ",", &saveptr);
     while (token != NULL) {
+        while (*token == ' ' || *token == '\t') token++;
+        char *end = token + strlen(token) - 1;
+        while (end >= token && (*end == ' ' || *end == '\t')) {
+            *end = '\0';
+            end--;
+        }
+        if (*token == '\0') {
+            token = strtok_r(NULL, ",", &saveptr);
+            continue;
+        }
+
         char *first_colon = strchr(token, ':');
         if (first_colon) {
             *first_colon = '\0';
@@ -87,14 +100,18 @@ void parse_backend_arg(const char *arg) {
             }
 
             if (port > 0 && port <= 65535 && strlen(ip) > 0) {
-                add_backend(ip, port, weight);
+                if (!add_backend(ip, port, weight)) {
+                    exit(EXIT_FAILURE);
+                }
             } else {
-                fprintf(stderr, "[ERROR] Invalid port in backend: %s:%s\n", ip, rest);
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend '%s': port must be 1-65535\n", ip);
+                exit(EXIT_FAILURE);
             }
         } else {
-            fprintf(stderr, "[ERROR] Invalid backend format: '%s' (expected IP:PORT or IP:PORT:WEIGHT)\n", token);
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend format: '%s' (expected IP:PORT or IP:PORT:WEIGHT)\n", token);
+            exit(EXIT_FAILURE);
         }
-        token = strtok(NULL, ",");
+        token = strtok_r(NULL, ",", &saveptr);
     }
 }
 

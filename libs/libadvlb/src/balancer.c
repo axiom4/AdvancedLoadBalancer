@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 BackendServer g_backends[MAX_BACKENDS];
 int g_num_backends = 0;
@@ -24,14 +28,60 @@ const char *algorithm_name(BalancerAlgorithm alg) {
 }
 
 bool add_backend(const char *ip, int port, int weight) {
+    if (!ip || ip[0] == '\0') {
+        fprintf(stderr, "\033[1;31m[ERROR]\033[0m Backend host/IP cannot be empty\n");
+        return false;
+    }
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid backend port: %d (must be 1-65535)\n", port);
+        return false;
+    }
+
+    char resolved_ip[INET_ADDRSTRLEN];
+    struct in_addr test_addr;
+
+    // 1. Fast-path: Check if already a valid IPv4 dotted-decimal address
+    if (inet_pton(AF_INET, ip, &test_addr) == 1) {
+        if (inet_ntop(AF_INET, &test_addr, resolved_ip, sizeof(resolved_ip)) == NULL) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to format IPv4 address for '%s'\n", ip);
+            return false;
+        }
+    } else {
+        // 2. Not a dotted-decimal IPv4: resolve via DNS getaddrinfo
+        struct addrinfo hints;
+        struct addrinfo *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET; // IPv4
+        hints.ai_socktype = SOCK_STREAM;
+
+        int rc = getaddrinfo(ip, NULL, &hints, &res);
+        if (rc != 0 || res == NULL) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Cannot resolve backend '%s': %s\n",
+                    ip, (rc != 0) ? gai_strerror(rc) : "No IPv4 address returned");
+            if (res) freeaddrinfo(res);
+            return false;
+        }
+
+        struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+        if (inet_ntop(AF_INET, &sin->sin_addr, resolved_ip, sizeof(resolved_ip)) == NULL) {
+            freeaddrinfo(res);
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to convert resolved address for '%s'\n", ip);
+            return false;
+        }
+        freeaddrinfo(res);
+
+        printf("[INFO] Resolved backend hostname '%s' -> %s\n", ip, resolved_ip);
+    }
+
     pthread_mutex_lock(&g_backend_mutex);
     if (g_num_backends >= MAX_BACKENDS) {
         pthread_mutex_unlock(&g_backend_mutex);
-        fprintf(stderr, "[WARN] Maximum backends limit reached (%d). '%s:%d' ignored.\n", MAX_BACKENDS, ip, port);
+        fprintf(stderr, "\033[1;33m[WARN]\033[0m Maximum backends limit reached (%d). '%s:%d' ignored.\n",
+                MAX_BACKENDS, resolved_ip, port);
         return false;
     }
     int idx = g_num_backends;
-    strncpy(g_backends[idx].ip, ip, sizeof(g_backends[idx].ip) - 1);
+    strncpy(g_backends[idx].ip, resolved_ip, sizeof(g_backends[idx].ip) - 1);
     g_backends[idx].ip[sizeof(g_backends[idx].ip) - 1] = '\0';
     g_backends[idx].port = port;
     g_backends[idx].weight = (weight > 0) ? weight : 1;
