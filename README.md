@@ -203,12 +203,14 @@ Usage:
 | `--hc-interval SEC` | Interval between consecutive active health checks in seconds (default: 2). |
 | `--hc-timeout MS` | Response timeout for health check probe in milliseconds (default: 800). |
 
-### Performance and Worker Tuning
+### Upstream Connection Pooling and Worker Tuning
 | Option | Description |
 | :--- | :--- |
-| `-w, --workers NUM` | Number of epoll/kqueue worker threads (default: CPU cores, clamped 1-256). |
+| `-w, --workers NUM` | Number of worker threads (default: CPU cores, clamped 1-256). Scales TCP workers and multi-core UDP (`SO_REUSEPORT`). |
 | `-m, --max-connections NUM` | Maximum simultaneous concurrent client connections before dropping (default: 4096). |
 | `--timeout SEC` | Inactivity timeout for client streaming sockets in seconds (default: 30). |
+| `--no-pool` | Disable upstream TCP Keep-Alive connection pooling (enabled by default). |
+| `--pool-size NUM` | Maximum idle pooled connections retained per backend (default: 16, max: 32). |
 | `--no-tui` | Disable interactive Ncurses TUI and print logs directly to standard output. |
 
 ---
