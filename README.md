@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Epoll%20%2F%20Kqueue%20Worker%20Pool-orange.svg)](#system-architecture)
 [![Concurrency](https://img.shields.io/badge/Concurrency-Lock--Free%20MPSC-brightgreen.svg)](#load-balancing-algorithms)
-[![Tests](https://img.shields.io/badge/Tests-33%20Passed-success.svg)](#automated-test-suite-make-test)
+[![Tests](https://img.shields.io/badge/Tests-60%20Passed-success.svg)](#automated-test-suite-make-test)
 
 **Advanced Load Balancer (ADLB)** is a high-performance, low-latency network load balancer for **Layer 4 (TCP / UDP)** and **Layer 7 (HTTP / HTTPS)** traffic, engineered in modern **C11** with a modular library architecture, non-blocking **epoll / kqueue** worker pools, **lock-free** backend routing, and constant-memory asynchronous logging.
 
@@ -148,13 +148,19 @@ make clean
 ```
 Usage:
   ./advanced_load_balancer -p PORT -b IP:PORT[:WEIGHT] [OPTIONS]
+  ./advanced_load_balancer -c /path/to/advlb.conf [OPTIONS]
 ```
 
-### Mandatory Arguments
+### Configuration File
 | Option | Description |
 | :--- | :--- |
-| `-p, --port PORT` | Ingress listening port for TCP or UDP traffic (1-65535). |
-| `-b, --backend IP:PORT[:W]` | Upstream backend server with optional weight (default: 1). Can be repeated or passed as a comma-separated list. |
+| `-c, --config FILE` | Load configuration settings and upstream backend servers from an `advlb.conf` file. CLI options override configuration file values. |
+
+### Ingress & Backend Parameters
+| Option | Description |
+| :--- | :--- |
+| `-p, --port PORT` | Ingress listening port for TCP or UDP traffic (1-65535). Required unless defined in config file. |
+| `-b, --backend IP:PORT[:W]` | Upstream backend server with optional weight (default: 1). Supports both IPv4 (`127.0.0.1:9001`) and bracketed IPv6 (`[::1]:9001` or `[2001:db8::1]:8080:2`). Can be repeated or comma-separated. |
 
 ### Routing Algorithms
 | Option | Description |
@@ -230,6 +236,16 @@ Usage:
 ### Example 4: Layer 4 UDP Balancer (DNS or Real-Time Gaming)
 ```bash
 ./advanced_load_balancer -p 53 -u -b 1.1.1.1:53 -b 8.8.8.8:53 --udp-timeout 10
+```
+
+### Example 5: Running with Configuration File (`advlb.conf`)
+```bash
+./advanced_load_balancer -c advlb.conf
+```
+
+### Example 6: Dual-Stack IPv6 and IPv4 Backends
+```bash
+./advanced_load_balancer -p 8080 -b 127.0.0.1:9001:1 -b [::1]:9002:2 --algo lc
 ```
 
 ---
@@ -354,9 +370,11 @@ Run the complete test suite with zero external dependencies:
 make test
 ```
 
-### Test Coverage Highlights:
+### Test Coverage Highlights (60 Automated Tests):
 - **PROXY Protocol v1**: Serialization and stream decoding verification using UNIX `socketpair()` across fragmented payloads.
-- **IPv4 RFC Validation**: Bounds and syntax checking for valid and malformed addresses.
+- **IPv4 & IPv6 RFC Validation**: Bounds and syntax checking for valid and malformed IPv4 and IPv6 addresses.
+- **Dual-Stack & Bracketed IPv6**: Verification of bracketed IPv6 backend notation (`[::1]:9005:3`) and address normalization.
+- **Configuration File Parser (`advlb.conf`)**: Parsing network, SSL, health check, workers, and upstream servers from disk.
 - **Algorithm Verification**: Cycle correctness for Round-Robin, load balancing under variable active connections for Least-Connections, deterministic affinity for IP-Hash, and sampling under Random-2.
 - **Circuit Breaker Transitions**: Threshold trips (`UP -> DOWN`), routing bypass around dead backends, and restoration on successful probe.
 - **Underflow Protection**: Clamping guards preventing negative active connection counters on over-release.
