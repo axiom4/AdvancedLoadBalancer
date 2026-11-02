@@ -18,6 +18,7 @@
 
 #define MAX_UDP_SESSIONS 2048
 #define UDP_HASH_BUCKETS 1024
+#define MAX_UDP_SESSIONS_PER_IP 64
 
 typedef struct UdpSession {
     bool in_use;
@@ -92,40 +93,83 @@ static UdpSession *find_or_create_udp_session(int epfd, const struct sockaddr_in
     }
 
     int free_slot = -1;
+    int oldest_slot = -1;
+    time_t oldest_time = now + 1;
+    int expired_slot = -1;
+    time_t oldest_expired_time = now + 1;
+    int ip_sessions = 0;
+
+    // Single-pass scan: find free slot, count per-IP sessions, and identify LRU candidates
     for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
         if (!s_udp_sessions[i].in_use) {
-            free_slot = i;
-            break;
-        }
-    }
-
-    // If no free slots, recycle oldest expired session
-    if (free_slot == -1) {
-        time_t oldest_time = now;
-        int oldest_slot = -1;
-        for (int i = 0; i < MAX_UDP_SESSIONS; i++) {
-            if (s_udp_sessions[i].in_use && (now - s_udp_sessions[i].last_activity) >= g_config.udp_session_timeout_sec) {
-                if (s_udp_sessions[i].last_activity < oldest_time) {
-                    oldest_time = s_udp_sessions[i].last_activity;
-                    oldest_slot = i;
+            if (free_slot == -1) free_slot = i;
+        } else {
+            if (s_udp_sessions[i].client_addr.sin_addr.s_addr == client_addr->sin_addr.s_addr) {
+                ip_sessions++;
+            }
+            // Track absolute oldest for emergency LRU eviction under heavy flood
+            if (s_udp_sessions[i].last_activity < oldest_time) {
+                oldest_time = s_udp_sessions[i].last_activity;
+                oldest_slot = i;
+            }
+            // Track oldest expired session (idle > timeout)
+            if ((now - s_udp_sessions[i].last_activity) >= g_config.udp_session_timeout_sec) {
+                if (s_udp_sessions[i].last_activity < oldest_expired_time) {
+                    oldest_expired_time = s_udp_sessions[i].last_activity;
+                    expired_slot = i;
                 }
             }
         }
-        if (oldest_slot != -1) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, s_udp_sessions[oldest_slot].backend_fd, NULL);
-            close(s_udp_sessions[oldest_slot].backend_fd);
-            release_backend(s_udp_sessions[oldest_slot].backend_idx);
-            hash_remove(&s_udp_sessions[oldest_slot]);
-            s_udp_sessions[oldest_slot].in_use = false;
-            free_slot = oldest_slot;
+    }
+
+    // 1. Enforce per-IP concurrent session limit (mitigates IP-spoofing / state exhaustion DoS)
+    if (ip_sessions >= MAX_UDP_SESSIONS_PER_IP) {
+        static time_t last_ip_drop = 0;
+        if (now - last_ip_drop >= 2) {
+            char c_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(client_addr->sin_addr), c_ip, sizeof(c_ip));
+            add_log("\033[1;31m[UDP DROP]\033[0m Client %s exceeded per-IP session limit (%d)",
+                    c_ip, MAX_UDP_SESSIONS_PER_IP);
+            last_ip_drop = now;
+        }
+        pthread_mutex_unlock(&s_udp_session_mutex);
+        return NULL;
+    }
+
+    // 2. Select slot to use: free slot, oldest expired slot, or emergency LRU eviction
+    int slot_to_use = free_slot;
+    if (slot_to_use == -1 && expired_slot != -1) {
+        slot_to_use = expired_slot;
+    } else if (slot_to_use == -1 && oldest_slot != -1) {
+        slot_to_use = oldest_slot;
+        static time_t last_evict = 0;
+        if (now - last_evict >= 2) {
+            add_log("\033[1;33m[UDP EVICT]\033[0m Table saturated (%d sessions): evicting LRU idle session",
+                    MAX_UDP_SESSIONS);
+            last_evict = now;
         }
     }
 
-    if (free_slot == -1) {
+    if (slot_to_use == -1) {
+        static time_t last_drop = 0;
+        if (now - last_drop >= 2) {
+            add_log("\033[1;31m[UDP DROP]\033[0m UDP session table full (max %d)", MAX_UDP_SESSIONS);
+            last_drop = now;
+        }
         pthread_mutex_unlock(&s_udp_session_mutex);
-        add_log("\033[1;31m[UDP DROP]\033[0m UDP session table full (max %d)", MAX_UDP_SESSIONS);
         return NULL;
     }
+
+    // If recycling an in-use slot (expired or LRU evicted), cleanly close prior resources
+    if (s_udp_sessions[slot_to_use].in_use) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, s_udp_sessions[slot_to_use].backend_fd, NULL);
+        close(s_udp_sessions[slot_to_use].backend_fd);
+        release_backend(s_udp_sessions[slot_to_use].backend_idx);
+        hash_remove(&s_udp_sessions[slot_to_use]);
+        s_udp_sessions[slot_to_use].in_use = false;
+    }
+
+    free_slot = slot_to_use;
 
     int backend_idx = get_healthy_backend(client_addr);
     if (backend_idx < 0) {
