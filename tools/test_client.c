@@ -139,7 +139,13 @@ static void *mock_client_worker(void *arg) {
     int port = mc->port;
     free(mc);
 
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    // Clear O_NONBLOCK inherited from listening socket on BSD/macOS
+    int fl = fcntl(cfd, F_GETFL, 0);
+    if (fl >= 0 && (fl & O_NONBLOCK)) {
+        fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -147,29 +153,41 @@ static void *mock_client_worker(void *arg) {
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
     char req[BUFFER_SIZE];
-    ssize_t n = recv(cfd, req, sizeof(req) - 1, 0);
-    if (n > 0) {
+    while (g_running) {
+        ssize_t n = recv(cfd, req, sizeof(req) - 1, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+
         req[n] = '\0';
         if (strncmp(req, "PING", 4) == 0) {
             const char *pong = "PONG\r\n";
             send(cfd, pong, strlen(pong), 0);
-        } else {
-            char body[256];
-            int body_len = snprintf(body, sizeof(body), "Response from mock backend on port %d\n", port);
+            break;
+        }
 
-            char resp[1024];
-            int resp_len = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Server: MockBackend/%d\r\n"
-                "X-Backend-Port: %d\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                port, port, body_len, body);
+        bool want_close = (strcasestr(req, "Connection: close") != NULL) ||
+                          (strstr(req, "HTTP/1.0") != NULL && strcasestr(req, "Connection: keep-alive") == NULL);
 
-            send(cfd, resp, (size_t)resp_len, 0);
+        char body[256];
+        int body_len = snprintf(body, sizeof(body), "Response from mock backend on port %d\n", port);
+
+        char resp[1024];
+        int resp_len = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\n"
+            "Server: MockBackend/%d\r\n"
+            "X-Backend-Port: %d\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: %s\r\n"
+            "\r\n"
+            "%s",
+            port, port, body_len, want_close ? "close" : "keep-alive", body);
+
+        if (send(cfd, resp, (size_t)resp_len, 0) <= 0) {
+            break;
+        }
+        if (want_close) {
+            break;
         }
     }
     close(cfd);
@@ -249,7 +267,7 @@ static void *mock_backend_thread(void *arg) {
     int flags = fcntl(sfd, F_GETFL, 0);
     fcntl(sfd, F_SETFL, flags | O_NONBLOCK);
 
-    if (listen(sfd, 1024) < 0) {
+    if (listen(sfd, 4096) < 0) {
         close(sfd);
         return NULL;
     }
@@ -283,8 +301,7 @@ static void *mock_backend_thread(void *arg) {
 
                 pthread_t tid;
                 if (pthread_create(&tid, &attr, mock_client_worker, mc) != 0) {
-                    free(mc);
-                    close(cfd);
+                    mock_client_worker(mc);
                 }
             }
         }

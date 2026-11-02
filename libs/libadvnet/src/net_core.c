@@ -170,6 +170,7 @@ int net_connect_tcp_nonblocking(const char *ip, int port,
     }
 
     net_set_nodelay(fd, 1);
+    net_set_reuse(fd, 1, 0);
 #ifdef SO_NOSIGPIPE
     int flag = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flag, sizeof(int));

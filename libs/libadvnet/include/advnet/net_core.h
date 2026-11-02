@@ -10,8 +10,9 @@ extern "C" {
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#ifndef SOMAXCONN
-#define SOMAXCONN 1024
+#if !defined(SOMAXCONN) || (SOMAXCONN < 4096)
+#undef SOMAXCONN
+#define SOMAXCONN 4096
 #endif
 
 // Server socket creation

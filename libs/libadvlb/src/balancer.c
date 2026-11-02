@@ -361,6 +361,10 @@ void release_backend(int index) {
 
 void record_backend_success(int index) {
     if (index >= 0 && index < g_num_backends) {
+        if (atomic_load_explicit(&g_backends[index].is_alive, memory_order_relaxed) &&
+            g_backends[index].consecutive_failures == 0) {
+            return;
+        }
         pthread_mutex_lock(&g_backend_mutex);
         g_backends[index].consecutive_failures = 0;
         if (!atomic_load_explicit(&g_backends[index].is_alive, memory_order_relaxed)) {

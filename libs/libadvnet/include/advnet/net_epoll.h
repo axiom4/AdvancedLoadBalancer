@@ -81,15 +81,36 @@ static inline int epoll_wait(int epfd, struct epoll_event *events, int maxevents
     int n = kevent(epfd, NULL, 0, out_kev, to_fetch, pts);
     if (n <= 0) return n;
 
+    int out_count = 0;
     for (int i = 0; i < n; i++) {
-        events[i].events = 0;
-        if (out_kev[i].filter == EVFILT_READ) events[i].events |= EPOLLIN;
-        if (out_kev[i].filter == EVFILT_WRITE) events[i].events |= EPOLLOUT;
-        if (out_kev[i].flags & EV_ERROR) events[i].events |= EPOLLERR;
-        if (out_kev[i].flags & EV_EOF) events[i].events |= EPOLLHUP;
-        events[i].data.fd = (int)(intptr_t)out_kev[i].udata;
+        int fd = (int)(intptr_t)out_kev[i].udata;
+        uint32_t ev = 0;
+        if (out_kev[i].filter == EVFILT_READ) {
+            ev |= EPOLLIN;
+            if (out_kev[i].flags & EV_EOF) ev |= EPOLLHUP;
+        }
+        if (out_kev[i].filter == EVFILT_WRITE) {
+            ev |= EPOLLOUT;
+            if (out_kev[i].flags & EV_EOF) ev |= EPOLLHUP;
+        }
+        if (out_kev[i].flags & EV_ERROR) ev |= EPOLLERR;
+
+        int existing = -1;
+        for (int j = 0; j < out_count; j++) {
+            if (events[j].data.fd == fd) {
+                existing = j;
+                break;
+            }
+        }
+        if (existing >= 0) {
+            events[existing].events |= ev;
+        } else {
+            events[out_count].data.fd = fd;
+            events[out_count].events = ev;
+            out_count++;
+        }
     }
-    return n;
+    return out_count;
 }
 #endif
 
