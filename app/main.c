@@ -28,6 +28,7 @@ int main(int argc, char *argv[]) {
     g_start_time = time(NULL);
     srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
 
+    increase_fd_limit();
     config_init_defaults(&g_config);
     log_init();
 

@@ -10,6 +10,7 @@ ssize_t read_retry(int fd, char *buf, size_t len);
 int connect_with_timeout_transparent(const char *ip, int port, int timeout_ms, const struct sockaddr_in *client_addr);
 int create_tcp_server_socket(int port);
 int create_udp_server_socket(int port);
+void increase_fd_limit(void);
 
 #endif /* ADVLB_NET_UTILS_H */
 

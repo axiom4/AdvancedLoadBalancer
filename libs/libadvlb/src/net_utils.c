@@ -3,6 +3,24 @@
 #include "advlb/config.h"
 #include "advlb/log.h"
 #include "advnet/advnet.h"
+#include <sys/resource.h>
+
+void increase_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rlim_t target = 65536;
+        if (target > rl.rlim_max) {
+            target = rl.rlim_max;
+        }
+        if (rl.rlim_cur < target) {
+            rl.rlim_cur = target;
+            if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+                rl.rlim_cur = rl.rlim_max;
+                setrlimit(RLIMIT_NOFILE, &rl);
+            }
+        }
+    }
+}
 
 int set_nonblocking(int fd) {
     return net_set_nonblocking(fd);

@@ -229,7 +229,9 @@ int parse_cli_args(int argc, char *argv[]) {
                     fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid value for --workers: '%s' (must be > 0)\n", optarg);
                     exit(EXIT_FAILURE);
                 }
-                if (g_config.num_workers > 64) g_config.num_workers = 64;
+                if (g_config.num_workers > 256) {
+                    g_config.num_workers = 256;
+                }
                 break;
             case 1020: // --timeout
                 g_config.inactivity_timeout_sec = atoi(optarg);

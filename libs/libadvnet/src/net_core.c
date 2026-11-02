@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <poll.h>
 
 int net_set_nonblocking(int fd) {
     int flags;
@@ -182,38 +183,24 @@ int net_connect_tcp_timeout(const char *ip, int port, int timeout_ms,
         return fd;
     }
 
-    int epfd = epoll_create1(0);
-    if (epfd < 0) {
-        close(fd);
-        return -1;
-    }
-
-    struct epoll_event ev;
-    ev.events = EPOLLOUT;
-    ev.data.fd = fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        close(epfd);
-        close(fd);
-        return -1;
-    }
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
 
     while (1) {
-        struct epoll_event event;
-        int ep_res = epoll_wait(epfd, &event, 1, timeout_ms);
-        if (ep_res < 0) {
+        int pret = poll(&pfd, 1, timeout_ms);
+        if (pret < 0) {
             if (errno == EINTR) continue;
-            close(epfd);
             close(fd);
             return -1;
         }
-        if (ep_res == 0) {
-            close(epfd);
+        if (pret == 0) {
             close(fd);
             return -1; // Connection timeout
         }
         break;
     }
-    close(epfd);
 
     int so_error = 0;
     socklen_t len = sizeof(so_error);

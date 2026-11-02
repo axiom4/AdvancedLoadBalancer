@@ -421,6 +421,7 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
         if (bfd >= 0) {
             conn->backend_idx = b_idx;
             conn->backend_fd = bfd;
+            record_backend_success(b_idx);
             set_nonblocking(bfd);
             int flag = 1;
             setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
@@ -429,6 +430,8 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
             return;
         }
 
+        add_log("\033[1;33m[WARN]\033[0m Backend [%d] %s:%d connect error: %s (errno %d)",
+                b_idx, b_ip, b_port, strerror(errno), errno);
         record_backend_failure(b_idx);
     }
 
@@ -799,16 +802,33 @@ static void *worker_event_loop(void *arg) {
 bool worker_pool_init(int num_workers) {
     if (num_workers <= 0) num_workers = 4;
     s_workers = calloc((size_t)num_workers, sizeof(WorkerThread));
-    if (!s_workers) return false;
+    if (!s_workers) {
+        fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to allocate memory for %d worker structures\n", num_workers);
+        return false;
+    }
     s_num_workers = num_workers;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 512 * 1024); // 512 KB stack per worker
 
     for (int i = 0; i < num_workers; i++) {
         WorkerThread *w = &s_workers[i];
         w->id = i;
         w->epfd = epoll_create1(0);
-        if (w->epfd < 0) return false;
+        if (w->epfd < 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Worker [%d] failed to create epoll/kqueue: %s (errno %d)\n",
+                    i, strerror(errno), errno);
+            pthread_attr_destroy(&attr);
+            return false;
+        }
 
-        if (pipe(w->notify_pipe) < 0) return false;
+        if (pipe(w->notify_pipe) < 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Worker [%d] failed to create notify pipe: %s (errno %d)\n",
+                    i, strerror(errno), errno);
+            pthread_attr_destroy(&attr);
+            return false;
+        }
         set_nonblocking(w->notify_pipe[0]);
         set_nonblocking(w->notify_pipe[1]);
 
@@ -817,15 +837,22 @@ bool worker_pool_init(int num_workers) {
         ev.data.fd = w->notify_pipe[0];
         ev.events = EPOLLIN;
         if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->notify_pipe[0], &ev) < 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Worker [%d] failed to add notify pipe to epoll: %s\n",
+                    i, strerror(errno));
+            pthread_attr_destroy(&attr);
             return false;
         }
 
         pthread_mutex_init(&w->queue_mutex, NULL);
 
-        if (pthread_create(&w->thread, NULL, worker_event_loop, w) != 0) {
+        if (pthread_create(&w->thread, &attr, worker_event_loop, w) != 0) {
+            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Worker [%d] failed to spawn pthread: %s (errno %d)\n",
+                    i, strerror(errno), errno);
+            pthread_attr_destroy(&attr);
             return false;
         }
     }
+    pthread_attr_destroy(&attr);
 
     add_log("\033[1;32m[SYSTEM]\033[0m Initialized epoll worker pool with %d threads", num_workers);
     return true;
@@ -1244,6 +1271,7 @@ void *client_handler_thread(void *arg) {
 
         backend_fd = connect_with_timeout_transparent(b_ip, b_port, 1000, &client_addr);
         if (backend_fd >= 0) {
+            record_backend_success(backend_idx);
             add_log("\033[1;36m[CONN]\033[0m Client %s:%d %s -> Backend [%d] %s:%d",
                     client_ip, client_port,
                     g_config.enable_ssl_offloading ? "\033[1;35m(TLS)\033[0m" : "",

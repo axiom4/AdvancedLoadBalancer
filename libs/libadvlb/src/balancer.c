@@ -263,6 +263,16 @@ void release_backend(int index) {
     }
 }
 
+void record_backend_success(int index) {
+    if (index >= 0 && index < g_num_backends) {
+        pthread_mutex_lock(&g_backend_mutex);
+        g_backends[index].consecutive_failures = 0;
+        pthread_mutex_unlock(&g_backend_mutex);
+    }
+}
+
+#define CLIENT_FALL_THRESHOLD 20
+
 void record_backend_failure(int index) {
     if (index >= 0 && index < g_num_backends) {
         pthread_mutex_lock(&g_backend_mutex);
@@ -273,7 +283,7 @@ void record_backend_failure(int index) {
         g_backends[index].consecutive_failures++;
         g_backends[index].consecutive_successes = 0;
         int fails = g_backends[index].consecutive_failures;
-        if (fails >= FALL_THRESHOLD) {
+        if (fails >= CLIENT_FALL_THRESHOLD) {
             atomic_store_explicit(&g_backends[index].is_alive, false, memory_order_relaxed);
         }
         char b_ip[INET_ADDRSTRLEN];
@@ -282,7 +292,7 @@ void record_backend_failure(int index) {
         pthread_mutex_unlock(&g_backend_mutex);
 
         add_log("\033[1;33m[CIRCUIT BREAKER]\033[0m Backend [%d] %s:%d conn error (fail %d/%d)",
-                index, b_ip, b_port, fails, FALL_THRESHOLD);
+                index, b_ip, b_port, fails, CLIENT_FALL_THRESHOLD);
     }
 }
 
