@@ -1,0 +1,38 @@
+# Binari compilati
+advanced_load_balancer
+load_balancer_advanced
+
+# Directory e oggetti di build
+build/
+*.o
+
+# Librerie generate
+lib/
+*.a
+*.so
+*.dylib
+
+# Cartelle di debug (macOS / Clang)
+*.dSYM/
+
+# File di backup e temporanei
+*.orig
+*.bak
+*~
+*.swp
+
+# Certificati e chiavi TLS / SSL di test
+*.pem
+*.crt
+*.key
+
+# Log e crash dump
+*.log
+core
+vgcore.*
+
+# File di sistema e configurazioni IDE
+.DS_Store
+.vscode/
+.idea/
+
