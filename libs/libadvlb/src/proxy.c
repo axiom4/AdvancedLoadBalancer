@@ -385,7 +385,27 @@ void *client_handler_thread(void *arg) {
         SSL_set_fd(client_ssl, client_fd);
 
         int ep = epoll_create1(0);
+        if (ep < 0) {
+            SSL_free(client_ssl);
+            close(client_fd);
+            goto cleanup;
+        }
+
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.data.fd = client_fd;
+        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+            close(ep);
+            SSL_free(client_ssl);
+            close(client_fd);
+            goto cleanup;
+        }
+        uint32_t current_events = ev.events;
+
         bool handshake_ok = false;
+        time_t hs_start = time(NULL);
+        const int hs_timeout_ms = 5000;
 
         while (g_server_running) {
             int acc_res = SSL_accept(client_ssl);
@@ -395,15 +415,26 @@ void *client_handler_thread(void *arg) {
             }
             int err = SSL_get_error(client_ssl, acc_res);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                if (ep >= 0) {
-                    struct epoll_event ev;
-                    ev.events = (err == SSL_ERROR_WANT_READ) ? EPOLLIN : EPOLLOUT;
-                    ev.data.fd = client_fd;
-                    epoll_ctl(ep, EPOLL_CTL_MOD, client_fd, &ev);
-                    struct epoll_event rev;
-                    int wait_res = epoll_wait(ep, &rev, 1, 3000);
-                    if (wait_res <= 0) break;
+                int elapsed_ms = (int)((time(NULL) - hs_start) * 1000);
+                int remaining_ms = hs_timeout_ms - elapsed_ms;
+                if (remaining_ms <= 0) break;
+
+                uint32_t needed_events = (err == SSL_ERROR_WANT_READ) ? (EPOLLIN | EPOLLERR | EPOLLHUP) : (EPOLLOUT | EPOLLERR | EPOLLHUP);
+                if (needed_events != current_events) {
+                    ev.events = needed_events;
+                    if (epoll_ctl(ep, EPOLL_CTL_MOD, client_fd, &ev) < 0) {
+                        break;
+                    }
+                    current_events = needed_events;
                 }
+
+                struct epoll_event rev;
+                int wait_res = epoll_wait(ep, &rev, 1, remaining_ms);
+                if (wait_res < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (wait_res == 0) break; // Timeout
                 continue;
             }
             if (err == SSL_ERROR_SYSCALL && errno == EINTR) {
@@ -412,7 +443,7 @@ void *client_handler_thread(void *arg) {
             break;
         }
 
-        if (ep >= 0) close(ep);
+        close(ep);
 
         if (!handshake_ok) {
             SSL_free(client_ssl);
