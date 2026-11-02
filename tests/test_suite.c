@@ -15,6 +15,7 @@
 #include "advlb/log.h"
 #include "advlb/proxy_proto.h"
 #include "advlb/net_utils.h"
+#include "advlb/ssl_engine.h"
 #include "advnet/advnet.h"
 
 static int g_tests_run = 0;
@@ -298,6 +299,136 @@ static void test_mpsc_logger_concurrency(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test 8: Configuration File Parser (advlb.conf)                             */
+/* -------------------------------------------------------------------------- */
+static void test_config_file_parser(void) {
+    printf("\n=== Running Test Suite: Configuration File Parser (advlb.conf) ===\n");
+
+    const char *tmp_conf = "/tmp/test_adlb_parser.conf";
+    FILE *f = fopen(tmp_conf, "w");
+    TEST_ASSERT(f != NULL, "Created temporary configuration file for parsing");
+    if (!f) return;
+
+    fprintf(f, "# Test ADLB Config\n");
+    fprintf(f, "port = 9443\n");
+    fprintf(f, "workers = 16\n");
+    fprintf(f, "max_connections = 8192\n");
+    fprintf(f, "timeout = 45\n");
+    fprintf(f, "ssl = true\n");
+    fprintf(f, "cert = /etc/ssl/test.crt\n");
+    fprintf(f, "key = /etc/ssl/test.key\n");
+    fprintf(f, "algorithm = rr\n");
+    fprintf(f, "hc_type = http\n");
+    fprintf(f, "hc_path = /healthz\n");
+    fprintf(f, "hc_interval = 5\n");
+    fprintf(f, "hc_timeout = 1200\n");
+    fclose(f);
+
+    LbConfig test_cfg;
+    config_init_defaults(&test_cfg);
+    bool ok = config_load_file(tmp_conf, &test_cfg);
+    unlink(tmp_conf);
+
+    TEST_ASSERT(ok == true, "config_load_file parsed configuration file successfully");
+    TEST_ASSERT(test_cfg.listen_port == 9443, "Parsed listen_port matches 9443");
+    TEST_ASSERT(test_cfg.num_workers == 16, "Parsed workers matches 16");
+    TEST_ASSERT(test_cfg.max_connections == 8192, "Parsed max_connections matches 8192");
+    TEST_ASSERT(test_cfg.inactivity_timeout_sec == 45, "Parsed timeout matches 45s");
+    TEST_ASSERT(test_cfg.enable_ssl_offloading == true, "Parsed ssl matches true");
+    TEST_ASSERT(strcmp(test_cfg.cert_file, "/etc/ssl/test.crt") == 0, "Parsed cert_file matches");
+    TEST_ASSERT(strcmp(test_cfg.key_file, "/etc/ssl/test.key") == 0, "Parsed key_file matches");
+    TEST_ASSERT(test_cfg.current_algorithm == ALG_ROUND_ROBIN, "Parsed algorithm matches ALG_ROUND_ROBIN");
+    TEST_ASSERT(test_cfg.current_hc_type == HC_TYPE_HTTP, "Parsed hc_type matches HC_TYPE_HTTP");
+    TEST_ASSERT(strcmp(test_cfg.hc_http_path, "/healthz") == 0, "Parsed hc_path matches /healthz");
+    TEST_ASSERT(test_cfg.hc_interval_sec == 5, "Parsed hc_interval matches 5s");
+    TEST_ASSERT(test_cfg.hc_timeout_ms == 1200, "Parsed hc_timeout matches 1200ms");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test 9: Dual-Stack IPv6 and IPv4 Support                                  */
+/* -------------------------------------------------------------------------- */
+static void test_ipv6_and_dual_stack(void) {
+    printf("\n=== Running Test Suite: Dual-Stack IPv6 / IPv4 Support ===\n");
+
+    // 9a. Validation
+    TEST_ASSERT(net_validate_ip("127.0.0.1") == true, "Valid IPv4 localhost");
+    TEST_ASSERT(net_validate_ip("10.0.0.1") == true, "Valid IPv4 private");
+    TEST_ASSERT(net_validate_ip("::1") == true, "Valid IPv6 localhost ::1");
+    TEST_ASSERT(net_validate_ip("2001:db8::1") == true, "Valid IPv6 standard 2001:db8::1");
+    TEST_ASSERT(net_validate_ip("fe80::1ff:fe23:4567:890a") == true, "Valid IPv6 link-local");
+    TEST_ASSERT(net_validate_ip("999.1.2.3") == false, "Invalid IPv4 rejected");
+    TEST_ASSERT(net_validate_ip("2001:xyz::1") == false, "Invalid IPv6 rejected");
+    TEST_ASSERT(net_validate_ip("invalid_host") == false, "Invalid address rejected");
+
+    // 9b. Bracketed IPv6 backend addition
+    reset_test_backends(0);
+    bool b_ok = add_backend("[::1]", 9005, 3);
+    TEST_ASSERT(b_ok == true, "add_backend accepts bracketed IPv6 [::1]");
+    TEST_ASSERT(g_num_backends == 1, "Backend registered in pool");
+    TEST_ASSERT(strcmp(g_backends[0].ip, "::1") == 0, "IPv6 address correctly stripped of brackets");
+    TEST_ASSERT(g_backends[0].port == 9005, "IPv6 backend port matches 9005");
+    TEST_ASSERT(g_backends[0].weight == 3, "IPv6 backend weight matches 3");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Test Suite 10: Dynamic Reload & Certificate Hot Swap                       */
+/* -------------------------------------------------------------------------- */
+static void test_sighup_and_hot_reload(void) {
+    printf("\n=== Running Test Suite: Dynamic Reload & TLS Hot Swap ===\n");
+
+    // 10a. Dynamic config reload via config_reload()
+    char tmp_path[] = "/tmp/adlb_reload_test_XXXXXX";
+    int fd = mkstemp(tmp_path);
+    TEST_ASSERT(fd >= 0, "Created temporary reload config file");
+    if (fd >= 0) {
+        const char *content1 = "workers = 4\nalgorithm = rr\ntimeout = 25\n";
+        write(fd, content1, strlen(content1));
+        close(fd);
+
+        config_init_defaults(&g_config);
+        strncpy(g_config.config_file, tmp_path, sizeof(g_config.config_file) - 1);
+        bool r1 = config_reload();
+        TEST_ASSERT(r1 == true, "config_reload parsed updated file successfully");
+        TEST_ASSERT(g_config.current_algorithm == ALG_ROUND_ROBIN, "Algorithm reloaded to ALG_ROUND_ROBIN");
+        TEST_ASSERT(g_config.inactivity_timeout_sec == 25, "Inactivity timeout reloaded to 25s");
+
+        // Overwrite with updated values
+        FILE *f2 = fopen(tmp_path, "w");
+        if (f2) {
+            fprintf(f2, "workers = 8\nalgorithm = lc\ntimeout = 50\n");
+            fclose(f2);
+        }
+
+        bool r2 = config_reload();
+        TEST_ASSERT(r2 == true, "Second config_reload executed");
+        TEST_ASSERT(g_config.current_algorithm == ALG_LEAST_CONNECTIONS, "Algorithm dynamically swapped to ALG_LEAST_CONNECTIONS");
+        TEST_ASSERT(g_config.inactivity_timeout_sec == 50, "Inactivity timeout dynamically updated to 50s");
+        unlink(tmp_path);
+    }
+
+    // 10b. TLS Certificate Hot Swap
+#ifndef NO_SSL
+    if (access("certs/server.crt", R_OK) == 0 && access("certs/server.key", R_OK) == 0) {
+        SSL_CTX *ctx = init_ssl_context("certs/server.crt", "certs/server.key");
+        TEST_ASSERT(ctx != NULL, "init_ssl_context initialized valid TLS context");
+        TEST_ASSERT(g_global_ssl_ctx == ctx, "g_global_ssl_ctx points to initialized context");
+
+        bool cert_reload_ok = reload_ssl_certificates("certs/server.crt", "certs/server.key");
+        TEST_ASSERT(cert_reload_ok == true, "reload_ssl_certificates succeeded with valid certificate and key");
+        TEST_ASSERT(g_global_ssl_ctx != NULL, "g_global_ssl_ctx points to newly swapped SSL context");
+
+        // Attempt reload with invalid path (must fail gracefully without breaking existing context)
+        bool invalid_reload = reload_ssl_certificates("certs/non_existent.crt", "certs/server.key");
+        TEST_ASSERT(invalid_reload == false, "reload_ssl_certificates gracefully rejected invalid certificate path");
+        TEST_ASSERT(g_global_ssl_ctx != NULL, "Existing active SSL context retained intact after failed reload");
+
+        cleanup_ssl_context();
+        TEST_ASSERT(g_global_ssl_ctx == NULL, "cleanup_ssl_context freed active context");
+    }
+#endif
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main Test Runner                                                           */
 /* -------------------------------------------------------------------------- */
 int main(void) {
@@ -316,6 +447,9 @@ int main(void) {
     test_circuit_breaker();
     test_backend_release_underflow();
     test_mpsc_logger_concurrency();
+    test_config_file_parser();
+    test_ipv6_and_dual_stack();
+    test_sighup_and_hot_reload();
 
     printf("\n====================================================================\n");
     printf("TEST RESULTS: %d Run | \033[1;32m%d Passed\033[0m | \033[1;%sm%d Failed\033[0m\n",
