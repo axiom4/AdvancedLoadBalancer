@@ -142,6 +142,24 @@ bool parse_hc_type(const char *name, HealthCheckType *out_type) {
     return false;
 }
 
+bool is_valid_http_path(const char *path) {
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    size_t len = strlen(path);
+    if (len >= sizeof(g_config.hc_http_path)) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)path[i];
+        // Reject CRLF, spaces, and control characters (RFC 7230 Request-Target validation)
+        if (c <= 32 || c >= 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int parse_cli_args(int argc, char *argv[]) {
     static struct option long_options[] = {
         {"port",        required_argument, 0, 'p'},
@@ -247,6 +265,12 @@ int parse_cli_args(int argc, char *argv[]) {
                 g_config.current_hc_type = HC_TYPE_HTTP;
                 break;
             case 1013: // --hc-path
+                if (!is_valid_http_path(optarg)) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid HTTP health check path: '%s'\n", optarg);
+                    fprintf(stderr, "Path must start with '/' and contain no CRLF (\\r, \\n), spaces, or control characters (RFC 7230).\n\n");
+                    print_help(argv[0]);
+                    exit(EXIT_FAILURE);
+                }
                 g_config.current_hc_type = HC_TYPE_HTTP;
                 strncpy(g_config.hc_http_path, optarg, sizeof(g_config.hc_http_path) - 1);
                 g_config.hc_http_path[sizeof(g_config.hc_http_path) - 1] = '\0';

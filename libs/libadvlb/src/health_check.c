@@ -25,6 +25,15 @@ const char *health_check_name(HealthCheckType type) {
     }
 }
 
+static inline const char *safe_http_path(const char *path) {
+    if (!path || path[0] != '/') return "/";
+    for (size_t i = 0; path[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)path[i];
+        if (c <= 32 || c >= 127) return "/";
+    }
+    return path;
+}
+
 void finalize_payload_config(void) {
     bool is_http = (strncasecmp(g_config.hc_send_payload, "GET ", 4) == 0 ||
                     strncasecmp(g_config.hc_send_payload, "HEAD ", 5) == 0 ||
@@ -113,7 +122,7 @@ void perform_health_check_cycle(bool is_startup) {
                     char req[512];
                     int req_len = snprintf(req, sizeof(req),
                                            "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: LB-HealthCheck/2.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-                                           g_config.hc_http_path, ip, port);
+                                           safe_http_path(g_config.hc_http_path), ip, port);
                     write_all(sfd, req, (size_t)req_len);
                 } else {
                     write_all(sfd, g_config.hc_send_payload, strlen(g_config.hc_send_payload));
@@ -196,7 +205,7 @@ void perform_health_check_cycle(bool is_startup) {
                         char req[512];
                         int req_len = snprintf(req, sizeof(req),
                                                "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: LB-HealthCheck/2.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-                                               g_config.hc_http_path, ip, port);
+                                               safe_http_path(g_config.hc_http_path), ip, port);
                         write_all(probe_fds[idx], req, (size_t)req_len);
                     } else {
                         write_all(probe_fds[idx], g_config.hc_send_payload, strlen(g_config.hc_send_payload));
