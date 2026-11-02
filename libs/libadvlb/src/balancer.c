@@ -16,6 +16,75 @@ int g_num_backends = 0;
 pthread_mutex_t g_backend_mutex = PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint s_round_robin_counter = 0;
 
+#define MAX_WRR_SCHEDULE_LEN 4096
+static int s_wrr_schedule[MAX_WRR_SCHEDULE_LEN];
+static atomic_int s_wrr_schedule_len = 0;
+static atomic_uint s_wrr_counter = 0;
+
+static int gcd(int a, int b) {
+    while (b != 0) {
+        int t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+static void balancer_rebuild_wrr_schedule_locked(void) {
+    if (g_num_backends <= 0) {
+        atomic_store_explicit(&s_wrr_schedule_len, 0, memory_order_release);
+        return;
+    }
+
+    int g = 0;
+    for (int i = 0; i < g_num_backends; i++) {
+        int w = (g_backends[i].weight > 0) ? g_backends[i].weight : 1;
+        g = (g == 0) ? w : gcd(g, w);
+    }
+    if (g <= 0) g = 1;
+
+    int eff_weights[MAX_BACKENDS];
+    int eff_total = 0;
+    for (int i = 0; i < g_num_backends; i++) {
+        int w = (g_backends[i].weight > 0) ? g_backends[i].weight : 1;
+        eff_weights[i] = w / g;
+        eff_total += eff_weights[i];
+    }
+
+    if (eff_total > MAX_WRR_SCHEDULE_LEN) {
+        double scale = (double)MAX_WRR_SCHEDULE_LEN / (double)eff_total;
+        eff_total = 0;
+        for (int i = 0; i < g_num_backends; i++) {
+            eff_weights[i] = (int)(eff_weights[i] * scale);
+            if (eff_weights[i] < 1) eff_weights[i] = 1;
+            eff_total += eff_weights[i];
+        }
+    }
+
+    int current_weights[MAX_BACKENDS];
+    memset(current_weights, 0, sizeof(current_weights));
+
+    for (int step = 0; step < eff_total && step < MAX_WRR_SCHEDULE_LEN; step++) {
+        int best = -1;
+        for (int i = 0; i < g_num_backends; i++) {
+            current_weights[i] += eff_weights[i];
+            if (best == -1 || current_weights[i] > current_weights[best]) {
+                best = i;
+            }
+        }
+        s_wrr_schedule[step] = best;
+        current_weights[best] -= eff_total;
+    }
+
+    atomic_store_explicit(&s_wrr_schedule_len, eff_total, memory_order_release);
+}
+
+void balancer_rebuild_wrr_schedule(void) {
+    pthread_mutex_lock(&g_backend_mutex);
+    balancer_rebuild_wrr_schedule_locked();
+    pthread_mutex_unlock(&g_backend_mutex);
+}
+
 const char *algorithm_name(BalancerAlgorithm alg) {
     switch (alg) {
         case ALG_ROUND_ROBIN:       return "Round-Robin";
@@ -114,6 +183,7 @@ bool add_backend(const char *ip, int port, int weight) {
     atomic_init(&g_backends[idx].active_connections, 0);
     atomic_init(&g_backends[idx].total_requests_handled, 0);
     g_num_backends++;
+    balancer_rebuild_wrr_schedule_locked();
     pthread_mutex_unlock(&g_backend_mutex);
     return true;
 }
@@ -202,24 +272,21 @@ static int select_backend_least_latency_lockfree(int num_backends) {
     return best_index;
 }
 
-// 5. Smooth Weighted Round-Robin: weighted balancing algorithm (Mutex-Protected)
-static int select_backend_weighted_rr_locked(int num_backends) {
-    int best_index = -1;
-    int total_weight = 0;
+// 5. Smooth Weighted Round-Robin: weighted balancing algorithm (Lock-Free Interleaved Lookup)
+static int select_backend_weighted_rr_lockfree(int num_backends) {
+    int sched_len = atomic_load_explicit(&s_wrr_schedule_len, memory_order_acquire);
+    if (sched_len <= 0) {
+        return select_backend_round_robin_lockfree(num_backends);
+    }
 
-    for (int i = 0; i < num_backends; i++) {
-        if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
-            g_backends[i].current_weight += g_backends[i].weight;
-            total_weight += g_backends[i].weight;
-            if (best_index == -1 || g_backends[i].current_weight > g_backends[best_index].current_weight) {
-                best_index = i;
-            }
+    unsigned int base = atomic_fetch_add_explicit(&s_wrr_counter, 1, memory_order_relaxed);
+    for (int attempts = 0; attempts < sched_len; attempts++) {
+        int idx = s_wrr_schedule[(base + (unsigned int)attempts) % (unsigned int)sched_len];
+        if (atomic_load_explicit(&g_backends[idx].is_alive, memory_order_relaxed)) {
+            return idx;
         }
     }
-    if (best_index != -1) {
-        g_backends[best_index].current_weight -= total_weight;
-    }
-    return best_index;
+    return -1;
 }
 
 // 6. Random (Power of Two Choices: pick 2 random nodes and route to the less loaded one) (Lock-Free)
@@ -272,9 +339,7 @@ int get_healthy_backend(const struct sockaddr_storage *client_addr) {
             selected = select_backend_random_2_lockfree(num_backends);
             break;
         case ALG_WEIGHTED_RR:
-            pthread_mutex_lock(&g_backend_mutex);
-            selected = select_backend_weighted_rr_locked(num_backends);
-            pthread_mutex_unlock(&g_backend_mutex);
+            selected = select_backend_weighted_rr_lockfree(num_backends);
             break;
     }
 
@@ -337,6 +402,7 @@ void reset_backend_stats(void) {
     for (int i = 0; i < g_num_backends; i++) {
         atomic_store_explicit(&g_backends[i].total_requests_handled, 0, memory_order_relaxed);
     }
+    balancer_rebuild_wrr_schedule_locked();
     pthread_mutex_unlock(&g_backend_mutex);
     add_log("\033[1;32m[STATS]\033[0m Request statistics reset.");
 }

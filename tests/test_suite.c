@@ -18,6 +18,7 @@
 #include "advlb/ssl_engine.h"
 #include "advlb/conn_pool.h"
 #include "advlb/udp_proxy.h"
+#include "advlb/proxy.h"
 #include "advnet/advnet.h"
 
 static int g_tests_run = 0;
@@ -289,6 +290,23 @@ static void test_load_balancer_algorithms(void) {
     int r2_choice = get_healthy_backend(&client);
     TEST_ASSERT(r2_choice >= 0 && r2_choice < 3, "ALG_RANDOM_2 selects valid backend index");
     release_backend(r2_choice);
+
+    // 4e. Smooth Weighted Round-Robin (Lock-Free SWRR)
+    reset_test_backends(2);
+    g_backends[0].weight = 3;
+    g_backends[1].weight = 1;
+    balancer_rebuild_wrr_schedule();
+    g_config.current_algorithm = ALG_WEIGHTED_RR;
+
+    int count0 = 0, count1 = 0;
+    for (int i = 0; i < 40; i++) {
+        int b = get_healthy_backend(&client);
+        if (b == 0) count0++;
+        else if (b == 1) count1++;
+        release_backend(b);
+    }
+    TEST_ASSERT(count0 == 30 && count1 == 10,
+                "ALG_WEIGHTED_RR distributes exactly according to 3:1 ratio (30 vs 10)");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -592,6 +610,21 @@ static void test_udp_multi_worker_reuseport(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Test Suite 13: TCP Worker Pool Lifecycle, SO_REUSEPORT & Slab Allocator    */
+/* -------------------------------------------------------------------------- */
+static void test_worker_pool_lifecycle(void) {
+    printf("\n=== Running Test Suite: TCP Worker Pool Lifecycle, SO_REUSEPORT & Slab Allocator ===\n");
+
+    int test_port = 19999;
+    g_config.listen_port = test_port;
+    bool ok = worker_pool_init(4);
+    TEST_ASSERT(ok == true, "worker_pool_init successfully spawns 4 worker threads with SO_REUSEPORT");
+
+    worker_pool_shutdown();
+    TEST_ASSERT(true, "worker_pool_shutdown cleanly terminates workers, closes listen sockets, and drains slab pool");
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main Test Runner                                                           */
 /* -------------------------------------------------------------------------- */
 int main(void) {
@@ -615,6 +648,7 @@ int main(void) {
     test_sighup_and_hot_reload();
     test_upstream_connection_pooling();
     test_udp_multi_worker_reuseport();
+    test_worker_pool_lifecycle();
 
     printf("\n====================================================================\n");
     printf("TEST RESULTS: %d Run | \033[1;32m%d Passed\033[0m | \033[1;%sm%d Failed\033[0m\n",

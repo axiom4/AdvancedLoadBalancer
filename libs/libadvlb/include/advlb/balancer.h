@@ -17,6 +17,7 @@ void release_backend(int index);
 void record_backend_success(int index);
 void record_backend_failure(int index);
 void reset_backend_stats(void);
+void balancer_rebuild_wrr_schedule(void);
 
 #endif /* ADVLB_BALANCER_H */
 

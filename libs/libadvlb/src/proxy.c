@@ -25,8 +25,8 @@
 
 typedef struct {
     char data[BUFFER_SIZE];
-    size_t head; // read index for sending
-    size_t tail; // write index for receiving
+    size_t head; // monotonic read index
+    size_t tail; // monotonic write index
 } StreamBuffer;
 
 static inline size_t buffer_available(const StreamBuffer *sb) {
@@ -34,18 +34,51 @@ static inline size_t buffer_available(const StreamBuffer *sb) {
 }
 
 static inline size_t buffer_space(const StreamBuffer *sb) {
-    return BUFFER_SIZE - sb->tail;
+    size_t avail = sb->tail - sb->head;
+    return (avail < BUFFER_SIZE) ? (BUFFER_SIZE - avail) : 0;
 }
 
-static inline void buffer_compact(StreamBuffer *sb) {
-    if (sb->head > 0) {
-        size_t avail = sb->tail - sb->head;
-        if (avail > 0) {
-            memmove(sb->data, sb->data + sb->head, avail);
-        }
-        sb->head = 0;
-        sb->tail = avail;
+// Contiguous write segment pointer and its length for nonblocking_read()
+static inline char *buffer_write_ptr(StreamBuffer *sb) {
+    return sb->data + (sb->tail & (BUFFER_SIZE - 1));
+}
+
+static inline size_t buffer_write_len(const StreamBuffer *sb) {
+    size_t avail = sb->tail - sb->head;
+    if (avail >= BUFFER_SIZE) return 0;
+    size_t total_free = BUFFER_SIZE - avail;
+    size_t to_end = BUFFER_SIZE - (sb->tail & (BUFFER_SIZE - 1));
+    return (to_end < total_free) ? to_end : total_free;
+}
+
+static inline void buffer_produce(StreamBuffer *sb, size_t count) {
+    sb->tail += count;
+}
+
+// Contiguous read segment pointer and its length for nonblocking_write()
+static inline const char *buffer_read_ptr(const StreamBuffer *sb) {
+    return sb->data + (sb->head & (BUFFER_SIZE - 1));
+}
+
+static inline size_t buffer_read_len(const StreamBuffer *sb) {
+    size_t avail = sb->tail - sb->head;
+    if (avail == 0) return 0;
+    size_t to_end = BUFFER_SIZE - (sb->head & (BUFFER_SIZE - 1));
+    return (to_end < avail) ? to_end : avail;
+}
+
+static inline void buffer_consume(StreamBuffer *sb, size_t count) {
+    sb->head += count;
+}
+
+// Circular prepend for PROXY Protocol v1 header without moving existing data
+static inline bool buffer_prepend(StreamBuffer *sb, const char *hdr, size_t len) {
+    if (buffer_space(sb) < len) return false;
+    sb->head -= len;
+    for (size_t i = 0; i < len; i++) {
+        sb->data[(sb->head + i) & (BUFFER_SIZE - 1)] = hdr[i];
     }
+    return true;
 }
 
 // Sends non-blocking data to plain socket or SSL
@@ -181,6 +214,7 @@ typedef struct WorkerThread {
     pthread_t thread;
     int epfd;
     int notify_pipe[2];
+    int listen_fd; // SO_REUSEPORT multi-accept socket
 
     pthread_mutex_t queue_mutex;
     NewConnNode *queue_head;
@@ -191,7 +225,33 @@ typedef struct WorkerThread {
 
     ProxyConnection **fd_table;
     int fd_table_cap;
+
+    // 2.3: Worker-local Slab Allocator / Object Pool for ProxyConnection
+    ProxyConnection *conn_pool_head;
+    int conn_pool_count;
+    volatile bool running;
 } WorkerThread;
+
+static inline ProxyConnection *worker_alloc_conn(WorkerThread *worker) {
+    if (worker && worker->conn_pool_head) {
+        ProxyConnection *conn = worker->conn_pool_head;
+        worker->conn_pool_head = conn->next;
+        worker->conn_pool_count--;
+        memset(conn, 0, sizeof(ProxyConnection));
+        return conn;
+    }
+    return calloc(1, sizeof(ProxyConnection));
+}
+
+static inline void worker_free_conn(WorkerThread *worker, ProxyConnection *conn) {
+    if (worker && worker->conn_pool_count < 256) {
+        conn->next = worker->conn_pool_head;
+        worker->conn_pool_head = conn;
+        worker->conn_pool_count++;
+        return;
+    }
+    free(conn);
+}
 
 static WorkerThread *s_workers = NULL;
 static int s_num_workers = 0;
@@ -314,7 +374,7 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
     add_log("\033[1;30m[DISC]\033[0m Connection closed for client %s:%d", client_ip, client_port);
 
     worker_remove_conn(worker, conn);
-    free(conn);
+    worker_free_conn(worker, conn);
     atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
 }
 
@@ -405,31 +465,8 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
         char pp_hdr[128];
         int pp_len = build_proxy_protocol_v1_header_storage(pp_hdr, sizeof(pp_hdr), &conn->client_addr, &lb_addr);
         if (pp_len > 0) {
-            size_t avail = buffer_available(&conn->c2b);
-            if (conn->c2b.head >= (size_t)pp_len) {
-                conn->c2b.head -= (size_t)pp_len;
-                memcpy(conn->c2b.data + conn->c2b.head, pp_hdr, (size_t)pp_len);
-            } else if (conn->c2b.tail + (size_t)pp_len <= BUFFER_SIZE) {
-                if (avail > 0) {
-                    memmove(conn->c2b.data + conn->c2b.head + pp_len,
-                            conn->c2b.data + conn->c2b.head,
-                            avail);
-                }
-                memcpy(conn->c2b.data + conn->c2b.head, pp_hdr, (size_t)pp_len);
-                conn->c2b.tail += (size_t)pp_len;
-            } else {
-                buffer_compact(&conn->c2b);
-                avail = buffer_available(&conn->c2b);
-                if (conn->c2b.tail + (size_t)pp_len <= BUFFER_SIZE) {
-                    if (avail > 0) {
-                        memmove(conn->c2b.data + pp_len, conn->c2b.data, avail);
-                    }
-                    memcpy(conn->c2b.data, pp_hdr, (size_t)pp_len);
-                    conn->c2b.head = 0;
-                    conn->c2b.tail = avail + (size_t)pp_len;
-                } else {
-                    add_log("\033[1;31m[PPv1 ERR]\033[0m Buffer full, failed prepending PROXY v1 header");
-                }
+            if (!buffer_prepend(&conn->c2b, pp_hdr, (size_t)pp_len)) {
+                add_log("\033[1;31m[PPv1 ERR]\033[0m Buffer full, failed prepending PROXY v1 header");
             }
         }
     }
@@ -438,15 +475,18 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
     conn->last_activity = time(NULL);
 
     // Attempt immediate non-blocking flush of any pending c2b data
-    if (buffer_available(&conn->c2b) > 0) {
+    while (buffer_available(&conn->c2b) > 0) {
         bool want_io = false;
+        size_t rlen = buffer_read_len(&conn->c2b);
         ssize_t w = nonblocking_write(conn->backend_fd, NULL,
-                                      conn->c2b.data + conn->c2b.head, buffer_available(&conn->c2b), &want_io);
+                                      buffer_read_ptr(&conn->c2b), rlen, &want_io);
         if (w > 0) {
-            conn->c2b.head += (size_t)w;
+            buffer_consume(&conn->c2b, (size_t)w);
         } else if (w < 0) {
             worker_close_conn(worker, conn);
             return;
+        } else {
+            break;
         }
     }
 
@@ -554,14 +594,13 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
             return;
         }
         if (events & EPOLLIN) {
-            buffer_compact(&conn->c2b);
-            size_t space = buffer_space(&conn->c2b);
+            size_t space = buffer_write_len(&conn->c2b);
             if (space > 0) {
                 bool want_io = false;
                 ssize_t r = nonblocking_read(conn->client_fd, conn->client_ssl,
-                                             conn->c2b.data + conn->c2b.tail, space, &want_io);
+                                             buffer_write_ptr(&conn->c2b), space, &want_io);
                 if (r > 0) {
-                    conn->c2b.tail += (size_t)r;
+                    buffer_produce(&conn->c2b, (size_t)r);
                     conn->last_activity = time(NULL);
                 } else if (r == 0 && !want_io) {
                     conn->client_closed = true;
@@ -600,7 +639,7 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
 }
 
 static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *conn) {
-    while (g_server_running) {
+    while (g_server_running && worker->running) {
         int acc_res = SSL_accept(conn->client_ssl);
         if (acc_res > 0) {
             conn->last_activity = time(NULL);
@@ -645,14 +684,13 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Events on CLIENT socket
     if (fd == conn->client_fd) {
         if (events & EPOLLIN) {
-            buffer_compact(&conn->c2b);
-            size_t space = buffer_space(&conn->c2b);
+            size_t space = buffer_write_len(&conn->c2b);
             if (space > 0) {
                 bool want_io = false;
                 ssize_t r = nonblocking_read(conn->client_fd, conn->client_ssl,
-                                             conn->c2b.data + conn->c2b.tail, space, &want_io);
+                                             buffer_write_ptr(&conn->c2b), space, &want_io);
                 if (r > 0) {
-                    conn->c2b.tail += (size_t)r;
+                    buffer_produce(&conn->c2b, (size_t)r);
                     conn->last_activity = now;
                 } else if (r == 0 && !want_io) {
                     conn->client_closed = true;
@@ -664,12 +702,13 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
         }
 
         if (events & EPOLLOUT) {
-            if (buffer_available(&conn->b2c) > 0) {
+            size_t avail = buffer_read_len(&conn->b2c);
+            if (avail > 0) {
                 bool want_io = false;
                 ssize_t w = nonblocking_write(conn->client_fd, conn->client_ssl,
-                                              conn->b2c.data + conn->b2c.head, buffer_available(&conn->b2c), &want_io);
+                                              buffer_read_ptr(&conn->b2c), avail, &want_io);
                 if (w > 0) {
-                    conn->b2c.head += (size_t)w;
+                    buffer_consume(&conn->b2c, (size_t)w);
                     conn->last_activity = now;
                 } else if (w < 0) {
                     worker_close_conn(worker, conn);
@@ -686,14 +725,13 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Events on BACKEND socket
     if (fd == conn->backend_fd) {
         if (events & EPOLLIN) {
-            buffer_compact(&conn->b2c);
-            size_t space = buffer_space(&conn->b2c);
+            size_t space = buffer_write_len(&conn->b2c);
             if (space > 0) {
                 bool want_io = false;
                 ssize_t r = nonblocking_read(conn->backend_fd, NULL,
-                                             conn->b2c.data + conn->b2c.tail, space, &want_io);
+                                             buffer_write_ptr(&conn->b2c), space, &want_io);
                 if (r > 0) {
-                    conn->b2c.tail += (size_t)r;
+                    buffer_produce(&conn->b2c, (size_t)r);
                     conn->last_activity = now;
                 } else if (r == 0 && !want_io) {
                     conn->backend_closed = true;
@@ -705,12 +743,13 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
         }
 
         if (events & EPOLLOUT) {
-            if (buffer_available(&conn->c2b) > 0) {
+            size_t avail = buffer_read_len(&conn->c2b);
+            if (avail > 0) {
                 bool want_io = false;
                 ssize_t w = nonblocking_write(conn->backend_fd, NULL,
-                                              conn->c2b.data + conn->c2b.head, buffer_available(&conn->c2b), &want_io);
+                                              buffer_read_ptr(&conn->c2b), avail, &want_io);
                 if (w > 0) {
-                    conn->c2b.head += (size_t)w;
+                    buffer_consume(&conn->c2b, (size_t)w);
                     conn->last_activity = now;
                 } else if (w < 0) {
                     worker_close_conn(worker, conn);
@@ -727,10 +766,11 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Immediate flush attempt for c2b to backend
     if (conn->backend_fd >= 0 && buffer_available(&conn->c2b) > 0) {
         bool want_io = false;
+        size_t avail = buffer_read_len(&conn->c2b);
         ssize_t w = nonblocking_write(conn->backend_fd, NULL,
-                                      conn->c2b.data + conn->c2b.head, buffer_available(&conn->c2b), &want_io);
+                                      buffer_read_ptr(&conn->c2b), avail, &want_io);
         if (w > 0) {
-            conn->c2b.head += (size_t)w;
+            buffer_consume(&conn->c2b, (size_t)w);
             conn->last_activity = now;
         } else if (w < 0) {
             worker_close_conn(worker, conn);
@@ -741,10 +781,11 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Immediate flush attempt for b2c to client
     if (conn->client_fd >= 0 && buffer_available(&conn->b2c) > 0) {
         bool want_io = false;
+        size_t avail = buffer_read_len(&conn->b2c);
         ssize_t w = nonblocking_write(conn->client_fd, conn->client_ssl,
-                                      conn->b2c.data + conn->b2c.head, buffer_available(&conn->b2c), &want_io);
+                                      buffer_read_ptr(&conn->b2c), avail, &want_io);
         if (w > 0) {
-            conn->b2c.head += (size_t)w;
+            buffer_consume(&conn->b2c, (size_t)w);
             conn->last_activity = now;
         } else if (w < 0) {
             worker_close_conn(worker, conn);
@@ -809,7 +850,7 @@ static void worker_accept_connection(WorkerThread *worker, int client_fd, const 
     int flag = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
-    ProxyConnection *conn = calloc(1, sizeof(ProxyConnection));
+    ProxyConnection *conn = worker_alloc_conn(worker);
     if (!conn) {
         close(client_fd);
         atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
@@ -899,26 +940,26 @@ static void *worker_event_loop(void *arg) {
     struct epoll_event events[MAX_WORKER_EVENTS];
     time_t last_timeout_check = time(NULL);
 
-    while (g_server_running) {
+    while (g_server_running && worker->running) {
         // Priority drain of pending data in OpenSSL internal buffers
         ProxyConnection *c = worker->conn_list_head;
         while (c) {
             ProxyConnection *next_c = c->next;
             if (c->state == CONN_STATE_FORWARDING && c->client_ssl && !c->client_closed && SSL_pending(c->client_ssl) > 0) {
-                buffer_compact(&c->c2b);
-                size_t space = buffer_space(&c->c2b);
+                size_t space = buffer_write_len(&c->c2b);
                 if (space > 0) {
                     bool want_io = false;
                     ssize_t r = nonblocking_read(c->client_fd, c->client_ssl,
-                                                 c->c2b.data + c->c2b.tail, space, &want_io);
+                                                 buffer_write_ptr(&c->c2b), space, &want_io);
                     if (r > 0) {
-                        c->c2b.tail += (size_t)r;
+                        buffer_produce(&c->c2b, (size_t)r);
                         c->last_activity = time(NULL);
                         if (c->backend_fd >= 0 && buffer_available(&c->c2b) > 0) {
+                            size_t avail = buffer_read_len(&c->c2b);
                             ssize_t w = nonblocking_write(c->backend_fd, NULL,
-                                                          c->c2b.data + c->c2b.head, buffer_available(&c->c2b), &want_io);
+                                                          buffer_read_ptr(&c->c2b), avail, &want_io);
                             if (w > 0) {
-                                c->c2b.head += (size_t)w;
+                                buffer_consume(&c->c2b, (size_t)w);
                             } else if (w < 0) {
                                 worker_close_conn(worker, c);
                                 c = next_c;
@@ -957,6 +998,35 @@ static void *worker_event_loop(void *arg) {
 
             if (curr_fd == worker->notify_pipe[0]) {
                 worker_process_new_conns(worker);
+                continue;
+            }
+
+            if (worker->listen_fd >= 0 && curr_fd == worker->listen_fd) {
+                while (g_server_running && worker->running) {
+                    struct sockaddr_storage client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_fd = accept(worker->listen_fd, (struct sockaddr *)&client_addr, &client_len);
+                    if (client_fd < 0) {
+                        if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        break;
+                    }
+
+                    if (atomic_load_explicit(&g_active_clients, memory_order_relaxed) >= g_config.max_connections) {
+                        close(client_fd);
+                        static time_t last_warn = 0;
+                        time_t now_w = time(NULL);
+                        if (now_w - last_warn >= 2) {
+                            add_log("\033[1;31m[DROP]\033[0m Connection rejected: max-connections limit (%d) reached",
+                                    g_config.max_connections);
+                            last_warn = now_w;
+                        }
+                        continue;
+                    }
+
+                    atomic_fetch_add_explicit(&g_active_clients, 1, memory_order_relaxed);
+                    worker_accept_connection(worker, client_fd, &client_addr);
+                }
                 continue;
             }
 
@@ -1014,6 +1084,19 @@ static void *worker_event_loop(void *arg) {
         worker_close_conn(worker, worker->conn_list_head);
     }
 
+    // Drain worker local slab pool
+    while (worker->conn_pool_head) {
+        ProxyConnection *next_p = worker->conn_pool_head->next;
+        free(worker->conn_pool_head);
+        worker->conn_pool_head = next_p;
+    }
+    worker->conn_pool_count = 0;
+
+    if (worker->listen_fd >= 0) {
+        close(worker->listen_fd);
+        worker->listen_fd = -1;
+    }
+
     return NULL;
 }
 
@@ -1033,6 +1116,7 @@ bool worker_pool_init(int num_workers) {
     for (int i = 0; i < num_workers; i++) {
         WorkerThread *w = &s_workers[i];
         w->id = i;
+        w->running = true;
         w->epfd = epoll_create1(0);
         if (w->epfd < 0) {
             fprintf(stderr, "\033[1;31m[ERROR]\033[0m Worker [%d] failed to create epoll/kqueue: %s (errno %d)\n",
@@ -1059,6 +1143,23 @@ bool worker_pool_init(int num_workers) {
                     i, strerror(errno));
             pthread_attr_destroy(&attr);
             return false;
+        }
+
+        // Bind SO_REUSEPORT listening socket directly in each worker for kernel multi-accept
+        w->listen_fd = -1;
+        if (g_config.listen_port > 0) {
+            w->listen_fd = create_tcp_server_socket(g_config.listen_port);
+            if (w->listen_fd >= 0) {
+                set_nonblocking(w->listen_fd);
+                struct epoll_event ev_listen;
+                memset(&ev_listen, 0, sizeof(ev_listen));
+                ev_listen.data.fd = w->listen_fd;
+                ev_listen.events = EPOLLIN;
+                if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->listen_fd, &ev_listen) < 0) {
+                    close(w->listen_fd);
+                    w->listen_fd = -1;
+                }
+            }
         }
 
         pthread_mutex_init(&w->queue_mutex, NULL);
@@ -1115,6 +1216,11 @@ void worker_pool_shutdown(void) {
     if (!s_workers) return;
     for (int i = 0; i < s_num_workers; i++) {
         WorkerThread *w = &s_workers[i];
+        w->running = false;
+        if (w->listen_fd >= 0) {
+            close(w->listen_fd);
+            w->listen_fd = -1;
+        }
         char c = 'q';
         (void)write(w->notify_pipe[1], &c, 1);
         pthread_join(w->thread, NULL);
@@ -1190,13 +1296,12 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 
     while (g_server_running) {
         if (client_ssl && !client_closed && SSL_pending(client_ssl) > 0) {
-            buffer_compact(&c2b);
-            size_t space = buffer_space(&c2b);
+            size_t space = buffer_write_len(&c2b);
             if (space > 0) {
                 bool want_io = false;
-                ssize_t r = nonblocking_read(client_fd, client_ssl, c2b.data + c2b.tail, space, &want_io);
+                ssize_t r = nonblocking_read(client_fd, client_ssl, buffer_write_ptr(&c2b), space, &want_io);
                 if (r > 0) {
-                    c2b.tail += (size_t)r;
+                    buffer_produce(&c2b, (size_t)r);
                     last_activity = time(NULL);
                 }
             }
@@ -1204,9 +1309,10 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 
         if (buffer_available(&c2b) > 0) {
             bool want_io = false;
-            ssize_t w = nonblocking_write(backend_fd, NULL, c2b.data + c2b.head, buffer_available(&c2b), &want_io);
+            size_t avail = buffer_read_len(&c2b);
+            ssize_t w = nonblocking_write(backend_fd, NULL, buffer_read_ptr(&c2b), avail, &want_io);
             if (w > 0) {
-                c2b.head += (size_t)w;
+                buffer_consume(&c2b, (size_t)w);
                 last_activity = time(NULL);
             } else if (w < 0) {
                 break;
@@ -1215,9 +1321,10 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 
         if (buffer_available(&b2c) > 0) {
             bool want_io = false;
-            ssize_t w = nonblocking_write(client_fd, client_ssl, b2c.data + b2c.head, buffer_available(&b2c), &want_io);
+            size_t avail = buffer_read_len(&b2c);
+            ssize_t w = nonblocking_write(client_fd, client_ssl, buffer_read_ptr(&b2c), avail, &want_io);
             if (w > 0) {
-                b2c.head += (size_t)w;
+                buffer_consume(&b2c, (size_t)w);
                 last_activity = time(NULL);
             } else if (w < 0) {
                 break;
@@ -1291,13 +1398,12 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 
             if (curr_fd == client_fd) {
                 if (ev_mask & EPOLLIN) {
-                    buffer_compact(&c2b);
-                    size_t space = buffer_space(&c2b);
+                    size_t space = buffer_write_len(&c2b);
                     if (space > 0) {
                         bool want_io = false;
-                        ssize_t r = nonblocking_read(client_fd, client_ssl, c2b.data + c2b.tail, space, &want_io);
+                        ssize_t r = nonblocking_read(client_fd, client_ssl, buffer_write_ptr(&c2b), space, &want_io);
                         if (r > 0) {
-                            c2b.tail += (size_t)r;
+                            buffer_produce(&c2b, (size_t)r);
                             last_activity = now;
                         } else if (r == 0 && !want_io) {
                             client_closed = true;
@@ -1311,9 +1417,10 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
                 if (ev_mask & EPOLLOUT) {
                     if (buffer_available(&b2c) > 0) {
                         bool want_io = false;
-                        ssize_t w = nonblocking_write(client_fd, client_ssl, b2c.data + b2c.head, buffer_available(&b2c), &want_io);
+                        size_t avail = buffer_read_len(&b2c);
+                        ssize_t w = nonblocking_write(client_fd, client_ssl, buffer_read_ptr(&b2c), avail, &want_io);
                         if (w > 0) {
-                            b2c.head += (size_t)w;
+                            buffer_consume(&b2c, (size_t)w);
                             last_activity = now;
                         } else if (w < 0) {
                             fatal_err = true;
@@ -1329,13 +1436,12 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
 
             if (curr_fd == backend_fd) {
                 if (ev_mask & EPOLLIN) {
-                    buffer_compact(&b2c);
-                    size_t space = buffer_space(&b2c);
+                    size_t space = buffer_write_len(&b2c);
                     if (space > 0) {
                         bool want_io = false;
-                        ssize_t r = nonblocking_read(backend_fd, NULL, b2c.data + b2c.tail, space, &want_io);
+                        ssize_t r = nonblocking_read(backend_fd, NULL, buffer_write_ptr(&b2c), space, &want_io);
                         if (r > 0) {
-                            b2c.tail += (size_t)r;
+                            buffer_produce(&b2c, (size_t)r);
                             last_activity = now;
                         } else if (r == 0 && !want_io) {
                             backend_closed = true;
@@ -1349,9 +1455,10 @@ void forward_traffic_dual_epoll(int client_fd, SSL *client_ssl, int backend_fd) 
                 if (ev_mask & EPOLLOUT) {
                     if (buffer_available(&c2b) > 0) {
                         bool want_io = false;
-                        ssize_t w = nonblocking_write(backend_fd, NULL, c2b.data + c2b.head, buffer_available(&c2b), &want_io);
+                        size_t avail = buffer_read_len(&c2b);
+                        ssize_t w = nonblocking_write(backend_fd, NULL, buffer_read_ptr(&c2b), avail, &want_io);
                         if (w > 0) {
-                            c2b.head += (size_t)w;
+                            buffer_consume(&c2b, (size_t)w);
                             last_activity = now;
                         } else if (w < 0) {
                             fatal_err = true;
