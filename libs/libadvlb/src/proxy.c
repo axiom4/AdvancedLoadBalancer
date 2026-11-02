@@ -8,6 +8,8 @@
 #include "advlb/compat_epoll.h"
 #include "advlb/ssl_engine.h"
 #include "advlb/conn_pool.h"
+#include "advlb/session_table.h"
+#include "advlb/cluster.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,6 +187,38 @@ static inline bool has_connection_close_header(const char *buf, size_t len) {
     return false;
 }
 
+static bool extract_http_session_token(const char *buf, size_t len,
+                                       const char **out_tok, size_t *out_len) {
+    if (!buf || len < 12 || !out_tok || !out_len) return false;
+    size_t scan_len = (len < 1024) ? len : 1024;
+
+    static const char *hdr_names[] = { "x-session-id:", "cookie:" };
+    static const size_t hdr_lens[] = { 13, 7 };
+
+    for (size_t h = 0; h < 2; h++) {
+        const char *target = hdr_names[h];
+        size_t tlen = hdr_lens[h];
+        if (scan_len <= tlen) continue;
+        for (size_t i = 0; i + tlen < scan_len; i++) {
+            if (i > 0 && buf[i - 1] != '\n') continue;
+            if (strncasecmp(buf + i, target, tlen) == 0) {
+                size_t pos = i + tlen;
+                while (pos < scan_len && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
+                size_t end = pos;
+                while (end < scan_len && buf[end] != '\r' && buf[end] != '\n') end++;
+                if (end > pos) {
+                    size_t tok_len = end - pos;
+                    if (tok_len > 128) tok_len = 128;
+                    *out_tok = buf + pos;
+                    *out_len = tok_len;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 typedef enum {
     CONN_STATE_PROXY_PROTOCOL,
     CONN_STATE_SSL_HANDSHAKE,
@@ -211,6 +245,7 @@ typedef struct ProxyConnection {
     bool had_error;
     bool from_pool;
     bool keep_alive_eligible;
+    bool l7_session_checked;
 
     size_t bytes_to_backend;
     size_t bytes_from_backend;
@@ -220,6 +255,7 @@ typedef struct ProxyConnection {
 
     time_t last_activity;
     time_t hs_start;
+    time_t last_session_sync;
 
     struct WorkerThread *worker;
     struct ProxyConnection *prev;
@@ -649,6 +685,100 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
     worker_close_conn(worker, conn);
 }
 
+static bool worker_apply_l7_session_affinity(WorkerThread *worker, ProxyConnection *conn) {
+    if (conn->l7_session_checked || conn->bytes_to_backend > 0) return false;
+    if (!g_config.enable_cluster && !g_config.enable_session_stickiness) {
+        conn->l7_session_checked = true;
+        return false;
+    }
+
+    size_t avail = buffer_read_len(&conn->c2b);
+    if (avail < 16) return false;
+
+    const char *rptr = buffer_read_ptr(&conn->c2b);
+    const char *tok = NULL;
+    size_t tok_len = 0;
+    if (!extract_http_session_token(rptr, avail, &tok, &tok_len)) {
+        if (avail >= 256 || memmem(rptr, avail, "\r\n\r\n", 4) != NULL) {
+            conn->l7_session_checked = true;
+        }
+        return false;
+    }
+
+    conn->l7_session_checked = true;
+    uint32_t ttl = (g_config.session_ttl_sec > 0) ? (uint32_t)g_config.session_ttl_sec : 120u;
+    int target_b = session_table_lookup_token(tok, tok_len);
+
+    if (target_b >= 0 && target_b < g_num_backends &&
+        target_b != conn->backend_idx && !g_config.enable_proxy_protocol_v1) {
+        int new_bfd = -1;
+        bool in_prog = false;
+        bool pooled = false;
+
+        if (g_config.enable_upstream_pooling) {
+            new_bfd = conn_pool_acquire(target_b);
+            if (new_bfd >= 0) pooled = true;
+        }
+        if (new_bfd < 0) {
+            new_bfd = connect_nonblocking_transparent(g_backends[target_b].ip,
+                                                      g_backends[target_b].port,
+                                                      &conn->client_addr, &in_prog);
+        }
+
+        if (new_bfd >= 0) {
+            if (conn->backend_fd >= 0) {
+                epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
+                worker_clear_fd(worker, conn->backend_fd);
+                if (conn->from_pool && g_config.enable_upstream_pooling) {
+                    if (!conn_pool_release(conn->backend_idx, conn->backend_fd)) {
+                        close(conn->backend_fd);
+                    }
+                } else {
+                    close(conn->backend_fd);
+                }
+            }
+            if (conn->backend_idx >= 0) {
+                release_backend(conn->backend_idx);
+            }
+
+            atomic_fetch_add_explicit(&g_backends[target_b].active_connections, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_backends[target_b].total_requests_handled, 1, memory_order_relaxed);
+
+            conn->backend_idx = target_b;
+            conn->backend_fd = new_bfd;
+            conn->from_pool = pooled;
+            conn->last_backend_ev = 0;
+            worker_set_fd(worker, new_bfd, conn);
+
+            bool use_port = !g_config.enable_session_stickiness;
+            session_table_upsert_local(&conn->client_addr, SESSION_PROTO_TCP, use_port,
+                                       target_b, ttl, g_config.enable_cluster);
+            session_table_upsert_token(tok, tok_len, target_b, ttl, g_config.enable_cluster);
+
+            if (!pooled && in_prog) {
+                conn->state = CONN_STATE_BACKEND_CONNECTING;
+                struct epoll_event ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.data.fd = new_bfd;
+                ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                conn->last_backend_ev = ev.events;
+                epoll_ctl(worker->epfd, EPOLL_CTL_ADD, new_bfd, &ev);
+                return true;
+            }
+
+            record_backend_success(target_b);
+            conn->state = CONN_STATE_FORWARDING;
+            worker_update_conn_epoll(worker, conn);
+            return false;
+        }
+    }
+
+    if (conn->backend_idx >= 0) {
+        session_table_upsert_token(tok, tok_len, conn->backend_idx, ttl, g_config.enable_cluster);
+    }
+    return false;
+}
+
 static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events) {
     if (fd == conn->client_fd) {
         if (events & EPOLLERR) {
@@ -679,6 +809,9 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
                 } else {
                     break;
                 }
+            }
+            if (!conn->l7_session_checked && buffer_available(&conn->c2b) > 0) {
+                (void)worker_apply_l7_session_affinity(worker, conn);
             }
         }
         return;
@@ -775,6 +908,19 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                 } else {
                     break;
                 }
+            }
+            if (!conn->l7_session_checked && conn->bytes_to_backend == 0 && buffer_available(&conn->c2b) > 0) {
+                if (worker_apply_l7_session_affinity(worker, conn)) {
+                    return;
+                }
+            }
+            if ((g_config.enable_cluster || g_config.enable_session_stickiness) &&
+                conn->backend_idx >= 0 && (now - conn->last_session_sync >= 5)) {
+                uint32_t ttl = (g_config.session_ttl_sec > 0) ? (uint32_t)g_config.session_ttl_sec : 120u;
+                bool use_port = !g_config.enable_session_stickiness;
+                session_table_upsert_local(&conn->client_addr, SESSION_PROTO_TCP, use_port,
+                                           conn->backend_idx, ttl, g_config.enable_cluster);
+                conn->last_session_sync = now;
             }
         }
 
@@ -1117,6 +1263,12 @@ static void *worker_event_loop(void *arg) {
                     if (r > 0) {
                         buffer_produce(&c->c2b, (size_t)r);
                         c->last_activity = time(NULL);
+                        if (!c->l7_session_checked && c->bytes_to_backend == 0 && buffer_available(&c->c2b) > 0) {
+                            if (worker_apply_l7_session_affinity(worker, c)) {
+                                c = next_c;
+                                continue;
+                            }
+                        }
                         if (c->backend_fd >= 0 && buffer_available(&c->c2b) > 0) {
                             size_t avail = buffer_read_len(&c->c2b);
                             ssize_t w = nonblocking_write(c->backend_fd, NULL,
@@ -1332,9 +1484,9 @@ bool worker_pool_init(int num_workers) {
             return false;
         }
 
-        // Bind SO_REUSEPORT listening socket directly in each worker for kernel multi-accept
+        // Bind per-worker listening socket only in standalone mode when main global listener is inactive
         w->listen_fd = -1;
-        if (g_config.listen_port > 0) {
+        if (g_config.listen_port > 0 && g_global_server_fd < 0 && !g_config.enable_cluster) {
             w->listen_fd = create_tcp_server_socket(g_config.listen_port);
             if (w->listen_fd >= 0) {
                 set_nonblocking(w->listen_fd);
@@ -1401,13 +1553,28 @@ void worker_pool_dispatch(int client_fd, const struct sockaddr_storage *client_a
 
 void worker_pool_shutdown(void) {
     if (!s_workers) return;
+
+    // Stop accepting on worker sockets and allow in-flight active connections to drain gracefully
     for (int i = 0; i < s_num_workers; i++) {
         WorkerThread *w = &s_workers[i];
-        w->running = false;
         if (w->listen_fd >= 0) {
+            epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->listen_fd, NULL);
             close(w->listen_fd);
             w->listen_fd = -1;
         }
+    }
+
+    for (int wait_ms = 0; wait_ms < 1500; wait_ms += 10) {
+        if (atomic_load_explicit(&g_active_clients, memory_order_relaxed) <= 0) {
+            break;
+        }
+        struct timespec ts = {0, 10000000L}; // 10ms
+        nanosleep(&ts, NULL);
+    }
+
+    for (int i = 0; i < s_num_workers; i++) {
+        WorkerThread *w = &s_workers[i];
+        w->running = false;
         char c = 'q';
         (void)write(w->notify_pipe[1], &c, 1);
         pthread_join(w->thread, NULL);

@@ -40,6 +40,7 @@ typedef struct {
     bool use_udp;
     bool use_ssl;
     bool send_proxy_proto;
+    bool use_session;
     char http_path[256];
     char post_data[1024];
     int mock_backends_count;
@@ -391,28 +392,35 @@ static void *worker_client_thread(void *arg) {
                      g_cfg.target_ip, g_cfg.target_port);
         }
 
+        char sess_hdr[128] = "";
+        if (g_cfg.use_session || g_cfg.keep_alive) {
+            snprintf(sess_hdr, sizeof(sess_hdr), "X-Session-ID: adlb-sess-worker-%d\r\n", ctx->thread_id);
+        }
+
         if (strlen(g_cfg.post_data) > 0) {
             req_len = snprintf(req_buf, sizeof(req_buf),
                 "%sPOST %s HTTP/1.1\r\n"
                 "Host: %s:%d\r\n"
                 "User-Agent: adlb-test-client/1.0\r\n"
+                "%s"
                 "Content-Type: application/x-www-form-urlencoded\r\n"
                 "Content-Length: %zu\r\n"
                 "Connection: %s\r\n"
                 "\r\n"
                 "%s",
                 proxy_hdr, g_cfg.http_path, g_cfg.target_ip, g_cfg.target_port,
-                strlen(g_cfg.post_data), g_cfg.keep_alive ? "keep-alive" : "close",
+                sess_hdr, strlen(g_cfg.post_data), g_cfg.keep_alive ? "keep-alive" : "close",
                 g_cfg.post_data);
         } else {
             req_len = snprintf(req_buf, sizeof(req_buf),
                 "%sGET %s HTTP/1.1\r\n"
                 "Host: %s:%d\r\n"
                 "User-Agent: adlb-test-client/1.0\r\n"
+                "%s"
                 "Connection: %s\r\n"
                 "\r\n",
                 proxy_hdr, g_cfg.http_path, g_cfg.target_ip, g_cfg.target_port,
-                g_cfg.keep_alive ? "keep-alive" : "close");
+                sess_hdr, g_cfg.keep_alive ? "keep-alive" : "close");
         }
     } else {
         req_len = snprintf(req_buf, sizeof(req_buf), "PING adlb-load-test payload\r\n");
@@ -433,103 +441,119 @@ static void *worker_client_thread(void *arg) {
         bool success = false;
         ssize_t received_bytes = 0;
 
-        if (active_fd < 0) {
-            active_fd = connect_to_target(g_cfg.target_ip, g_cfg.target_port, g_cfg.use_udp);
-            if (active_fd < 0) {
-                atomic_fetch_add_explicit(&g_fail_connect, 1, memory_order_relaxed);
-                pthread_mutex_lock(&g_err_str_mutex);
-                snprintf(g_last_conn_err, sizeof(g_last_conn_err), "%s", strerror(errno));
-                pthread_mutex_unlock(&g_err_str_mutex);
-                if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] Connect failed to %s:%d: %s\n", g_cfg.target_ip, g_cfg.target_port, strerror(errno));
-                atomic_fetch_add_explicit(&g_reqs_failed, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_reqs_completed, 1, memory_order_relaxed);
-                continue;
-            }
-
+        for (int attempt = 0; attempt < 2 && !success && g_running; attempt++) {
+            if (attempt > 0) {
 #ifndef NO_SSL
-            if (g_cfg.use_ssl && !g_cfg.use_udp) {
-                active_ssl = SSL_new(g_ssl_ctx);
-                SSL_set_fd(active_ssl, active_fd);
-                if (SSL_connect(active_ssl) <= 0) {
-                    atomic_fetch_add_explicit(&g_fail_ssl, 1, memory_order_relaxed);
-                    unsigned long err = ERR_get_error();
-                    char err_buf[128] = "";
-                    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-                    pthread_mutex_lock(&g_err_str_mutex);
-                    snprintf(g_last_ssl_err, sizeof(g_last_ssl_err), "%s", err_buf[0] ? err_buf : strerror(errno));
-                    pthread_mutex_unlock(&g_err_str_mutex);
-                    if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] SSL_connect failed: %s\n", g_last_ssl_err);
+                if (active_ssl) {
                     SSL_free(active_ssl);
                     active_ssl = NULL;
+                }
+#endif
+                if (active_fd >= 0) {
                     close(active_fd);
                     active_fd = -1;
-                    atomic_fetch_add_explicit(&g_reqs_failed, 1, memory_order_relaxed);
-                    atomic_fetch_add_explicit(&g_reqs_completed, 1, memory_order_relaxed);
-                    continue;
                 }
+                usleep(15000); // 15ms backoff for VRRP VIP/listener switchover
             }
-#endif
-        }
 
-        // Send request
-        bool write_ok = false;
+            if (active_fd < 0) {
+                active_fd = connect_to_target(g_cfg.target_ip, g_cfg.target_port, g_cfg.use_udp);
+                if (active_fd < 0) {
+                    if (attempt == 0) continue;
+                    atomic_fetch_add_explicit(&g_fail_connect, 1, memory_order_relaxed);
+                    pthread_mutex_lock(&g_err_str_mutex);
+                    snprintf(g_last_conn_err, sizeof(g_last_conn_err), "%s", strerror(errno));
+                    pthread_mutex_unlock(&g_err_str_mutex);
+                    if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] Connect failed to %s:%d: %s\n", g_cfg.target_ip, g_cfg.target_port, strerror(errno));
+                    break;
+                }
+
 #ifndef NO_SSL
-        if (g_cfg.use_ssl && active_ssl) {
-            int ret = SSL_write(active_ssl, req_buf, req_len);
-            write_ok = (ret == req_len);
-        } else
+                if (g_cfg.use_ssl && !g_cfg.use_udp) {
+                    active_ssl = SSL_new(g_ssl_ctx);
+                    SSL_set_fd(active_ssl, active_fd);
+                    if (SSL_connect(active_ssl) <= 0) {
+                        unsigned long err = ERR_get_error();
+                        char err_buf[128] = "";
+                        ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                        SSL_free(active_ssl);
+                        active_ssl = NULL;
+                        close(active_fd);
+                        active_fd = -1;
+                        if (attempt == 0) continue;
+                        atomic_fetch_add_explicit(&g_fail_ssl, 1, memory_order_relaxed);
+                        pthread_mutex_lock(&g_err_str_mutex);
+                        snprintf(g_last_ssl_err, sizeof(g_last_ssl_err), "%s", err_buf[0] ? err_buf : strerror(errno));
+                        pthread_mutex_unlock(&g_err_str_mutex);
+                        if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] SSL_connect failed: %s\n", g_last_ssl_err);
+                        break;
+                    }
+                }
 #endif
-        {
-            ssize_t ret = send(active_fd, req_buf, (size_t)req_len, 0);
-            write_ok = (ret == req_len);
-        }
+            }
 
-        if (write_ok) {
-            // Read response
+            // Send request
+            bool write_ok = false;
 #ifndef NO_SSL
             if (g_cfg.use_ssl && active_ssl) {
-                received_bytes = SSL_read(active_ssl, resp_buf, sizeof(resp_buf) - 1);
+                int ret = SSL_write(active_ssl, req_buf, req_len);
+                write_ok = (ret == req_len);
             } else
 #endif
             {
-                received_bytes = recv(active_fd, resp_buf, sizeof(resp_buf) - 1, 0);
+                ssize_t ret = send(active_fd, req_buf, (size_t)req_len, 0);
+                write_ok = (ret == req_len);
             }
 
-            if (received_bytes > 0) {
-                resp_buf[received_bytes] = '\0';
-                success = true;
-
-                // Inspect response for backend identity
-                int detected_port = 0;
-                char *hdr = strcasestr(resp_buf, "X-Backend-Port:");
-                if (hdr) {
-                    sscanf(hdr + 15, " %d", &detected_port);
-                } else {
-                    char *sub = strstr(resp_buf, "port ");
-                    if (!sub) sub = strstr(resp_buf, "port:");
-                    if (!sub) sub = strstr(resp_buf, ":900");
-                    if (sub) {
-                        while (*sub && (*sub < '0' || *sub > '9')) sub++;
-                        sscanf(sub, "%d", &detected_port);
-                    }
+            if (write_ok) {
+                // Read response
+#ifndef NO_SSL
+                if (g_cfg.use_ssl && active_ssl) {
+                    received_bytes = SSL_read(active_ssl, resp_buf, sizeof(resp_buf) - 1);
+                } else
+#endif
+                {
+                    received_bytes = recv(active_fd, resp_buf, sizeof(resp_buf) - 1, 0);
                 }
-                if (detected_port > 0) {
-                    record_backend_hit(detected_port);
+
+                if (received_bytes > 0) {
+                    resp_buf[received_bytes] = '\0';
+                    success = true;
+
+                    // Inspect response for backend identity
+                    int detected_port = 0;
+                    char *hdr = strcasestr(resp_buf, "X-Backend-Port:");
+                    if (hdr) {
+                        sscanf(hdr + 15, " %d", &detected_port);
+                    } else {
+                        char *sub = strstr(resp_buf, "port ");
+                        if (!sub) sub = strstr(resp_buf, "port:");
+                        if (!sub) sub = strstr(resp_buf, ":900");
+                        if (sub) {
+                            while (*sub && (*sub < '0' || *sub > '9')) sub++;
+                            sscanf(sub, "%d", &detected_port);
+                        }
+                    }
+                    if (detected_port > 0) {
+                        record_backend_hit(detected_port);
+                    }
+                } else {
+                    if (attempt == 0) continue;
+                    atomic_fetch_add_explicit(&g_fail_recv, 1, memory_order_relaxed);
+                    pthread_mutex_lock(&g_err_str_mutex);
+                    if (received_bytes == 0) {
+                        snprintf(g_last_recv_err, sizeof(g_last_recv_err), "Server closed socket prematurely (EOF)");
+                    } else {
+                        snprintf(g_last_recv_err, sizeof(g_last_recv_err), "%s", strerror(errno));
+                    }
+                    pthread_mutex_unlock(&g_err_str_mutex);
+                    if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] Recv failed or EOF (n=%zd): %s\n", received_bytes, strerror(errno));
                 }
             } else {
-                atomic_fetch_add_explicit(&g_fail_recv, 1, memory_order_relaxed);
-                pthread_mutex_lock(&g_err_str_mutex);
-                if (received_bytes == 0) {
-                    snprintf(g_last_recv_err, sizeof(g_last_recv_err), "Server closed socket prematurely (EOF)");
-                } else {
-                    snprintf(g_last_recv_err, sizeof(g_last_recv_err), "%s", strerror(errno));
-                }
-                pthread_mutex_unlock(&g_err_str_mutex);
-                if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] Recv failed or EOF (n=%zd): %s\n", received_bytes, strerror(errno));
+                if (attempt == 0) continue;
+                atomic_fetch_add_explicit(&g_fail_send, 1, memory_order_relaxed);
+                if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] Send failed: %s\n", strerror(errno));
             }
-        } else {
-            atomic_fetch_add_explicit(&g_fail_send, 1, memory_order_relaxed);
-            if (g_cfg.verbose) fprintf(stderr, "[CLIENT ERROR] Send failed: %s\n", strerror(errno));
         }
 
         double t_end = get_time_sec();
@@ -593,7 +617,8 @@ static void print_usage(const char *prog) {
     printf("  -k, --keep-alive           Enable HTTP Keep-Alive connection reuse\n");
     printf("  -s, --ssl                  Enable HTTPS / SSL/TLS mode\n");
     printf("  -u, --udp                  Enable Layer 4 UDP mode (default: TCP)\n");
-    printf("  -P, --proxy-protocol       Prepend PROXY Protocol v1 header\n\n");
+    printf("  -P, --proxy-protocol       Prepend PROXY Protocol v1 header\n");
+    printf("  -S, --session              Send per-worker X-Session-ID header for HA session affinity\n\n");
     printf("Load & Concurrency Options:\n");
     printf("  -c, --concurrency NUM      Number of concurrent client worker threads (default: 10)\n");
     printf("  -n, --requests NUM         Total number of requests to execute (default: 1000)\n");
@@ -625,6 +650,7 @@ int main(int argc, char *argv[]) {
     g_cfg.use_udp = false;
     g_cfg.use_ssl = false;
     g_cfg.send_proxy_proto = false;
+    g_cfg.use_session = false;
     strncpy(g_cfg.http_path, "/", sizeof(g_cfg.http_path));
     g_cfg.post_data[0] = '\0';
     g_cfg.mock_backends_count = 0;
@@ -659,6 +685,8 @@ int main(int argc, char *argv[]) {
             g_cfg.use_ssl = true;
         } else if (strcmp(argv[i], "-P") == 0 || strcmp(argv[i], "--proxy-protocol") == 0) {
             g_cfg.send_proxy_proto = true;
+        } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--session") == 0) {
+            g_cfg.use_session = true;
         } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--path") == 0) {
             if (++i < argc) strncpy(g_cfg.http_path, argv[i], sizeof(g_cfg.http_path));
         } else if (strcmp(argv[i], "--post") == 0) {

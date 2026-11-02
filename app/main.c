@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <time.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
@@ -23,6 +24,8 @@
 #include "advlb/udp_proxy.h"
 #include "advlb/tui.h"
 #include "advlb/cli.h"
+#include "advlb/session_table.h"
+#include "advlb/cluster.h"
 
 static void handle_sighup(int sig) {
     (void)sig;
@@ -35,6 +38,8 @@ int main(int argc, char *argv[]) {
 
     increase_fd_limit();
     config_init_defaults(&g_config);
+    session_table_init();
+    cluster_init();
     log_init();
 
     if (parse_cli_args(argc, argv) != 0) {
@@ -95,6 +100,9 @@ int main(int argc, char *argv[]) {
         }
 
         perform_health_check_cycle(true);
+        if (g_config.enable_cluster) {
+            cluster_start();
+        }
 
         pthread_t hc_tid;
         if (pthread_create(&hc_tid, NULL, health_check_thread, NULL) != 0) {
@@ -122,6 +130,9 @@ int main(int argc, char *argv[]) {
             nanosleep(&ts, NULL);
         }
 
+        if (g_config.enable_cluster) {
+            cluster_stop();
+        }
         udp_worker_pool_stop();
 
         cleanup_tui();
@@ -131,9 +142,13 @@ int main(int argc, char *argv[]) {
     }
 
     // TCP Mode
-    int server_fd = create_tcp_server_socket(g_config.listen_port);
-    if (server_fd < 0) {
-        exit(EXIT_FAILURE);
+    int server_fd = -1;
+    if (!g_config.enable_cluster) {
+        server_fd = create_tcp_server_socket(g_config.listen_port);
+        if (server_fd < 0) {
+            exit(EXIT_FAILURE);
+        }
+        set_nonblocking(server_fd);
     }
     g_global_server_fd = server_fd;
 
@@ -147,6 +162,9 @@ int main(int argc, char *argv[]) {
     }
 
     perform_health_check_cycle(true);
+    if (g_config.enable_cluster) {
+        cluster_start();
+    }
 
     pthread_t hc_tid;
     if (pthread_create(&hc_tid, NULL, health_check_thread, NULL) != 0) {
@@ -177,39 +195,76 @@ int main(int argc, char *argv[]) {
             config_reload();
         }
 
-        struct sockaddr_storage client_addr;
-        socklen_t client_len = sizeof(client_addr);
-
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (!g_server_running) break;
-            if (g_reload_requested) {
-                g_reload_requested = 0;
-                add_log("\033[1;36m[SYSTEM]\033[0m SIGHUP received: reloading configuration and certificates...");
-                config_reload();
+        if (g_config.enable_cluster) {
+            if (cluster_get_state() == VRRP_STATE_MASTER) {
+                if (server_fd < 0) {
+                    server_fd = create_tcp_server_socket(g_config.listen_port);
+                    if (server_fd >= 0) {
+                        set_nonblocking(server_fd);
+                        g_global_server_fd = server_fd;
+                        add_log("\033[1;32m[VRRP]\033[0m Ingress listener activated on port %d (MASTER)", g_config.listen_port);
+                    } else {
+                        struct timespec ts = {0, 25000000L}; // 25ms
+                        nanosleep(&ts, NULL);
+                        continue;
+                    }
+                }
+            } else {
+                if (server_fd >= 0) {
+                    close(server_fd);
+                    server_fd = -1;
+                    g_global_server_fd = -1;
+                    add_log("\033[1;33m[VRRP]\033[0m Ingress listener released on port %d (BACKUP) — active connections continue draining",
+                            g_config.listen_port);
+                }
+                struct timespec ts = {0, 25000000L}; // 25ms
+                nanosleep(&ts, NULL);
+                continue;
             }
-            if (errno == EINTR) continue;
-            if (errno == ECONNABORTED || errno == EPROTO) continue;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = server_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pret = poll(&pfd, 1, 50);
+        if (pret <= 0 || !(pfd.revents & POLLIN)) {
             continue;
         }
 
-        // Check concurrent connections limit (SEC-02 mitigation)
-        if (atomic_load_explicit(&g_active_clients, memory_order_relaxed) >= g_config.max_connections) {
-            close(client_fd);
-            static time_t last_warn = 0;
-            time_t now = time(NULL);
-            if (now - last_warn >= 2) {
-                add_log("\033[1;31m[DROP]\033[0m Connection rejected: max-connections limit (%d) reached",
-                        g_config.max_connections);
-                last_warn = now;
-            }
-            continue;
-        }
+        while (g_server_running) {
+            struct sockaddr_storage client_addr;
+            socklen_t client_len = sizeof(client_addr);
 
-        atomic_fetch_add_explicit(&g_active_clients, 1, memory_order_relaxed);
-        worker_pool_dispatch(client_fd, &client_addr);
+            int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+            if (client_fd < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == ECONNABORTED || errno == EPROTO) continue;
+                break;
+            }
+
+            // Check concurrent connections limit (SEC-02 mitigation)
+            if (atomic_load_explicit(&g_active_clients, memory_order_relaxed) >= g_config.max_connections) {
+                close(client_fd);
+                static time_t last_warn = 0;
+                time_t now = time(NULL);
+                if (now - last_warn >= 2) {
+                    add_log("\033[1;31m[DROP]\033[0m Connection rejected: max-connections limit (%d) reached",
+                            g_config.max_connections);
+                    last_warn = now;
+                }
+                continue;
+            }
+
+            atomic_fetch_add_explicit(&g_active_clients, 1, memory_order_relaxed);
+            worker_pool_dispatch(client_fd, &client_addr);
+        }
     }
 
+    if (g_config.enable_cluster) {
+        cluster_stop();
+    }
     worker_pool_shutdown();
 
     cleanup_tui();

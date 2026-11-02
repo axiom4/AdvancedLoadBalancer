@@ -19,6 +19,8 @@
 #include "advlb/conn_pool.h"
 #include "advlb/udp_proxy.h"
 #include "advlb/proxy.h"
+#include "advlb/session_table.h"
+#include "advlb/cluster.h"
 #include "advnet/advnet.h"
 
 static int g_tests_run = 0;
@@ -708,6 +710,201 @@ static void test_swrr_concurrent_stress(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 15. Distributed Session Table & Sticky Failover Tests                      */
+/* -------------------------------------------------------------------------- */
+static void test_session_table_stickiness_and_failover(void) {
+    printf("\n=== Running Test Suite: Session Table Stickiness & Remote Sync ===\n");
+    session_table_init();
+    session_table_clear();
+    reset_test_backends(3);
+
+    g_config.current_algorithm = ALG_ROUND_ROBIN;
+    g_config.enable_session_stickiness = true;
+    g_config.session_ttl_sec = 120;
+
+    struct sockaddr_storage client1;
+    memset(&client1, 0, sizeof(client1));
+    struct sockaddr_in *c4 = (struct sockaddr_in *)&client1;
+    c4->sin_family = AF_INET;
+    c4->sin_port = htons(54321);
+    inet_pton(AF_INET, "192.168.50.10", &c4->sin_addr);
+
+    int first_b = get_healthy_backend(&client1);
+    TEST_ASSERT(first_b >= 0 && first_b < 3, "Initial sticky selection returned valid backend");
+    release_backend(first_b);
+
+    /* Even with Round-Robin active, subsequent connections from client1 must stick to first_b */
+    bool all_stuck = true;
+    for (int i = 0; i < 10; i++) {
+        int b = get_healthy_backend(&client1);
+        if (b != first_b) all_stuck = false;
+        release_backend(b);
+    }
+    TEST_ASSERT(all_stuck, "Client IP remained pinned to same backend across 10 Round-Robin calls");
+    TEST_ASSERT(session_table_count() == 1, "Session table tracks 1 active session");
+
+    /* Simulate backend failure: sticky session must automatically fail over to a healthy backend */
+    atomic_store(&g_backends[first_b].is_alive, false);
+    int failover_b = get_healthy_backend(&client1);
+    TEST_ASSERT(failover_b >= 0 && failover_b != first_b,
+                "Sticky client automatically failed over when original backend went DOWN");
+    release_backend(failover_b);
+    atomic_store(&g_backends[first_b].is_alive, true);
+
+    /* Test remote wire application with IP:port resolution */
+    struct sockaddr_storage client2;
+    memset(&client2, 0, sizeof(client2));
+    struct sockaddr_in *c4_2 = (struct sockaddr_in *)&client2;
+    c4_2->sin_family = AF_INET;
+    c4_2->sin_port = htons(60001);
+    inet_pton(AF_INET, "10.20.30.40", &c4_2->sin_addr);
+
+    ClusterSessionWire wire;
+    bool filled = session_table_fill_wire(&wire, &client2, SESSION_PROTO_TCP, false, 2, 300, 99);
+    TEST_ASSERT(filled, "session_table_fill_wire serialized client2 -> backend[2]");
+
+    /* Corrupt hint index to prove resolution works by backend_ip:backend_port */
+    wire.backend_idx = htons(0);
+    bool applied = session_table_apply_remote(&wire);
+    TEST_ASSERT(applied, "session_table_apply_remote accepted replicated wire record");
+
+    int lookup_b = session_table_lookup(&client2, SESSION_PROTO_TCP, false);
+    TEST_ASSERT(lookup_b == 2, "Replicated session resolved to backend[2] by IP:port match");
+
+    ClusterSessionWire snap[8];
+    int exported = session_table_export_snapshot(snap, 8);
+    TEST_ASSERT(exported == 2, "session_table_export_snapshot exported 2 active sessions for bulk sync");
+
+    bool deleted = session_table_delete_remote(&wire);
+    TEST_ASSERT(deleted && session_table_lookup(&client2, SESSION_PROTO_TCP, false) == -1,
+                "session_table_delete_remote removed replicated session");
+
+    session_table_clear();
+    g_config.enable_session_stickiness = false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 16. HA Cluster VRRP Election, VIP & Real-Time Session Replication          */
+/* -------------------------------------------------------------------------- */
+static void test_cluster_vrrp_and_session_sync(void) {
+    printf("\n=== Running Test Suite: HA Cluster VRRP Election & Session Replication ===\n");
+    reset_test_backends(2);
+    session_table_clear();
+    cluster_init();
+    cluster_clear_peers();
+
+    /* Configure local node on 127.0.0.1:19561 with priority 140 */
+    g_config.enable_cluster = true;
+    g_config.enable_session_stickiness = false;
+    g_config.current_algorithm = ALG_ROUND_ROBIN;
+    g_config.vrrp_router_id = 77;
+    g_config.vrrp_priority = 140;
+    g_config.vrrp_advert_interval_ms = 40;
+    g_config.vrrp_preempt = true;
+    strncpy(g_config.virtual_ip, "127.0.0.250", sizeof(g_config.virtual_ip) - 1);
+    g_config.vip_interface[0] = '\0'; /* user-space VIP mode for unprivileged test */
+    strncpy(g_config.cluster_bind_ip, "127.0.0.1", sizeof(g_config.cluster_bind_ip) - 1);
+    g_config.cluster_port = 19561;
+    g_config.cluster_enable_multicast = false;
+    strncpy(g_config.cluster_secret, "test-cluster-hmac-secret-256", sizeof(g_config.cluster_secret) - 1);
+
+    /* Create a UNIX datagram socketpair for sandbox-compatible bidirectional VRRP & Sync transport */
+    int sv[2] = {-1, -1};
+    int sp_rc = socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    TEST_ASSERT(sp_rc == 0, "Created UNIX datagram socketpair for cluster transport");
+    int peer_fd = sv[1];
+
+    bool peer_added = cluster_add_peer("127.0.0.1:19562");
+    TEST_ASSERT(peer_added, "Added peer 127.0.0.1:19562 to cluster mesh");
+
+    bool started = cluster_start_with_socket(sv[0]);
+    TEST_ASSERT(started, "cluster_start_with_socket() initialized VRRP & Session Sync engine");
+
+    /* Wait ~220ms (3 * 40ms + skew) for local node to elect itself MASTER */
+    usleep(250000);
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_MASTER,
+                "Node automatically elected itself VRRP MASTER after master_down_interval");
+    TEST_ASSERT(cluster_is_vip_active(),
+                "Virtual IP (127.0.0.250) marked ACTIVE upon becoming VRRP MASTER");
+
+    /* Verify Peer socket received VRRP advertisements + initial SYNC_REQ */
+    uint8_t rx_buf[2048];
+    int vrrp_pkts_received = 0;
+    while (recv(peer_fd, rx_buf, sizeof(rx_buf), MSG_DONTWAIT) > 0) {
+        vrrp_pkts_received++;
+    }
+    TEST_ASSERT(vrrp_pkts_received >= 2,
+                "Peer node received HMAC-signed VRRP advertisements and SYNC_REQ from Master");
+
+    /* Create multiple connections from the same IP (different ports) on Master:
+     * Verify they distribute across ALL backends while still replicating 5-tuple sessions to Peer */
+    struct sockaddr_storage c_addr;
+    memset(&c_addr, 0, sizeof(c_addr));
+    struct sockaddr_in *c_in = (struct sockaddr_in *)&c_addr;
+    c_in->sin_family = AF_INET;
+    inet_pton(AF_INET, "127.0.0.1", &c_in->sin_addr);
+
+    int b_hits[2] = {0, 0};
+    int assigned_b[6] = {-1, -1, -1, -1, -1, -1};
+    for (int p = 0; p < 6; p++) {
+        c_in->sin_port = htons((uint16_t)(44550 + p));
+        int cb = get_healthy_backend(&c_addr);
+        assigned_b[p] = cb;
+        if (cb >= 0 && cb < 2) b_hits[cb]++;
+        release_backend(cb);
+    }
+    TEST_ASSERT(b_hits[0] == 3 && b_hits[1] == 3,
+                "Cluster mode balances connections from same IP across all backends (3/3)");
+
+    /* Verify active connection 5-tuple continuity: same active (IP, port) maps to exact same backend */
+    bool active_conn_preserved = true;
+    for (int p = 0; p < 6; p++) {
+        c_in->sin_port = htons((uint16_t)(44550 + p));
+        int cb = get_healthy_backend(&c_addr);
+        if (cb != assigned_b[p]) active_conn_preserved = false;
+        release_backend(cb);
+    }
+    TEST_ASSERT(active_conn_preserved,
+                "Active 5-tuple connections preserve exact backend assignment across VRRP switchover");
+
+    /* Verify L7 HTTP Session Token (X-Session-ID / Cookie) replication across VRRP nodes */
+    const char *sess_tok = "adlb-sess-active-conn-99";
+    session_table_upsert_token(sess_tok, strlen(sess_tok), 1, 120, true);
+    TEST_ASSERT(session_table_lookup_token(sess_tok, strlen(sess_tok)) == 1,
+                "L7 Session Token (X-Session-ID) pinned and resolved to backend[1] across cluster");
+
+    usleep(80000); /* Allow async cluster thread to drain queue and transmit delta */
+
+    bool got_session_delta = false;
+    ssize_t n;
+    while ((n = recv(peer_fd, rx_buf, sizeof(rx_buf), MSG_DONTWAIT)) > 0) {
+        /* Byte 5 in header is pkt_type (2 == CLUSTER_PKT_SESSION_UPSERT) */
+        if (n > 64 && rx_buf[5] == 2) {
+            got_session_delta = true;
+        }
+    }
+    TEST_ASSERT(got_session_delta,
+                "Master asynchronously broadcasted SESSION_UPSERT delta packet to cluster peer");
+
+    /* Test manual step-down (TUI '[C]' failover trigger) */
+    cluster_trigger_stepdown();
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_BACKUP,
+                "cluster_trigger_stepdown() immediately transitioned node MASTER -> BACKUP");
+    TEST_ASSERT(!cluster_is_vip_active(),
+                "Virtual IP released immediately upon manual stepdown");
+
+    cluster_stop();
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_DISABLED,
+                "cluster_stop() cleanly shut down VRRP engine");
+    close(peer_fd);
+
+    g_config.enable_cluster = false;
+    g_config.enable_session_stickiness = false;
+    session_table_clear();
+    cluster_clear_peers();
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main Test Runner                                                           */
 /* -------------------------------------------------------------------------- */
 int main(void) {
@@ -733,6 +930,8 @@ int main(void) {
     test_udp_multi_worker_reuseport();
     test_worker_pool_lifecycle();
     test_swrr_concurrent_stress();
+    test_session_table_stickiness_and_failover();
+    test_cluster_vrrp_and_session_sync();
 
     printf("\n====================================================================\n");
     printf("TEST RESULTS: %d Run | \033[1;32m%d Passed\033[0m | \033[1;%sm%d Failed\033[0m\n",

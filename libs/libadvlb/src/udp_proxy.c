@@ -5,6 +5,8 @@
 #include "advlb/log.h"
 #include "advlb/net_utils.h"
 #include "advlb/compat_epoll.h"
+#include "advlb/session_table.h"
+#include "advlb/cluster.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -172,7 +174,20 @@ static UdpSession *worker_find_or_create_session(UdpWorker *w, const struct sock
     struct sockaddr_storage client_ss;
     memset(&client_ss, 0, sizeof(client_ss));
     memcpy(&client_ss, client_addr, sizeof(struct sockaddr_in));
-    int backend_idx = get_healthy_backend(&client_ss);
+
+    int backend_idx = -1;
+    if (g_config.enable_cluster || g_config.enable_session_stickiness) {
+        backend_idx = session_table_lookup(&client_ss, SESSION_PROTO_UDP, true);
+        if (backend_idx >= 0 && backend_idx < g_num_backends) {
+            atomic_fetch_add_explicit(&g_backends[backend_idx].active_connections, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_backends[backend_idx].total_requests_handled, 1, memory_order_relaxed);
+        } else {
+            backend_idx = -1;
+        }
+    }
+    if (backend_idx < 0) {
+        backend_idx = get_healthy_backend(&client_ss);
+    }
     if (backend_idx < 0) {
         pthread_mutex_unlock(&w->mutex);
         return NULL;
@@ -238,6 +253,11 @@ static UdpSession *worker_find_or_create_session(UdpWorker *w, const struct sock
     w->sessions[free_slot].last_activity = now;
     worker_hash_insert(w, &w->sessions[free_slot]);
 
+    if (g_config.enable_cluster || g_config.enable_session_stickiness) {
+        session_table_upsert_local(&client_ss, SESSION_PROTO_UDP, true, backend_idx,
+                                   (uint32_t)g_config.udp_session_timeout_sec, g_config.enable_cluster);
+    }
+
     char c_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr->sin_addr), c_ip, sizeof(c_ip));
     add_log("\033[1;36m[UDP FLOW]\033[0m Client %s:%d -> Backend [%d] %s:%d (Worker %d)",
@@ -271,7 +291,27 @@ static void *udp_worker_thread_func(void *arg) {
     time_t last_cleanup = time(NULL);
 
     while (w->running && g_server_running) {
-        int nfds = epoll_wait(w->epfd, events, 64, 1000);
+        if (g_config.enable_cluster) {
+            if (cluster_get_state() == VRRP_STATE_MASTER) {
+                if (w->server_fd < 0) {
+                    w->server_fd = create_udp_server_socket(w->port);
+                    if (w->server_fd >= 0) {
+                        struct epoll_event ev_server;
+                        ev_server.events = EPOLLIN | EPOLLERR;
+                        ev_server.data.fd = -1;
+                        epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->server_fd, &ev_server);
+                    }
+                }
+            } else {
+                if (w->server_fd >= 0) {
+                    epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->server_fd, NULL);
+                    close(w->server_fd);
+                    w->server_fd = -1;
+                }
+            }
+        }
+
+        int nfds = epoll_wait(w->epfd, events, 64, 100);
         time_t now = time(NULL);
 
         if (g_reload_requested) {
@@ -327,8 +367,10 @@ static void *udp_worker_thread_func(void *arg) {
                         if (bytes == 0) break;
 
                         session->last_activity = now;
-                        sendto(w->server_fd, buffer, (size_t)bytes, 0,
-                               (struct sockaddr *)&(session->client_addr), sizeof(session->client_addr));
+                        if (w->server_fd >= 0) {
+                            sendto(w->server_fd, buffer, (size_t)bytes, 0,
+                                   (struct sockaddr *)&(session->client_addr), sizeof(session->client_addr));
+                        }
                     }
                 }
                 pthread_mutex_unlock(&w->mutex);
@@ -364,29 +406,34 @@ bool udp_worker_pool_start(int num_workers, int port) {
         w->port = port;
         pthread_mutex_init(&w->mutex, NULL);
 
-        // Bind with SO_REUSEPORT
-        w->server_fd = create_udp_server_socket(port);
-        if (w->server_fd < 0) {
-            fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to bind SO_REUSEPORT UDP socket for worker %d on port %d\n", i, port);
-            udp_worker_pool_stop();
-            return false;
-        }
-
         w->epfd = epoll_create1(0);
         if (w->epfd < 0) {
-            close(w->server_fd);
             udp_worker_pool_stop();
             return false;
         }
 
-        struct epoll_event ev_server;
-        ev_server.events = EPOLLIN | EPOLLERR;
-        ev_server.data.fd = -1; // -1 represents the listening worker server_fd
-        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->server_fd, &ev_server) < 0) {
-            close(w->server_fd);
-            close(w->epfd);
-            udp_worker_pool_stop();
-            return false;
+        w->server_fd = -1;
+        if (!g_config.enable_cluster) {
+            w->server_fd = create_udp_server_socket(port);
+            if (w->server_fd < 0) {
+                fprintf(stderr, "\033[1;31m[ERROR]\033[0m Failed to bind SO_REUSEPORT UDP socket for worker %d on port %d\n", i, port);
+                close(w->epfd);
+                w->epfd = -1;
+                udp_worker_pool_stop();
+                return false;
+            }
+
+            struct epoll_event ev_server;
+            ev_server.events = EPOLLIN | EPOLLERR;
+            ev_server.data.fd = -1; // -1 represents the listening worker server_fd
+            if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->server_fd, &ev_server) < 0) {
+                close(w->server_fd);
+                close(w->epfd);
+                w->server_fd = -1;
+                w->epfd = -1;
+                udp_worker_pool_stop();
+                return false;
+            }
         }
 
         w->running = true;

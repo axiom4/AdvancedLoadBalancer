@@ -2,6 +2,8 @@
 #include "advlb/cli.h"
 #include "advlb/log.h"
 #include "advlb/ssl_engine.h"
+#include "advlb/cluster.h"
+#include "advlb/session_table.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +52,21 @@ void config_init_defaults(LbConfig *cfg) {
     cfg->enable_upstream_pooling = true;
     cfg->upstream_pool_size = 16;
     cfg->upstream_pool_idle_sec = 30;
+
+    cfg->enable_cluster = false;
+    cfg->vrrp_router_id = 51;
+    cfg->vrrp_priority = 100;
+    cfg->vrrp_advert_interval_ms = 200;
+    cfg->vrrp_preempt = true;
+    cfg->virtual_ip[0] = '\0';
+    cfg->vip_interface[0] = '\0';
+    strncpy(cfg->cluster_bind_ip, "0.0.0.0", sizeof(cfg->cluster_bind_ip) - 1);
+    cfg->cluster_port = DEFAULT_CLUSTER_PORT;
+    cfg->cluster_enable_multicast = true;
+    strncpy(cfg->cluster_secret, "adlb-cluster-default-hmac-key", sizeof(cfg->cluster_secret) - 1);
+    cfg->cluster_node_id = 0;
+    cfg->enable_session_stickiness = false;
+    cfg->session_ttl_sec = DEFAULT_SESSION_TTL_SEC;
 }
 
 static bool parse_bool_val(const char *val) {
@@ -192,6 +209,51 @@ bool config_load_file(const char *filepath, LbConfig *cfg) {
         } else if (strcasecmp(key, "pool_idle_timeout") == 0 || strcasecmp(key, "pool_timeout") == 0) {
             cfg->upstream_pool_idle_sec = atoi(val);
             if (cfg->upstream_pool_idle_sec <= 0) cfg->upstream_pool_idle_sec = 30;
+        } else if (strcasecmp(key, "cluster") == 0 || strcasecmp(key, "enable_cluster") == 0) {
+            cfg->enable_cluster = parse_bool_val(val);
+        } else if (strcasecmp(key, "vrrp_router_id") == 0 || strcasecmp(key, "vrrp_id") == 0 || strcasecmp(key, "vrid") == 0) {
+            int vrid = atoi(val);
+            if (vrid >= 1 && vrid <= 255) cfg->vrrp_router_id = vrid;
+        } else if (strcasecmp(key, "vrrp_priority") == 0 || strcasecmp(key, "vrrp_prio") == 0) {
+            int prio = atoi(val);
+            if (prio >= 1 && prio <= 254) cfg->vrrp_priority = prio;
+        } else if (strcasecmp(key, "vrrp_interval_ms") == 0 || strcasecmp(key, "vrrp_advert_ms") == 0) {
+            int ms = atoi(val);
+            if (ms >= 20 && ms <= 10000) cfg->vrrp_advert_interval_ms = ms;
+        } else if (strcasecmp(key, "vrrp_preempt") == 0) {
+            cfg->vrrp_preempt = parse_bool_val(val);
+        } else if (strcasecmp(key, "virtual_ip") == 0 || strcasecmp(key, "vip") == 0) {
+            strncpy(cfg->virtual_ip, val, sizeof(cfg->virtual_ip) - 1);
+            cfg->enable_cluster = true;
+        } else if (strcasecmp(key, "vip_interface") == 0 || strcasecmp(key, "vip_iface") == 0) {
+            strncpy(cfg->vip_interface, val, sizeof(cfg->vip_interface) - 1);
+        } else if (strcasecmp(key, "cluster_bind") == 0 || strcasecmp(key, "cluster_bind_ip") == 0) {
+            char *colon = strrchr(val, ':');
+            if (colon && strchr(val, ':') == colon) {
+                *colon = '\0';
+                strncpy(cfg->cluster_bind_ip, val, sizeof(cfg->cluster_bind_ip) - 1);
+                int cp = atoi(colon + 1);
+                if (cp > 0 && cp <= 65535) cfg->cluster_port = cp;
+            } else {
+                strncpy(cfg->cluster_bind_ip, val, sizeof(cfg->cluster_bind_ip) - 1);
+            }
+        } else if (strcasecmp(key, "cluster_port") == 0) {
+            int cp = atoi(val);
+            if (cp > 0 && cp <= 65535) cfg->cluster_port = cp;
+        } else if (strcasecmp(key, "cluster_peer") == 0 || strcasecmp(key, "cluster_peers") == 0 || strcasecmp(key, "peer") == 0) {
+            cluster_add_peer(val);
+            cfg->enable_cluster = true;
+        } else if (strcasecmp(key, "cluster_multicast") == 0) {
+            cfg->cluster_enable_multicast = parse_bool_val(val);
+        } else if (strcasecmp(key, "cluster_secret") == 0 || strcasecmp(key, "vrrp_secret") == 0) {
+            strncpy(cfg->cluster_secret, val, sizeof(cfg->cluster_secret) - 1);
+        } else if (strcasecmp(key, "cluster_node_id") == 0 || strcasecmp(key, "node_id") == 0) {
+            cfg->cluster_node_id = (uint32_t)strtoul(val, NULL, 0);
+        } else if (strcasecmp(key, "session_stickiness") == 0 || strcasecmp(key, "sticky_sessions") == 0) {
+            cfg->enable_session_stickiness = parse_bool_val(val);
+        } else if (strcasecmp(key, "session_ttl") == 0 || strcasecmp(key, "session_ttl_sec") == 0) {
+            int ttl = atoi(val);
+            if (ttl > 0) cfg->session_ttl_sec = ttl;
         }
     }
 

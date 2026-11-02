@@ -4,6 +4,7 @@
 #include "advlb/config.h"
 #include "advlb/health_check.h"
 #include "advlb/utils.h"
+#include "advlb/cluster.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,20 @@ void print_help(const char *prog_name) {
     printf("                            \033[1;33mNOTE:\033[0m with --ssl both --cert and --key are \033[1;31mREQUIRED\033[0m!\n");
     printf("      --cert FILE           SSL X.509 certificate file (required with --ssl)\n");
     printf("      --key FILE            SSL RSA private key file (required with --ssl)\n\n");
+    printf("High-Availability Cluster (VRRP + VIP + Session Replication):\n");
+    printf("      --cluster             Enable HA Cluster mode (VRRP election + Session Sync)\n");
+    printf("      --vip IP[/PREFIX]     Virtual IP address managed by VRRP Master (e.g. 192.168.1.200/24)\n");
+    printf("      --vip-iface IFACE     Network interface for VIP binding (e.g. en0, eth0)\n");
+    printf("      --vrrp-id ID          VRRP Virtual Router ID 1-255 (default: 51)\n");
+    printf("      --vrrp-priority PRIO  Node VRRP election priority 1-254 (default: 100)\n");
+    printf("      --vrrp-interval MS    VRRP heartbeat interval in ms (default: 200)\n");
+    printf("      --no-preempt          Disable VRRP Master preemption\n");
+    printf("      --cluster-bind IP:PRT Local IP:Port for cluster VRRP & session sync (default: 0.0.0.0:9550)\n");
+    printf("      --cluster-peer IP:PRT Add unicast cluster peer node (repeatable or comma-separated)\n");
+    printf("      --cluster-secret KEY  Shared HMAC-SHA256 secret key for cluster authentication\n");
+    printf("      --no-multicast        Use unicast peer mesh only (disable multicast 224.0.0.18)\n");
+    printf("      --sticky              Enable sticky session persistence table (auto-enabled in cluster)\n");
+    printf("      --session-ttl SEC     Session stickiness TTL in seconds (default: 300)\n\n");
     printf("Other Options:\n");
     printf("  -m, --max-connections NUM Maximum concurrent connections limit (default: 4096)\n");
     printf("  -w, --workers NUM         Number of epoll worker threads (default: CPU cores)\n");
@@ -251,6 +266,23 @@ int parse_cli_args(int argc, char *argv[]) {
         {"timeout",     required_argument, 0, 1020},
         {"no-pool",     no_argument,       0, 1021},
         {"pool-size",   required_argument, 0, 1022},
+        {"cluster",     no_argument,       0, 1023},
+        {"vip",         required_argument, 0, 1024},
+        {"vip-iface",   required_argument, 0, 1025},
+        {"vrrp-id",     required_argument, 0, 1026},
+        {"vrrp-priority", required_argument, 0, 1027},
+        {"vrrp-prio",   required_argument, 0, 1027},
+        {"vrrp-interval", required_argument, 0, 1028},
+        {"no-preempt",  no_argument,       0, 1029},
+        {"cluster-bind", required_argument, 0, 1030},
+        {"cluster-port", required_argument, 0, 1031},
+        {"cluster-peer", required_argument, 0, 1032},
+        {"peer",        required_argument, 0, 1032},
+        {"cluster-secret", required_argument, 0, 1033},
+        {"no-multicast", no_argument,      0, 1034},
+        {"sticky",      no_argument,       0, 1035},
+        {"session-sticky", no_argument,    0, 1035},
+        {"session-ttl", required_argument, 0, 1036},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -393,6 +425,80 @@ int parse_cli_args(int argc, char *argv[]) {
                 g_config.upstream_pool_size = atoi(optarg);
                 if (g_config.upstream_pool_size < 0) g_config.upstream_pool_size = 0;
                 if (g_config.upstream_pool_size > 32) g_config.upstream_pool_size = 32;
+                break;
+            case 1023: // --cluster
+                g_config.enable_cluster = true;
+                break;
+            case 1024: // --vip
+                strncpy(g_config.virtual_ip, optarg, sizeof(g_config.virtual_ip) - 1);
+                g_config.enable_cluster = true;
+                break;
+            case 1025: // --vip-iface
+                strncpy(g_config.vip_interface, optarg, sizeof(g_config.vip_interface) - 1);
+                break;
+            case 1026: // --vrrp-id
+                g_config.vrrp_router_id = atoi(optarg);
+                if (g_config.vrrp_router_id < 1 || g_config.vrrp_router_id > 255) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid --vrrp-id '%s' (must be 1-255)\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 1027: // --vrrp-priority
+                g_config.vrrp_priority = atoi(optarg);
+                if (g_config.vrrp_priority < 1 || g_config.vrrp_priority > 254) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid --vrrp-priority '%s' (must be 1-254)\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 1028: // --vrrp-interval
+                g_config.vrrp_advert_interval_ms = atoi(optarg);
+                if (g_config.vrrp_advert_interval_ms < 20) g_config.vrrp_advert_interval_ms = 20;
+                break;
+            case 1029: // --no-preempt
+                g_config.vrrp_preempt = false;
+                break;
+            case 1030: { // --cluster-bind
+                char tmp[128];
+                strncpy(tmp, optarg, sizeof(tmp) - 1);
+                tmp[sizeof(tmp) - 1] = '\0';
+                char *colon = strrchr(tmp, ':');
+                if (colon && strchr(tmp, ':') == colon) {
+                    *colon = '\0';
+                    strncpy(g_config.cluster_bind_ip, tmp, sizeof(g_config.cluster_bind_ip) - 1);
+                    int cp = atoi(colon + 1);
+                    if (cp > 0 && cp <= 65535) g_config.cluster_port = cp;
+                } else {
+                    strncpy(g_config.cluster_bind_ip, tmp, sizeof(g_config.cluster_bind_ip) - 1);
+                }
+                g_config.enable_cluster = true;
+                break;
+            }
+            case 1031: // --cluster-port
+                g_config.cluster_port = atoi(optarg);
+                if (g_config.cluster_port <= 0 || g_config.cluster_port > 65535) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid --cluster-port '%s' (must be 1-65535)\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 1032: // --cluster-peer
+                if (!cluster_add_peer(optarg)) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid --cluster-peer '%s' (expected IP[:PORT])\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                g_config.enable_cluster = true;
+                break;
+            case 1033: // --cluster-secret
+                strncpy(g_config.cluster_secret, optarg, sizeof(g_config.cluster_secret) - 1);
+                break;
+            case 1034: // --no-multicast
+                g_config.cluster_enable_multicast = false;
+                break;
+            case 1035: // --sticky
+                g_config.enable_session_stickiness = true;
+                break;
+            case 1036: // --session-ttl
+                g_config.session_ttl_sec = atoi(optarg);
+                if (g_config.session_ttl_sec <= 0) g_config.session_ttl_sec = DEFAULT_SESSION_TTL_SEC;
                 break;
             case 'h':
                 print_help(argv[0]);

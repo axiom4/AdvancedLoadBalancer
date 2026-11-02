@@ -3,6 +3,7 @@
 #include "advlb/config.h"
 #include "advlb/log.h"
 #include "advlb/conn_pool.h"
+#include "advlb/session_table.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -201,12 +202,15 @@ static int select_backend_round_robin_lockfree(int num_backends) {
     return -1;
 }
 
-// 2. Least-Connections: select server with lowest active connection count (Lock-Free)
+// 2. Least-Connections: select server with lowest active connection count (Lock-Free with RR tie-break)
 static int select_backend_least_connections_lockfree(int num_backends) {
+    if (num_backends <= 0) return -1;
     int best_index = -1;
     int min_connections = 1e9;
+    unsigned int base = atomic_fetch_add_explicit(&s_round_robin_counter, 1, memory_order_relaxed);
 
-    for (int i = 0; i < num_backends; i++) {
+    for (int k = 0; k < num_backends; k++) {
+        int i = (int)((base + (unsigned int)k) % (unsigned int)num_backends);
         if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             int conns = atomic_load_explicit(&g_backends[i].active_connections, memory_order_relaxed);
             if (conns < min_connections) {
@@ -252,13 +256,16 @@ static int select_backend_ip_hash_lockfree(const struct sockaddr_storage *client
     return healthy_list[hash % (uint32_t)healthy_count];
 }
 
-// 4. Least-Latency: route to server with lowest measured real-time RTT latency (Lock-Free)
+// 4. Least-Latency: route to server with lowest measured real-time RTT latency (Lock-Free with RR tie-break)
 static int select_backend_least_latency_lockfree(int num_backends) {
+    if (num_backends <= 0) return -1;
     int best_index = -1;
     double min_lat = 1e9;
     int min_conns = 1e9;
+    unsigned int base = atomic_fetch_add_explicit(&s_round_robin_counter, 1, memory_order_relaxed);
 
-    for (int i = 0; i < num_backends; i++) {
+    for (int k = 0; k < num_backends; k++) {
+        int i = (int)((base + (unsigned int)k) % (unsigned int)num_backends);
         if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             int conns = atomic_load_explicit(&g_backends[i].active_connections, memory_order_relaxed);
             double lat = g_backends[i].latency_ms;
@@ -319,6 +326,27 @@ int get_healthy_backend(const struct sockaddr_storage *client_addr) {
     int num_backends = g_num_backends;
     if (num_backends <= 0) return -1;
 
+    /* 1. If explicit IP stickiness is enabled, lookup by Client IP (use_port = false)
+     * 2. If HA cluster is enabled, lookup by active 5-tuple (client_ip:client_port, use_port = true) */
+    if (client_addr != NULL) {
+        if (g_config.enable_session_stickiness) {
+            int sticky_idx = session_table_lookup(client_addr, SESSION_PROTO_TCP, false);
+            if (sticky_idx >= 0 && sticky_idx < num_backends) {
+                atomic_fetch_add_explicit(&g_backends[sticky_idx].active_connections, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_backends[sticky_idx].total_requests_handled, 1, memory_order_relaxed);
+                return sticky_idx;
+            }
+        }
+        if (g_config.enable_cluster) {
+            int active_idx = session_table_lookup(client_addr, SESSION_PROTO_TCP, true);
+            if (active_idx >= 0 && active_idx < num_backends) {
+                atomic_fetch_add_explicit(&g_backends[active_idx].active_connections, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_backends[active_idx].total_requests_handled, 1, memory_order_relaxed);
+                return active_idx;
+            }
+        }
+    }
+
     int selected = -1;
     BalancerAlgorithm alg = g_config.current_algorithm;
 
@@ -346,6 +374,13 @@ int get_healthy_backend(const struct sockaddr_storage *client_addr) {
     if (selected >= 0) {
         atomic_fetch_add_explicit(&g_backends[selected].active_connections, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_backends[selected].total_requests_handled, 1, memory_order_relaxed);
+        if ((g_config.enable_session_stickiness || g_config.enable_cluster) && client_addr != NULL) {
+            /* Use 5-tuple (client_ip:client_port) when session_stickiness is false so load balancing
+             * distributes connections across all backends while still replicating active flows to peers */
+            bool use_port = !g_config.enable_session_stickiness;
+            session_table_upsert_local(client_addr, SESSION_PROTO_TCP, use_port, selected,
+                                       (uint32_t)g_config.session_ttl_sec, g_config.enable_cluster);
+        }
     }
     return selected;
 }

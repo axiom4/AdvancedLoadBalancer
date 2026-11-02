@@ -18,6 +18,8 @@ extern "C" {
 #include "advlb/tui.h"
 #include "advlb/cli.h"
 #include "advlb/proxy_proto.h"
+#include "advlb/session_table.h"
+#include "advlb/cluster.h"
 #include "advlb/compat_epoll.h"
 #include "advlb/compat_ssl.h"
 

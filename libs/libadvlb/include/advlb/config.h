@@ -26,6 +26,22 @@ typedef struct {
     int upstream_pool_size;
     int upstream_pool_idle_sec;
 
+    /* High-Availability Cluster (VRRP + VIP + Session Replication) */
+    bool enable_cluster;
+    int vrrp_router_id;
+    int vrrp_priority;
+    int vrrp_advert_interval_ms;
+    bool vrrp_preempt;
+    char virtual_ip[64];
+    char vip_interface[64];
+    char cluster_bind_ip[64];
+    int cluster_port;
+    bool cluster_enable_multicast;
+    char cluster_secret[128];
+    uint32_t cluster_node_id;
+    bool enable_session_stickiness;
+    int session_ttl_sec;
+
     BalancerAlgorithm current_algorithm;
     HealthCheckType current_hc_type;
     char hc_http_path[256];

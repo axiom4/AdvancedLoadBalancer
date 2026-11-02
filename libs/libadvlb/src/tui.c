@@ -5,6 +5,8 @@
 #include "advlb/health_check.h"
 #include "advlb/log.h"
 #include "advlb/utils.h"
+#include "advlb/cluster.h"
+#include "advlb/session_table.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -190,8 +192,19 @@ void render_tui(void) {
     // --- 1. HEADER ---
     char hdr_left[128];
     snprintf(hdr_left, sizeof(hdr_left), "  ADVANCED LOAD BALANCER - DASHBOARD");
-    char hdr_right[128];
-    snprintf(hdr_right, sizeof(hdr_right), "Uptime: %02d:%02d:%02d │ Status: RUNNING  ", hours, mins, secs);
+    char hdr_right[160];
+    if (g_config.enable_cluster) {
+        int tot_peers = 0;
+        int alive_peers = cluster_get_alive_peers(&tot_peers);
+        snprintf(hdr_right, sizeof(hdr_right),
+                 "HA: %s %s│ Peers: %d/%d │ Synced: %d │ Uptime: %02d:%02d:%02d  ",
+                 cluster_state_name(cluster_get_state()),
+                 (g_config.virtual_ip[0] != '\0') ? g_config.virtual_ip : "",
+                 alive_peers, tot_peers, session_table_count(),
+                 hours, mins, secs);
+    } else {
+        snprintf(hdr_right, sizeof(hdr_right), "Uptime: %02d:%02d:%02d │ Status: RUNNING  ", hours, mins, secs);
+    }
 
     attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
     mvhline(row, 0, ' ', max_x);
@@ -498,9 +511,11 @@ void render_tui(void) {
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
 
     // --- 4. COMMAND FOOTER ---
-    char foot_text[128];
+    char foot_text[160];
     if (g_confirming_exit) {
         snprintf(foot_text, sizeof(foot_text), " [◄ / ► / Tab] Select   │   [Enter / Space] Confirm Choice   │   [ESC] Cancel");
+    } else if (g_config.enable_cluster) {
+        snprintf(foot_text, sizeof(foot_text), " [Q] Exit │ [R] Reset │ [A] Algo │ [H] Health │ [P] PPv1 │ [C] VRRP Failover");
     } else {
         snprintf(foot_text, sizeof(foot_text), " [Q / Ctrl+C] Exit  │  [R] Reset  │  [A] Algorithm  │  [H] Health Check  │  [P] PROXY v1");
     }
@@ -630,6 +645,8 @@ void *tui_thread(void *arg) {
                     g_config.enable_proxy_protocol_v1 = !g_config.enable_proxy_protocol_v1;
                     add_log("\033[1;35m[CONFIG]\033[0m PROXY Protocol v1 to backends: %s",
                             g_config.enable_proxy_protocol_v1 ? "\033[1;32mENABLED\033[0m" : "\033[1;31mDISABLED\033[0m");
+                } else if ((c == 'c' || c == 'C') && g_config.enable_cluster) {
+                    cluster_trigger_stepdown();
                 } else if (c == KEY_RESIZE) {
                     // Terminal resize handled in next frame
                 }
