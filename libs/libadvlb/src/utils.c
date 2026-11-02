@@ -2,31 +2,43 @@
 #include "advlb/utils.h"
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 int visible_len(const char *s) {
     if (!s) return 0;
     int v = 0;
     bool in_esc = false;
-    mbtowc(NULL, NULL, 0);
+    mbstate_t ps;
+    memset(&ps, 0, sizeof(ps));
 
-    for (int i = 0; s[i] != '\0'; ) {
+    size_t s_len = strlen(s);
+    for (size_t i = 0; i < s_len; ) {
         if (s[i] == '\033') {
             in_esc = true;
             i++;
         } else if (in_esc) {
-            if (s[i] == 'm') in_esc = false;
+            // ANSI escape sequences typically terminate with an alpha character (e.g. 'm' for colors)
+            if ((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+                in_esc = false;
+            }
             i++;
         } else {
-            wchar_t wc;
-            int len = mbtowc(&wc, &s[i], MB_CUR_MAX);
-            if (len > 0) {
+            wchar_t wc = 0;
+            size_t remaining = s_len - i;
+            size_t len = mbrtowc(&wc, &s[i], remaining, &ps);
+            if (len == 0) {
+                // Null character encountered
+                break;
+            } else if (len == (size_t)-1 || len == (size_t)-2) {
+                // Invalid or incomplete multibyte sequence: count 1 byte and reset shift state
+                v++;
+                i++;
+                memset(&ps, 0, sizeof(ps));
+            } else {
                 int w = wcwidth(wc);
                 v += (w >= 0) ? w : 1;
                 i += len;
-            } else {
-                v++;
-                i++;
             }
         }
     }
