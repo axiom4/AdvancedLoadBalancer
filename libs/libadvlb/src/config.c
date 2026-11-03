@@ -60,7 +60,7 @@ void config_init_defaults(LbConfig *cfg) {
     cfg->vrrp_preempt = true;
     cfg->virtual_ip[0] = '\0';
     cfg->vip_interface[0] = '\0';
-    cfg->vrrp_use_vmac = true;
+    cfg->vrrp_use_vmac = false; // Safe default: standard VIP binding (avoids hypervisor vSwitch MAC-spoofing drops)
     cfg->vrrp_vmac[0] = '\0';
     strncpy(cfg->cluster_bind_ip, "0.0.0.0", sizeof(cfg->cluster_bind_ip) - 1);
     cfg->cluster_port = DEFAULT_CLUSTER_PORT;
@@ -233,7 +233,7 @@ bool config_load_file(const char *filepath, LbConfig *cfg) {
             cfg->vrrp_use_vmac = parse_bool_val(val);
         } else if (strcasecmp(key, "vrrp_vmac") == 0 || strcasecmp(key, "vmac") == 0) {
             snprintf(cfg->vrrp_vmac, sizeof(cfg->vrrp_vmac), "%.31s", val);
-            cfg->vrrp_use_vmac = true;
+            cfg->vrrp_use_vmac = false; // Safe default: standard VIP binding (avoids hypervisor vSwitch MAC-spoofing drops)
         } else if (strcasecmp(key, "cluster_bind") == 0 || strcasecmp(key, "cluster_bind_ip") == 0) {
             char *colon = strrchr(val, ':');
             if (colon && strchr(val, ':') == colon) {

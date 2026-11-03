@@ -527,7 +527,10 @@ static void broadcast_active_vip_garp(void) {
     if (!parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) return;
 
     const char *act_iface = (s_active_vip_iface[0] != '\0') ? s_active_vip_iface : g_config.vip_interface;
-    const char *mac_to_use = (s_active_vmac[0] != '\0') ? s_active_vmac : s_saved_orig_mac;
+    const char *mac_to_use = (g_config.vrrp_use_vmac && s_active_vmac[0] != '\0') ? s_active_vmac : s_saved_orig_mac;
+    if (mac_to_use[0] == '\0') {
+        mac_to_use = s_active_vmac;
+    }
     if (act_iface[0] != '\0' && mac_to_use[0] != '\0') {
         send_vrrp_garp_on_iface(act_iface, clean_vip, mac_to_use);
         if (strcmp(act_iface, g_config.vip_interface) != 0 && g_config.vip_interface[0] != '\0') {
@@ -685,7 +688,11 @@ static void acquire_virtual_ip(void) {
         return;
     }
 
-    resolve_active_vmac(clean_vip, s_active_vmac, sizeof(s_active_vmac));
+    if (g_config.vrrp_use_vmac) {
+        resolve_active_vmac(clean_vip, s_active_vmac, sizeof(s_active_vmac));
+    } else {
+        s_active_vmac[0] = '\0';
+    }
     s_mac_switched_on_iface = false;
     s_vmac_iface_created = false;
 
@@ -1948,14 +1955,11 @@ static void *cluster_worker_thread(void *arg) {
             last_advert_sent_ms = now_ms;
         }
 
-        /* Fast post-election GARP burst (every 250ms) and periodic GARP refresh (every 5s) while MASTER */
+        /* Fast post-election GARP burst (3 packets at 250ms intervals) upon transition to MASTER */
         if (atomic_load_explicit(&s_vrrp_state, memory_order_relaxed) == VRRP_STATE_MASTER && s_vip_bound_kernel) {
             if (s_garp_burst_remaining > 0 && (now_ms - s_last_garp_sent_ms) >= 250ULL) {
                 broadcast_active_vip_garp();
                 s_garp_burst_remaining--;
-                s_last_garp_sent_ms = now_ms;
-            } else if ((now_ms - s_last_garp_sent_ms) >= 5000ULL) {
-                broadcast_active_vip_garp();
                 s_last_garp_sent_ms = now_ms;
             }
         }

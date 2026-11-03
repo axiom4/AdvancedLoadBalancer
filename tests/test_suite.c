@@ -803,6 +803,7 @@ static void test_cluster_vrrp_and_session_sync(void) {
     g_config.vrrp_priority = 140;
     g_config.vrrp_advert_interval_ms = 40;
     g_config.vrrp_preempt = true;
+    g_config.vrrp_use_vmac = true;
     strncpy(g_config.virtual_ip, "127.0.0.250", sizeof(g_config.virtual_ip) - 1);
     g_config.vip_interface[0] = '\0'; /* user-space VIP mode for unprivileged test */
     strncpy(g_config.cluster_bind_ip, "127.0.0.1", sizeof(g_config.cluster_bind_ip) - 1);
