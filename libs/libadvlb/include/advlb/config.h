@@ -34,6 +34,8 @@ typedef struct {
     bool vrrp_preempt;
     char virtual_ip[64];
     char vip_interface[64];
+    bool vrrp_use_vmac;
+    char vrrp_vmac[32];
     char cluster_bind_ip[64];
     int cluster_port;
     bool cluster_enable_multicast;

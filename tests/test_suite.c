@@ -828,6 +828,32 @@ static void test_cluster_vrrp_and_session_sync(void) {
                 "Node automatically elected itself VRRP MASTER after master_down_interval");
     TEST_ASSERT(cluster_is_vip_active(),
                 "Virtual IP (127.0.0.250) marked ACTIVE upon becoming VRRP MASTER");
+    TEST_ASSERT(strcmp(cluster_get_active_vmac(), "00:00:5e:00:01:4d") == 0,
+                "Active VRRP Virtual MAC matches RFC 5798 00:00:5e:00:01:4d for VRID 77 (0x4D)");
+
+    /* Verify RFC 5798 VMAC formatting and Gratuitous ARP Ethernet frame generation */
+    char vmac51[32] = {0};
+    cluster_format_vrrp_mac(51, false, vmac51, sizeof(vmac51));
+    TEST_ASSERT(strcmp(vmac51, "00:00:5e:00:01:33") == 0,
+                "cluster_format_vrrp_mac() generates 00:00:5e:00:01:33 for VRID 51");
+
+    uint8_t vmac_bytes[6] = {0};
+    TEST_ASSERT(cluster_parse_mac_bytes(vmac51, vmac_bytes) &&
+                vmac_bytes[0] == 0x00 && vmac_bytes[2] == 0x5e &&
+                vmac_bytes[4] == 0x01 && vmac_bytes[5] == 0x33,
+                "cluster_parse_mac_bytes() accurately parses 6-byte hardware MAC address");
+
+    uint8_t garp_frame[42] = {0};
+    size_t garp_len = cluster_build_garp_frame(vmac_bytes, "192.168.100.200", true, garp_frame);
+    TEST_ASSERT(garp_len == 42 &&
+                garp_frame[0] == 0xff && garp_frame[5] == 0xff &&
+                memcmp(&garp_frame[6], vmac_bytes, 6) == 0 &&
+                garp_frame[12] == 0x08 && garp_frame[13] == 0x06 &&
+                garp_frame[21] == 0x02 &&
+                memcmp(&garp_frame[22], vmac_bytes, 6) == 0 &&
+                garp_frame[28] == 192 && garp_frame[29] == 168 &&
+                garp_frame[30] == 100 && garp_frame[31] == 200,
+                "cluster_build_garp_frame() builds RFC-valid 42-byte Ethernet Gratuitous ARP with VMAC");
 
     /* Verify Peer socket received VRRP advertisements + initial SYNC_REQ */
     uint8_t rx_buf[2048];
@@ -894,6 +920,8 @@ static void test_cluster_vrrp_and_session_sync(void) {
                 "cluster_trigger_stepdown() immediately transitioned node MASTER -> BACKUP");
     TEST_ASSERT(!cluster_is_vip_active(),
                 "Virtual IP released immediately upon manual stepdown");
+    TEST_ASSERT(cluster_get_active_vmac()[0] == '\0',
+                "VRRP Virtual MAC released immediately upon stepdown to BACKUP");
 
     cluster_stop();
     TEST_ASSERT(cluster_get_state() == VRRP_STATE_DISABLED,

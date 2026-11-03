@@ -20,8 +20,15 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <poll.h>
 #include <stdatomic.h>
+#ifdef __linux__
+#include <net/ethernet.h>
+#include <netpacket/packet.h>
+#endif
 
 #ifndef NO_SSL
 #include <openssl/hmac.h>
@@ -117,6 +124,15 @@ static bool s_cluster_initialized = false;
 static atomic_int s_vrrp_state = VRRP_STATE_DISABLED;
 static atomic_bool s_vip_active = false;
 static bool s_vip_bound_kernel = false;
+static char s_active_vmac[32] = {0};
+static char s_active_vip_iface[64] = {0};
+static char s_saved_orig_mac[32] = {0};
+static char s_iface_primary_ip[64] = {0};
+static bool s_mac_switched_on_iface = false;
+static bool s_vmac_iface_created = false;
+static int  s_vip_guard_pipe[2] = {-1, -1};
+static uint64_t s_last_garp_sent_ms = 0;
+static int  s_garp_burst_remaining = 0;
 static uint32_t s_node_id = 0;
 static _Atomic uint32_t s_current_master_id = 0;
 static uint64_t s_last_master_advert_ms = 0;
@@ -252,6 +268,412 @@ static bool parse_vip_cidr(const char *vip_cfg, char *out_ip, size_t ip_sz, int 
     return true;
 }
 
+void cluster_format_vrrp_mac(int vrid, bool is_ipv6, char *out_mac, size_t mac_sz) {
+    if (!out_mac || mac_sz == 0) return;
+    unsigned int id = (unsigned int)((vrid >= 1 && vrid <= 255) ? vrid : 51);
+    snprintf(out_mac, mac_sz, "00:00:5e:00:%02x:%02x", is_ipv6 ? 0x02u : 0x01u, id);
+}
+
+bool cluster_parse_mac_bytes(const char *mac_str, uint8_t out_bytes[6]) {
+    if (!mac_str || !out_bytes) return false;
+    unsigned int b[6];
+    char tail = '\0';
+    if (sscanf(mac_str, "%2x:%2x:%2x:%2x:%2x:%2x%c",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &tail) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (b[i] > 0xFFu) return false;
+        out_bytes[i] = (uint8_t)b[i];
+    }
+    return true;
+}
+
+size_t cluster_build_garp_frame(const uint8_t vmac[6],
+                                const char *vip_ip,
+                                bool is_reply,
+                                uint8_t out_frame[42]) {
+    if (!vmac || !vip_ip || !out_frame) return 0;
+    struct in_addr ip4;
+    if (inet_pton(AF_INET, vip_ip, &ip4) != 1) {
+        return 0;
+    }
+
+    memset(out_frame, 0, 42);
+    /* Ethernet Header (14 bytes) */
+    memset(&out_frame[0], 0xFF, 6);        /* Destination: Broadcast ff:ff:ff:ff:ff:ff */
+    memcpy(&out_frame[6], vmac, 6);        /* Source: VRRP Virtual MAC */
+    out_frame[12] = 0x08;                  /* EtherType: ARP (0x0806) */
+    out_frame[13] = 0x06;
+
+    /* ARP Payload (28 bytes) */
+    out_frame[14] = 0x00;                  /* Hardware type: Ethernet (1) */
+    out_frame[15] = 0x01;
+    out_frame[16] = 0x08;                  /* Protocol type: IPv4 (0x0800) */
+    out_frame[17] = 0x00;
+    out_frame[18] = 6;                     /* Hardware size: 6 */
+    out_frame[19] = 4;                     /* Protocol size: 4 */
+    out_frame[20] = 0x00;                  /* Opcode: 1 (GARP Request) or 2 (GARP Reply) */
+    out_frame[21] = is_reply ? 0x02 : 0x01;
+
+    memcpy(&out_frame[22], vmac, 6);       /* Sender Hardware Address (SHA): VRRP MAC */
+    memcpy(&out_frame[28], &ip4.s_addr, 4);/* Sender Protocol Address (SPA): VIP */
+    if (is_reply) {
+        memcpy(&out_frame[32], vmac, 6);   /* Target Hardware Address (THA): VRRP MAC */
+    } else {
+        memset(&out_frame[32], 0xFF, 6);   /* Target Hardware Address (THA): Broadcast */
+    }
+    memcpy(&out_frame[38], &ip4.s_addr, 4);/* Target Protocol Address (TPA): VIP */
+
+    return 42;
+}
+
+const char *cluster_get_active_vmac(void) {
+    return s_active_vmac;
+}
+
+const char *cluster_get_active_vip_iface(void) {
+    return (s_active_vip_iface[0] != '\0') ? s_active_vip_iface : g_config.vip_interface;
+}
+
+static void resolve_active_vmac(const char *clean_vip, char *out_mac, size_t mac_sz) {
+    uint8_t tmp_bytes[6];
+    if (g_config.vrrp_vmac[0] != '\0' && cluster_parse_mac_bytes(g_config.vrrp_vmac, tmp_bytes)) {
+        snprintf(out_mac, mac_sz, "%.31s", g_config.vrrp_vmac);
+        return;
+    }
+    bool is_ipv6 = (clean_vip && strchr(clean_vip, ':') != NULL);
+    int vrid = (g_config.vrrp_router_id >= 1 && g_config.vrrp_router_id <= 255) ? g_config.vrrp_router_id : 51;
+    cluster_format_vrrp_mac(vrid, is_ipv6, out_mac, mac_sz);
+}
+
+static bool resolve_vip_interface(const char *clean_vip, char *out_iface, size_t out_sz) {
+    if (!out_iface || out_sz == 0) return false;
+    out_iface[0] = '\0';
+
+    if (is_safe_iface_name(g_config.vip_interface) &&
+        if_nametoindex(g_config.vip_interface) != 0) {
+        snprintf(out_iface, out_sz, "%.63s", g_config.vip_interface);
+        return true;
+    }
+
+    /* Do not auto-bind physical NICs for loopback VIPs in unprivileged/unit tests */
+    if (g_config.vip_interface[0] == '\0' &&
+        clean_vip && (strncmp(clean_vip, "127.", 4) == 0 || strcmp(clean_vip, "::1") == 0)) {
+        return false;
+    }
+
+    struct in_addr vip_in;
+    bool has_vip4 = (clean_vip && inet_pton(AF_INET, clean_vip, &vip_in) == 1);
+
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) != 0 || !ifap) {
+        return false;
+    }
+
+    char fallback_iface[64] = {0};
+    char matched_iface[64] = {0};
+
+    for (struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        if (strncmp(ifa->ifa_name, "vrrp", 4) == 0 ||
+            strncmp(ifa->ifa_name, "docker", 6) == 0 ||
+            strncmp(ifa->ifa_name, "veth", 4) == 0 ||
+            strncmp(ifa->ifa_name, "virbr", 5) == 0) {
+            continue;
+        }
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            if (fallback_iface[0] == '\0') {
+                snprintf(fallback_iface, sizeof(fallback_iface), "%.63s", ifa->ifa_name);
+            }
+            if (has_vip4 && ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET) {
+                struct sockaddr_in *sin_addr = (struct sockaddr_in *)ifa->ifa_addr;
+                struct sockaddr_in *sin_mask = (struct sockaddr_in *)ifa->ifa_netmask;
+                if (sin_mask->sin_addr.s_addr != 0 &&
+                    (sin_addr->sin_addr.s_addr & sin_mask->sin_addr.s_addr) ==
+                    (vip_in.s_addr & sin_mask->sin_addr.s_addr)) {
+                    snprintf(matched_iface, sizeof(matched_iface), "%.63s", ifa->ifa_name);
+                    break;
+                }
+            }
+        }
+    }
+    freeifaddrs(ifap);
+
+    const char *chosen = (matched_iface[0] != '\0') ? matched_iface : fallback_iface;
+    if (chosen[0] != '\0' && is_safe_iface_name(chosen)) {
+        if (g_config.vip_interface[0] != '\0' && strcmp(g_config.vip_interface, chosen) != 0) {
+            add_log("\033[1;33m[VRRP VIP]\033[0m Interface '%s' not found — auto-selected '%s'",
+                    g_config.vip_interface, chosen);
+        }
+        snprintf(g_config.vip_interface, sizeof(g_config.vip_interface), "%.63s", chosen);
+        snprintf(out_iface, out_sz, "%.63s", chosen);
+        return true;
+    }
+    return false;
+}
+
+static void save_original_iface_mac_and_ip(const char *iface, const char *clean_vip) {
+    if (!is_safe_iface_name(iface)) return;
+
+    /* Discover primary non-VIP IPv4 address of the interface */
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) == 0 && ifap) {
+        for (struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+            if (strcmp(ifa->ifa_name, iface) != 0) continue;
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                char ip_buf[INET_ADDRSTRLEN] = {0};
+                struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+                if (inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf))) {
+                    if (!clean_vip || strcmp(ip_buf, clean_vip) != 0) {
+                        snprintf(s_iface_primary_ip, sizeof(s_iface_primary_ip), "%.63s", ip_buf);
+                        break;
+                    }
+                }
+            }
+        }
+        freeifaddrs(ifap);
+    }
+
+#ifdef __linux__
+    char sys_path[128];
+    char persist_path[128];
+    snprintf(sys_path, sizeof(sys_path), "/sys/class/net/%.31s/address", iface);
+    snprintf(persist_path, sizeof(persist_path), "/tmp/adlb_orig_mac_%.31s", iface);
+
+    char cur_mac[32] = {0};
+    FILE *fp = fopen(sys_path, "r");
+    if (fp) {
+        if (fgets(cur_mac, sizeof(cur_mac), fp) != NULL) {
+            cur_mac[strcspn(cur_mac, "\r\n ")] = '\0';
+        }
+        fclose(fp);
+    }
+
+    uint8_t parsed[6];
+    if (cluster_parse_mac_bytes(cur_mac, parsed)) {
+        if (strncasecmp(cur_mac, "00:00:5e:00:", 12) != 0) {
+            snprintf(s_saved_orig_mac, sizeof(s_saved_orig_mac), "%.31s", cur_mac);
+            FILE *pf = fopen(persist_path, "w");
+            if (pf) {
+                fprintf(pf, "%s\n", s_saved_orig_mac);
+                fclose(pf);
+            }
+            return;
+        }
+    }
+
+    /* Current MAC is already a VRRP MAC from a prior run — load persisted physical MAC */
+    if (s_saved_orig_mac[0] == '\0') {
+        FILE *pf = fopen(persist_path, "r");
+        if (pf) {
+            char saved[32] = {0};
+            if (fgets(saved, sizeof(saved), pf) != NULL) {
+                saved[strcspn(saved, "\r\n ")] = '\0';
+                if (cluster_parse_mac_bytes(saved, parsed) &&
+                    strncasecmp(saved, "00:00:5e:00:", 12) != 0) {
+                    snprintf(s_saved_orig_mac, sizeof(s_saved_orig_mac), "%.31s", saved);
+                }
+            }
+            fclose(pf);
+        }
+    }
+#endif
+}
+
+static void send_vrrp_garp_on_iface(const char *iface, const char *ip_str, const char *mac_str) {
+    if (!iface || iface[0] == '\0' || !ip_str || ip_str[0] == '\0' || !mac_str || mac_str[0] == '\0') {
+        return;
+    }
+#ifdef __linux__
+    uint8_t mac_bytes[6];
+    if (!cluster_parse_mac_bytes(mac_str, mac_bytes)) return;
+
+    unsigned int if_idx = if_nametoindex(iface);
+    if (if_idx == 0) return;
+
+    uint8_t frame_req[42];
+    uint8_t frame_rep[42];
+    if (cluster_build_garp_frame(mac_bytes, ip_str, false, frame_req) == 42 &&
+        cluster_build_garp_frame(mac_bytes, ip_str, true, frame_rep) == 42) {
+        int raw_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+        if (raw_fd >= 0) {
+            struct sockaddr_ll sll;
+            memset(&sll, 0, sizeof(sll));
+            sll.sll_family   = AF_PACKET;
+            sll.sll_protocol = htons(ETH_P_ARP);
+            sll.sll_ifindex  = (int)if_idx;
+            sll.sll_halen    = 6;
+            memset(sll.sll_addr, 0xFF, 6);
+
+            ssize_t s1 = sendto(raw_fd, frame_req, sizeof(frame_req), 0,
+                                (struct sockaddr *)&sll, sizeof(sll));
+            ssize_t s2 = sendto(raw_fd, frame_rep, sizeof(frame_rep), 0,
+                                (struct sockaddr *)&sll, sizeof(sll));
+            (void)s1;
+            (void)s2;
+            close(raw_fd);
+        }
+    }
+#endif
+}
+
+static void broadcast_active_vip_garp(void) {
+    if (!atomic_load_explicit(&s_vip_active, memory_order_relaxed) || !s_vip_bound_kernel) return;
+    char clean_vip[64] = {0};
+    int prefix = 32;
+    if (!parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) return;
+
+    const char *act_iface = (s_active_vip_iface[0] != '\0') ? s_active_vip_iface : g_config.vip_interface;
+    const char *mac_to_use = (s_active_vmac[0] != '\0') ? s_active_vmac : s_saved_orig_mac;
+    if (act_iface[0] != '\0' && mac_to_use[0] != '\0') {
+        send_vrrp_garp_on_iface(act_iface, clean_vip, mac_to_use);
+        if (strcmp(act_iface, g_config.vip_interface) != 0 && g_config.vip_interface[0] != '\0') {
+            send_vrrp_garp_on_iface(g_config.vip_interface, clean_vip, mac_to_use);
+        }
+        if (s_mac_switched_on_iface && s_iface_primary_ip[0] != '\0') {
+            send_vrrp_garp_on_iface(g_config.vip_interface, s_iface_primary_ip, mac_to_use);
+        }
+    }
+}
+
+static void disarm_vip_cleanup_guard(void) {
+    if (s_vip_guard_pipe[1] >= 0) {
+        char q = 'Q';
+        ssize_t w = write(s_vip_guard_pipe[1], &q, 1);
+        (void)w;
+        close(s_vip_guard_pipe[1]);
+        s_vip_guard_pipe[1] = -1;
+    }
+    if (s_vip_guard_pipe[0] >= 0) {
+        close(s_vip_guard_pipe[0]);
+        s_vip_guard_pipe[0] = -1;
+    }
+}
+
+static void spawn_vip_cleanup_guard(const char *clean_vip,
+                                    int prefix,
+                                    const char *parent_iface,
+                                    const char *active_iface,
+                                    bool vmac_iface_created,
+                                    bool mac_switched,
+                                    const char *orig_mac,
+                                    const char *primary_ip) {
+    disarm_vip_cleanup_guard();
+    if (geteuid() != 0 || !parent_iface || parent_iface[0] == '\0') return;
+
+    int vrid = (g_config.vrrp_router_id >= 1 && g_config.vrrp_router_id <= 255) ? g_config.vrrp_router_id : 51;
+    char pid_path[128];
+    snprintf(pid_path, sizeof(pid_path), "/tmp/adlb_master_vrid_%d.pid", vrid);
+    pid_t master_pid = getpid();
+    FILE *pf = fopen(pid_path, "w");
+    if (pf) {
+        fprintf(pf, "%d\n", (int)master_pid);
+        fclose(pf);
+    }
+
+    if (pipe(s_vip_guard_pipe) != 0) {
+        s_vip_guard_pipe[0] = s_vip_guard_pipe[1] = -1;
+        return;
+    }
+
+    pid_t pid1 = fork();
+    if (pid1 < 0) {
+        close(s_vip_guard_pipe[0]);
+        close(s_vip_guard_pipe[1]);
+        s_vip_guard_pipe[0] = s_vip_guard_pipe[1] = -1;
+        return;
+    }
+
+    if (pid1 == 0) {
+        /* Intermediate child: double-fork so the guard is reparented to init (no zombies) */
+        pid_t pid2 = fork();
+        if (pid2 != 0) {
+            _exit(0);
+        }
+
+        int read_fd = s_vip_guard_pipe[0];
+        long max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd < 256 || max_fd > 65536) max_fd = 4096;
+        for (int fd = 3; fd < (int)max_fd; fd++) {
+            if (fd != read_fd) close(fd);
+        }
+
+        char cmd_byte = 0;
+        ssize_t n = read(read_fd, &cmd_byte, 1);
+        close(read_fd);
+
+        /* If parent wrote 'Q', it is performing a graceful release_virtual_ip() itself */
+        if (n == 1 && cmd_byte == 'Q') {
+            _exit(0);
+        }
+
+        /* Parent died abruptly (e.g. SIGKILL / kill -9). Verify no newer Master on same host took over */
+        FILE *check_pf = fopen(pid_path, "r");
+        if (check_pf) {
+            int recorded_pid = 0;
+            if (fscanf(check_pf, "%d", &recorded_pid) == 1 &&
+                recorded_pid != (int)master_pid && recorded_pid > 0 &&
+                kill((pid_t)recorded_pid, 0) == 0) {
+                fclose(check_pf);
+                _exit(0);
+            }
+            fclose(check_pf);
+        }
+        unlink(pid_path);
+
+        char cleanup_cmd[1024];
+#ifdef __APPLE__
+        (void)prefix;
+        (void)active_iface;
+        (void)vmac_iface_created;
+        (void)mac_switched;
+        (void)orig_mac;
+        (void)primary_ip;
+        snprintf(cleanup_cmd, sizeof(cleanup_cmd),
+                 "ifconfig %.31s inet %.45s -alias >/dev/null 2>&1 || true; "
+                 "arp -d %.45s >/dev/null 2>&1 || true",
+                 parent_iface, clean_vip, clean_vip);
+        int rc = system(cleanup_cmd);
+        (void)rc;
+#else
+        if (vmac_iface_created && active_iface && active_iface[0] != '\0') {
+            snprintf(cleanup_cmd, sizeof(cleanup_cmd),
+                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
+                     "ip link del dev %.31s >/dev/null 2>&1 || true",
+                     clean_vip, prefix, active_iface, active_iface);
+            int rc = system(cleanup_cmd);
+            (void)rc;
+        } else {
+            snprintf(cleanup_cmd, sizeof(cleanup_cmd),
+                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true",
+                     clean_vip, prefix, parent_iface);
+            int rc = system(cleanup_cmd);
+            (void)rc;
+        }
+        if (mac_switched && orig_mac && orig_mac[0] != '\0') {
+            snprintf(cleanup_cmd, sizeof(cleanup_cmd),
+                     "ip link set dev %.31s address %.31s >/dev/null 2>&1 || true",
+                     parent_iface, orig_mac);
+            int rc = system(cleanup_cmd);
+            (void)rc;
+            if (primary_ip && primary_ip[0] != '\0') {
+                send_vrrp_garp_on_iface(parent_iface, primary_ip, orig_mac);
+            }
+        }
+#endif
+        _exit(0);
+    }
+
+    /* Parent: reap intermediate child immediately and keep s_vip_guard_pipe[1] open */
+    close(s_vip_guard_pipe[0]);
+    s_vip_guard_pipe[0] = -1;
+    int status = 0;
+    waitpid(pid1, &status, 0);
+}
+
 static void acquire_virtual_ip(void) {
     if (atomic_load_explicit(&s_vip_active, memory_order_relaxed)) return;
     atomic_store_explicit(&s_vip_active, true, memory_order_release);
@@ -263,29 +685,155 @@ static void acquire_virtual_ip(void) {
         return;
     }
 
-    if (is_safe_iface_name(g_config.vip_interface) && geteuid() == 0) {
-        char cmd[256];
+    resolve_active_vmac(clean_vip, s_active_vmac, sizeof(s_active_vmac));
+    s_mac_switched_on_iface = false;
+    s_vmac_iface_created = false;
+
+    char iface[64] = {0};
+    if (geteuid() == 0 && resolve_vip_interface(clean_vip, iface, sizeof(iface))) {
+        save_original_iface_mac_and_ip(iface, clean_vip);
+        snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "%.63s", iface);
+
+        char cmd[1024];
 #ifdef __APPLE__
-        snprintf(cmd, sizeof(cmd), "ifconfig %s inet %s/32 alias >/dev/null 2>&1",
-                 g_config.vip_interface, clean_vip);
-#else
-        snprintf(cmd, sizeof(cmd), "ip addr add %s/%d dev %s >/dev/null 2>&1; arping -U -c 1 -I %s %s >/dev/null 2>&1 || true",
-                 clean_vip, prefix, g_config.vip_interface, g_config.vip_interface, clean_vip);
-#endif
+        snprintf(cmd, sizeof(cmd),
+                 "ifconfig %.31s inet %.45s/32 alias >/dev/null 2>&1",
+                 iface, clean_vip);
         int rc = system(cmd);
         s_vip_bound_kernel = (rc == 0);
-        add_log("\033[1;32m[VRRP VIP]\033[0m Bound Virtual IP %s on %s + sent Gratuitous ARP",
-                clean_vip, g_config.vip_interface);
+        if (s_vip_bound_kernel && g_config.vrrp_use_vmac) {
+            snprintf(cmd, sizeof(cmd),
+                     "arp -S %.45s %.31s pub >/dev/null 2>&1 || true",
+                     clean_vip, s_active_vmac);
+            int arc = system(cmd);
+            (void)arc;
+        }
+#else
+        if (g_config.vrrp_use_vmac && strncmp(iface, "lo", 2) != 0) {
+            /* 1. Primary strategy: switch hardware MAC on the interface to the RFC 5798 VRRP VMAC */
+            snprintf(cmd, sizeof(cmd),
+                     "ip link set dev %.31s address %.31s >/dev/null 2>&1",
+                     iface, s_active_vmac);
+            if (system(cmd) == 0) {
+                s_mac_switched_on_iface = true;
+                snprintf(cmd, sizeof(cmd),
+                         "ip addr replace %.45s/%d dev %.31s >/dev/null 2>&1 && "
+                         "ip link set dev %.31s up >/dev/null 2>&1",
+                         clean_vip, prefix, iface, iface);
+                s_vip_bound_kernel = (system(cmd) == 0);
+                snprintf(cmd, sizeof(cmd),
+                         "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 "
+                         "net.ipv4.conf.%.31s.accept_local=1 "
+                         "net.ipv4.conf.%.31s.arp_announce=2 >/dev/null 2>&1 || true",
+                         iface, iface, iface);
+                int src = system(cmd);
+                (void)src;
+            } else {
+                /* 2. Fallback strategy: create macvlan sub-interface vrrp<VRID> with the VRRP VMAC */
+                int vrid = (g_config.vrrp_router_id >= 1 && g_config.vrrp_router_id <= 255) ? g_config.vrrp_router_id : 51;
+                snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "vrrp%d", vrid);
+                snprintf(cmd, sizeof(cmd),
+                         "ip link del dev %.31s >/dev/null 2>&1 || true; "
+                         "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
+                         "ip link add link %.31s name %.31s address %.31s type macvlan mode bridge >/dev/null 2>&1 && "
+                         "ip link set dev %.31s up >/dev/null 2>&1 && "
+                         "ip addr replace %.45s/%d dev %.31s >/dev/null 2>&1",
+                         s_active_vip_iface,
+                         clean_vip, prefix, iface,
+                         iface, s_active_vip_iface, s_active_vmac,
+                         s_active_vip_iface,
+                         clean_vip, prefix, s_active_vip_iface);
+                if (system(cmd) == 0) {
+                    s_vmac_iface_created = true;
+                    s_vip_bound_kernel = true;
+                    snprintf(cmd, sizeof(cmd),
+                             "ip link set dev %.31s promisc on >/dev/null 2>&1 || true; "
+                             "sysctl -qw net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2 >/dev/null 2>&1 || true; "
+                             "sysctl -qw net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 >/dev/null 2>&1 || true; "
+                             "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_filter=0 "
+                             "net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 "
+                             "net.ipv4.conf.%.31s.accept_local=1 >/dev/null 2>&1 || true",
+                             iface, iface, iface,
+                             s_active_vip_iface, s_active_vip_iface,
+                             s_active_vip_iface, s_active_vip_iface,
+                             s_active_vip_iface);
+                    int src = system(cmd);
+                    (void)src;
+                } else {
+                    snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "%.63s", iface);
+                    snprintf(cmd, sizeof(cmd),
+                             "ip addr replace %.45s/%d dev %.31s >/dev/null 2>&1",
+                             clean_vip, prefix, iface);
+                    s_vip_bound_kernel = (system(cmd) == 0);
+                }
+            }
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "ip addr replace %.45s/%d dev %.31s >/dev/null 2>&1",
+                     clean_vip, prefix, iface);
+            s_vip_bound_kernel = (system(cmd) == 0);
+        }
+
+        if (s_vip_bound_kernel) {
+            broadcast_active_vip_garp();
+            snprintf(cmd, sizeof(cmd),
+                     "arping -U -c 1 -I %.31s %.45s >/dev/null 2>&1 || "
+                     "arping -A -c 1 -I %.31s %.45s >/dev/null 2>&1 || true",
+                     s_active_vip_iface, clean_vip, s_active_vip_iface, clean_vip);
+            int arc = system(cmd);
+            (void)arc;
+            s_last_garp_sent_ms = now_monotonic_ms();
+            s_garp_burst_remaining = 3;
+        }
+#endif
+
+        if (s_vip_bound_kernel) {
+            spawn_vip_cleanup_guard(clean_vip, prefix, iface, s_active_vip_iface,
+                                    s_vmac_iface_created, s_mac_switched_on_iface,
+                                    s_saved_orig_mac, s_iface_primary_ip);
+            if (g_config.vrrp_use_vmac) {
+                add_log("\033[1;32m[VRRP VIP]\033[0m Bound VIP %s/%d on %s (VMAC %s) + broadcasted Gratuitous ARP",
+                        clean_vip, prefix, s_active_vip_iface, s_active_vmac);
+            } else {
+                add_log("\033[1;32m[VRRP VIP]\033[0m Bound VIP %s/%d on %s + broadcasted Gratuitous ARP",
+                        clean_vip, prefix, s_active_vip_iface);
+            }
+        } else {
+            add_log("\033[1;31m[VRRP VIP ERROR]\033[0m Failed to bind VIP %s/%d on interface %s",
+                    clean_vip, prefix, iface);
+        }
     } else {
         s_vip_bound_kernel = false;
-        add_log("\033[1;32m[VRRP VIP]\033[0m Virtual IP %s ACTIVE on MASTER Node %08X (user-space mode)",
-                clean_vip, s_node_id);
+        add_log("\033[1;32m[VRRP VIP]\033[0m Virtual IP %s (VMAC %s) ACTIVE on MASTER Node %08X (user-space mode)",
+                clean_vip, s_active_vmac, s_node_id);
     }
 }
 
 static void release_virtual_ip(void) {
     if (!atomic_load_explicit(&s_vip_active, memory_order_relaxed)) return;
     atomic_store_explicit(&s_vip_active, false, memory_order_release);
+    s_garp_burst_remaining = 0;
+
+    char prev_active_iface[64];
+    snprintf(prev_active_iface, sizeof(prev_active_iface), "%.63s", s_active_vip_iface);
+    s_active_vmac[0] = '\0';
+    s_active_vip_iface[0] = '\0';
+
+    disarm_vip_cleanup_guard();
+
+    int vrid = (g_config.vrrp_router_id >= 1 && g_config.vrrp_router_id <= 255) ? g_config.vrrp_router_id : 51;
+    char pid_path[128];
+    snprintf(pid_path, sizeof(pid_path), "/tmp/adlb_master_vrid_%d.pid", vrid);
+    FILE *pf = fopen(pid_path, "r");
+    if (pf) {
+        int rec_pid = 0;
+        if (fscanf(pf, "%d", &rec_pid) == 1 && rec_pid == (int)getpid()) {
+            fclose(pf);
+            unlink(pid_path);
+        } else {
+            fclose(pf);
+        }
+    }
 
     char clean_vip[64] = {0};
     int prefix = 32;
@@ -294,19 +842,49 @@ static void release_virtual_ip(void) {
     }
 
     if (s_vip_bound_kernel && is_safe_iface_name(g_config.vip_interface) && geteuid() == 0) {
-        char cmd[256];
+        char cmd[512];
 #ifdef __APPLE__
-        snprintf(cmd, sizeof(cmd), "ifconfig %s inet %s -alias >/dev/null 2>&1",
-                 g_config.vip_interface, clean_vip);
-#else
-        snprintf(cmd, sizeof(cmd), "ip addr del %s/%d dev %s >/dev/null 2>&1",
-                 clean_vip, prefix, g_config.vip_interface);
-#endif
+        (void)prev_active_iface;
+        snprintf(cmd, sizeof(cmd),
+                 "ifconfig %.31s inet %.45s -alias >/dev/null 2>&1 || true; "
+                 "arp -d %.45s >/dev/null 2>&1 || true",
+                 g_config.vip_interface, clean_vip, clean_vip);
         int rc = system(cmd);
         (void)rc;
+#else
+        if (s_vmac_iface_created && is_safe_iface_name(prev_active_iface)) {
+            snprintf(cmd, sizeof(cmd),
+                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
+                     "ip link del dev %.31s >/dev/null 2>&1 || true",
+                     clean_vip, prefix, prev_active_iface, prev_active_iface);
+            int rc = system(cmd);
+            (void)rc;
+            s_vmac_iface_created = false;
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true",
+                     clean_vip, prefix, g_config.vip_interface);
+            int rc = system(cmd);
+            (void)rc;
+        }
+
+        if (s_mac_switched_on_iface && s_saved_orig_mac[0] != '\0') {
+            snprintf(cmd, sizeof(cmd),
+                     "ip link set dev %.31s address %.31s >/dev/null 2>&1 || true",
+                     g_config.vip_interface, s_saved_orig_mac);
+            int rc = system(cmd);
+            (void)rc;
+            s_mac_switched_on_iface = false;
+            if (s_iface_primary_ip[0] != '\0') {
+                send_vrrp_garp_on_iface(g_config.vip_interface, s_iface_primary_ip, s_saved_orig_mac);
+            }
+        }
+#endif
         s_vip_bound_kernel = false;
     }
-    add_log("\033[1;33m[VRRP VIP]\033[0m Released Virtual IP %s from Node %08X", clean_vip, s_node_id);
+
+    add_log("\033[1;33m[VRRP VIP]\033[0m Released Virtual IP %s (restored physical MAC %s) from Node %08X",
+            clean_vip, (s_saved_orig_mac[0] != '\0') ? s_saved_orig_mac : "default", s_node_id);
 }
 
 static uint8_t compute_effective_priority(void) {
@@ -1370,6 +1948,18 @@ static void *cluster_worker_thread(void *arg) {
             last_advert_sent_ms = now_ms;
         }
 
+        /* Fast post-election GARP burst (every 250ms) and periodic GARP refresh (every 5s) while MASTER */
+        if (atomic_load_explicit(&s_vrrp_state, memory_order_relaxed) == VRRP_STATE_MASTER && s_vip_bound_kernel) {
+            if (s_garp_burst_remaining > 0 && (now_ms - s_last_garp_sent_ms) >= 250ULL) {
+                broadcast_active_vip_garp();
+                s_garp_burst_remaining--;
+                s_last_garp_sent_ms = now_ms;
+            } else if ((now_ms - s_last_garp_sent_ms) >= 5000ULL) {
+                broadcast_active_vip_garp();
+                s_last_garp_sent_ms = now_ms;
+            }
+        }
+
         /* Periodic session expiration cleanup every 5 seconds */
         if ((now_ms - last_cleanup_ms) >= 5000ULL) {
             session_table_cleanup_expired();
@@ -1636,8 +2226,10 @@ uint32_t cluster_get_current_master_id(void) {
 
 void cluster_trigger_stepdown(void) {
     if (!s_cluster_running) return;
+    uint64_t now_ms = now_monotonic_ms();
     uint64_t adv_ms = (uint64_t)(g_config.vrrp_advert_interval_ms > 0 ? g_config.vrrp_advert_interval_ms : 200);
-    s_stepdown_until_ms = now_monotonic_ms() + (adv_ms * 8ULL) + 1500ULL;
+    s_stepdown_until_ms = now_ms + (adv_ms * 8ULL) + 1500ULL;
+    s_last_master_advert_ms = now_ms;
 
     if (atomic_load_explicit(&s_vrrp_state, memory_order_relaxed) == VRRP_STATE_MASTER) {
         release_virtual_ip();

@@ -61,6 +61,13 @@ const char *cluster_state_name(VrrpState state);
 /* Return true if the Virtual IP is currently bound on this node */
 bool cluster_is_vip_active(void);
 
+/* RFC 5798 VRRPv3 Virtual MAC (00:00:5e:00:01:XX / 00:00:5e:00:02:XX) & Gratuitous ARP helpers */
+void cluster_format_vrrp_mac(int vrid, bool is_ipv6, char *out_mac, size_t mac_sz);
+bool cluster_parse_mac_bytes(const char *mac_str, uint8_t out_bytes[6]);
+size_t cluster_build_garp_frame(const uint8_t vmac[6], const char *vip_ip, bool is_reply, uint8_t out_frame[42]);
+const char *cluster_get_active_vmac(void);
+const char *cluster_get_active_vip_iface(void);
+
 /* Get count of currently reachable peers (and optionally total configured/discovered peers) */
 int cluster_get_alive_peers(int *out_total_peers);
 

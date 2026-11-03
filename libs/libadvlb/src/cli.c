@@ -60,6 +60,8 @@ void print_help(const char *prog_name) {
     printf("      --cluster             Enable HA Cluster mode (VRRP election + Session Sync)\n");
     printf("      --vip IP[/PREFIX]     Virtual IP address managed by VRRP Master (e.g. 192.168.1.200/24)\n");
     printf("      --vip-iface IFACE     Network interface for VIP binding (e.g. en0, eth0)\n");
+    printf("      --vmac MAC            Custom VRRP Virtual MAC (default: RFC 5798 00:00:5e:00:01:<VRID>)\n");
+    printf("      --no-vmac             Disable VRRP Virtual MAC address switch\n");
     printf("      --vrrp-id ID          VRRP Virtual Router ID 1-255 (default: 51)\n");
     printf("      --vrrp-priority PRIO  Node VRRP election priority 1-254 (default: 100)\n");
     printf("      --vrrp-interval MS    VRRP heartbeat interval in ms (default: 200)\n");
@@ -283,6 +285,8 @@ int parse_cli_args(int argc, char *argv[]) {
         {"sticky",      no_argument,       0, 1035},
         {"session-sticky", no_argument,    0, 1035},
         {"session-ttl", required_argument, 0, 1036},
+        {"vmac",        required_argument, 0, 1037},
+        {"no-vmac",     no_argument,       0, 1038},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -499,6 +503,19 @@ int parse_cli_args(int argc, char *argv[]) {
             case 1036: // --session-ttl
                 g_config.session_ttl_sec = atoi(optarg);
                 if (g_config.session_ttl_sec <= 0) g_config.session_ttl_sec = DEFAULT_SESSION_TTL_SEC;
+                break;
+            case 1037: { // --vmac
+                uint8_t mac_tmp[6];
+                if (!cluster_parse_mac_bytes(optarg, mac_tmp)) {
+                    fprintf(stderr, "\033[1;31m[ERROR]\033[0m Invalid --vmac '%s' (expected XX:XX:XX:XX:XX:XX)\n", optarg);
+                    exit(EXIT_FAILURE);
+                }
+                snprintf(g_config.vrrp_vmac, sizeof(g_config.vrrp_vmac), "%.31s", optarg);
+                g_config.vrrp_use_vmac = true;
+                break;
+            }
+            case 1038: // --no-vmac
+                g_config.vrrp_use_vmac = false;
                 break;
             case 'h':
                 print_help(argv[0]);
