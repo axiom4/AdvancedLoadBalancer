@@ -18,10 +18,11 @@ ifeq ($(UNAME_S),Darwin)
     endif
     RPATH_BIN = -Wl,-rpath,@executable_path/lib -Wl,-rpath,@loader_path/lib -Wl,-rpath,@executable_path/libs/libadvlb/lib -Wl,-rpath,@executable_path/libs/libadvnet/lib
 else
+    NCURSES_LIB ?= $(shell pkg-config --libs ncursesw 2>/dev/null || echo "-lncursesw")
     ifneq ($(findstring -DNO_SSL,$(CFLAGS)),-DNO_SSL)
-        LDLIBS = -lssl -lcrypto -lncurses
+        LDLIBS = -lssl -lcrypto $(NCURSES_LIB)
     else
-        LDLIBS = -lncurses
+        LDLIBS = $(NCURSES_LIB)
     endif
     RPATH_BIN = -Wl,-rpath,'$$ORIGIN/lib' -Wl,-rpath,'$$ORIGIN/libs/libadvlb/lib' -Wl,-rpath,'$$ORIGIN/libs/libadvnet/lib'
 endif

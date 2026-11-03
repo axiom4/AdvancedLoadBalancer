@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <locale.h>
 
 #include "advlb/types.h"
 #include "advlb/config.h"
@@ -33,6 +34,16 @@ static void handle_sighup(int sig) {
 }
 
 int main(int argc, char *argv[]) {
+    if (!setlocale(LC_ALL, "")) {
+        setlocale(LC_ALL, "C.UTF-8");
+    }
+    const char *loc = setlocale(LC_ALL, NULL);
+    if (!loc || strcmp(loc, "C") == 0 || strcmp(loc, "POSIX") == 0) {
+        if (!setlocale(LC_ALL, "C.UTF-8")) {
+            setlocale(LC_ALL, "en_US.UTF-8");
+        }
+    }
+
     g_start_time = time(NULL);
     srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
 

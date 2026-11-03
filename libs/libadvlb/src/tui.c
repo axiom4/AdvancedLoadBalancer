@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#define _XOPEN_SOURCE_EXTENDED 1
 #include "advlb/tui.h"
 #include "advlb/balancer.h"
 #include "advlb/config.h"
@@ -16,13 +17,40 @@
 
 static bool s_term_raw_enabled = false;
 
+static void draw_table_border(int row, int addr_w, chtype left, chtype mid, chtype right, chtype h) {
+    static const int widths[] = {4, 10, 12, 9, 12, 11};
+    move(row, 0);
+    addch(left);
+    hline(h, 4);
+    move(row, 5);
+    addch(mid);
+    hline(h, addr_w);
+    int cur_x = 5 + addr_w + 1;
+    for (int col = 1; col < 6; col++) {
+        move(row, cur_x);
+        addch(mid);
+        hline(h, widths[col]);
+        cur_x += widths[col] + 1;
+    }
+    move(row, cur_x);
+    addch(right);
+}
+
 void init_tui(void) {
     if (!g_config.enable_tui || !isatty(STDIN_FILENO)) {
         g_config.enable_tui = false;
         return;
     }
 
-    setlocale(LC_ALL, "");
+    if (!setlocale(LC_ALL, "")) {
+        setlocale(LC_ALL, "C.UTF-8");
+    }
+    const char *loc = setlocale(LC_ALL, NULL);
+    if (!loc || strcmp(loc, "C") == 0 || strcmp(loc, "POSIX") == 0) {
+        if (!setlocale(LC_ALL, "C.UTF-8")) {
+            setlocale(LC_ALL, "en_US.UTF-8");
+        }
+    }
     initscr();
     raw();
     noecho();
@@ -75,7 +103,7 @@ void handle_signal(int sig) {
 
 void print_log_line_ncurses(int y, int target_w, const char *line) {
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(y, 0, "│");
+    mvaddch(y, 0, ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" ");
 
@@ -153,7 +181,8 @@ void print_log_line_ncurses(int y, int target_w, const char *line) {
     }
 
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw(" │");
+    addch(' ');
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
 }
 
@@ -197,13 +226,13 @@ void render_tui(void) {
         int tot_peers = 0;
         int alive_peers = cluster_get_alive_peers(&tot_peers);
         snprintf(hdr_right, sizeof(hdr_right),
-                 "HA: %s %s│ Peers: %d/%d │ Synced: %d │ Uptime: %02d:%02d:%02d  ",
+                 "HA: %s %s | Peers: %d/%d | Synced: %d | Uptime: %02d:%02d:%02d  ",
                  cluster_state_name(cluster_get_state()),
                  (g_config.virtual_ip[0] != '\0') ? g_config.virtual_ip : "",
                  alive_peers, tot_peers, session_table_count(),
                  hours, mins, secs);
     } else {
-        snprintf(hdr_right, sizeof(hdr_right), "Uptime: %02d:%02d:%02d │ Status: RUNNING  ", hours, mins, secs);
+        snprintf(hdr_right, sizeof(hdr_right), "Uptime: %02d:%02d:%02d | Status: RUNNING  ", hours, mins, secs);
     }
 
     attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
@@ -229,22 +258,22 @@ void render_tui(void) {
         attron(COLOR_PAIR(CP_YELLOW) | A_BOLD);
         printw("(UDP)");
         attroff(COLOR_PAIR(CP_YELLOW) | A_BOLD);
-        printw(" │ ");
+        printw(" | ");
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("Algo:");
         attroff(COLOR_PAIR(CP_CYAN) | A_BOLD);
-        printw(" %s │ ", algorithm_name(g_config.current_algorithm));
+        printw(" %s | ", algorithm_name(g_config.current_algorithm));
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("HC:");
         attroff(COLOR_PAIR(CP_CYAN) | A_BOLD);
-        printw(" %s │ ", health_check_name(g_config.current_hc_type));
+        printw(" %s | ", health_check_name(g_config.current_hc_type));
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("Sessions:");
         attroff(COLOR_PAIR(CP_CYAN) | A_BOLD);
-        printw(" %d │ ", total_active);
+        printw(" %d | ", total_active);
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("Flows:");
@@ -259,17 +288,17 @@ void render_tui(void) {
         attron(COLOR_PAIR(CP_GREEN) | A_BOLD);
         printw("(TCP)");
         attroff(COLOR_PAIR(CP_GREEN) | A_BOLD);
-        printw(" │ ");
+        printw(" | ");
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("Algo:");
         attroff(COLOR_PAIR(CP_CYAN) | A_BOLD);
-        printw(" %s │ ", algorithm_name(g_config.current_algorithm));
+        printw(" %s | ", algorithm_name(g_config.current_algorithm));
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("HC:");
         attroff(COLOR_PAIR(CP_CYAN) | A_BOLD);
-        printw(" %s │ ", health_check_name(g_config.current_hc_type));
+        printw(" %s | ", health_check_name(g_config.current_hc_type));
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("PPv1:");
@@ -283,7 +312,7 @@ void render_tui(void) {
             printw(" OFF ");
             attroff(A_DIM);
         }
-        printw("│ ");
+        printw("| ");
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("SSL:");
@@ -297,12 +326,12 @@ void render_tui(void) {
             printw(" OFF ");
             attroff(A_DIM);
         }
-        printw("│ ");
+        printw("| ");
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("Conns:");
         attroff(COLOR_PAIR(CP_CYAN) | A_BOLD);
-        printw(" %d │ ", total_active);
+        printw(" %d | ", total_active);
 
         attron(COLOR_PAIR(CP_CYAN) | A_BOLD);
         printw("Reqs:");
@@ -313,10 +342,7 @@ void render_tui(void) {
 
     // Separator line
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    move(row, 0);
-    for (int col = 0; col < max_x; col++) {
-        printw("─");
-    }
+    mvhline(row, 0, ACS_HLINE, max_x);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
@@ -331,51 +357,47 @@ void render_tui(void) {
 
     // Top table border
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "┌────┬");
-    for (int k = 0; k < addr_w; k++) printw("─");
-    printw("┬──────────┬────────────┬─────────┬────────────┬───────────┐");
+    draw_table_border(row, addr_w, ACS_ULCORNER, ACS_TTEE, ACS_URCORNER, ACS_HLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
     // Table header
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "│");
+    mvaddch(row, 0, ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" ID ");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" %-*.*s ", addr_w - 2, addr_w - 2, "ADDRESS");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" STATUS   ");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" LATENCY    ");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" CONNS   ");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" TOTAL REQS ");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     printw(" FAIL/OK   ");
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    printw("│");
+    addch(ACS_VLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
     // Middle table border
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "├────┼");
-    for (int k = 0; k < addr_w; k++) printw("─");
-    printw("┼──────────┼────────────┼─────────┼────────────┼───────────┤");
+    draw_table_border(row, addr_w, ACS_LTEE, ACS_PLUS, ACS_RTEE, ACS_HLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
@@ -403,51 +425,54 @@ void render_tui(void) {
         unsigned long reqs = atomic_load_explicit(&g_backends[i].total_requests_handled, memory_order_relaxed);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        mvprintw(row, 0, "│");
+        mvaddch(row, 0, ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
         printw(" %-2d ", i);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│");
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
         printw(" %-*.*s ", addr_w - 2, addr_w - 2, addr_buf);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│ ");
+        addch(ACS_VLINE);
+        printw(" ");
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
 
         if (atomic_load_explicit(&g_backends[i].is_alive, memory_order_relaxed)) {
             attron(COLOR_PAIR(CP_GREEN) | A_BOLD);
-            printw("● UP     ");
+            addch(ACS_BULLET);
+            printw(" UP     ");
             attroff(COLOR_PAIR(CP_GREEN) | A_BOLD);
         } else {
             attron(COLOR_PAIR(CP_RED) | A_BOLD);
-            printw("○ DOWN   ");
+            addch(ACS_BULLET);
+            printw(" DOWN   ");
             attroff(COLOR_PAIR(CP_RED) | A_BOLD);
         }
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│");
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
         printw(" %-10s ", lat_buf);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│");
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
         printw(" %-7d ", conns);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│");
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
         printw(" %-10lu ", reqs);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│");
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
         printw(" %-9s ", fo_buf);
 
         attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-        printw("│");
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
 
         row++;
@@ -456,9 +481,7 @@ void render_tui(void) {
 
     // Bottom table border
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "└────┴");
-    for (int k = 0; k < addr_w; k++) printw("─");
-    printw("┴──────────┴────────────┴─────────┴────────────┴───────────┘");
+    draw_table_border(row, addr_w, ACS_LLCORNER, ACS_BTEE, ACS_LRCORNER, ACS_HLINE);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
@@ -471,14 +494,24 @@ void render_tui(void) {
     int inner_w = max_x - 4;
     if (inner_w < 40) inner_w = 40;
 
-    const char *log_title = "── LIVE CONNECTION LOGS ";
+    const char *log_title = " LIVE CONNECTION LOGS & EVENTS STREAM ";
     int lt_vis = visible_len(log_title);
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "┌%s", log_title);
-    int top_dashes = max_x - 2 - lt_vis;
-    if (top_dashes < 2) top_dashes = 2;
-    for (int k = 0; k < top_dashes; k++) printw("─");
-    printw("┐");
+    mvaddch(row, 0, ACS_ULCORNER);
+    hline(ACS_HLINE, 2);
+    attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
+
+    attron(COLOR_PAIR(CP_YELLOW) | A_BOLD);
+    mvprintw(row, 3, "%s", log_title);
+    attroff(COLOR_PAIR(CP_YELLOW) | A_BOLD);
+
+    attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
+    int top_dashes = max_x - 1 - (3 + lt_vis);
+    if (top_dashes > 0) {
+        move(row, 3 + lt_vis);
+        hline(ACS_HLINE, top_dashes);
+    }
+    mvaddch(row, max_x - 1, ACS_URCORNER);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
@@ -505,19 +538,19 @@ void render_tui(void) {
 
     // Bottom log box border
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "└");
-    for (int k = 0; k < max_x - 2; k++) printw("─");
-    printw("┘");
+    mvaddch(row, 0, ACS_LLCORNER);
+    hline(ACS_HLINE, max_x - 2);
+    mvaddch(row, max_x - 1, ACS_LRCORNER);
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
 
     // --- 4. COMMAND FOOTER ---
     char foot_text[160];
     if (g_confirming_exit) {
-        snprintf(foot_text, sizeof(foot_text), " [◄ / ► / Tab] Select   │   [Enter / Space] Confirm Choice   │   [ESC] Cancel");
+        snprintf(foot_text, sizeof(foot_text), " [<- / -> / Tab] Select  |  [Enter / Space] Confirm Choice  |  [ESC] Cancel");
     } else if (g_config.enable_cluster) {
-        snprintf(foot_text, sizeof(foot_text), " [Q] Exit │ [R] Reset │ [A] Algo │ [H] Health │ [P] PPv1 │ [C] VRRP Failover");
+        snprintf(foot_text, sizeof(foot_text), " [Q] Exit | [R] Reset | [A] Algo | [H] Health | [P] PPv1 | [C] VRRP Failover");
     } else {
-        snprintf(foot_text, sizeof(foot_text), " [Q / Ctrl+C] Exit  │  [R] Reset  │  [A] Algorithm  │  [H] Health Check  │  [P] PROXY v1");
+        snprintf(foot_text, sizeof(foot_text), " [Q / Ctrl+C] Exit  |  [R] Reset  |  [A] Algorithm  |  [H] Health Check  |  [P] PROXY v1");
     }
 
     attron(COLOR_PAIR(CP_FOOTER) | A_BOLD);
@@ -538,27 +571,31 @@ void render_tui(void) {
         }
 
         attron(COLOR_PAIR(CP_RED) | A_BOLD);
-        mvprintw(start_y, start_x, "┌");
+        mvaddch(start_y, start_x, ACS_ULCORNER);
         const char *title = " [!] CONFIRM EXIT ";
         int t_len = visible_len(title);
         int d1 = (box_w - 2 - t_len) / 2;
         int d2 = box_w - 2 - t_len - d1;
-        for (int k = 0; k < d1; k++) printw("─");
+        hline(ACS_HLINE, d1);
+        attroff(COLOR_PAIR(CP_RED) | A_BOLD);
+
         attron(COLOR_PAIR(CP_YELLOW) | A_BOLD);
-        printw("%s", title);
+        mvprintw(start_y, start_x + 1 + d1, "%s", title);
         attroff(COLOR_PAIR(CP_YELLOW) | A_BOLD);
+
         attron(COLOR_PAIR(CP_RED) | A_BOLD);
-        for (int k = 0; k < d2; k++) printw("─");
-        printw("┐");
+        move(start_y, start_x + 1 + d1 + t_len);
+        hline(ACS_HLINE, d2);
+        mvaddch(start_y, start_x + box_w - 1, ACS_URCORNER);
 
         for (int y = 1; y < box_h - 1; y++) {
-            mvprintw(start_y + y, start_x, "│");
-            mvprintw(start_y + y, start_x + box_w - 1, "│");
+            mvaddch(start_y + y, start_x, ACS_VLINE);
+            mvaddch(start_y + y, start_x + box_w - 1, ACS_VLINE);
         }
 
-        mvprintw(start_y + box_h - 1, start_x, "└");
-        for (int k = 0; k < box_w - 2; k++) printw("─");
-        printw("┘");
+        mvaddch(start_y + box_h - 1, start_x, ACS_LLCORNER);
+        hline(ACS_HLINE, box_w - 2);
+        mvaddch(start_y + box_h - 1, start_x + box_w - 1, ACS_LRCORNER);
         attroff(COLOR_PAIR(CP_RED) | A_BOLD);
 
         const char *msg = "Are you sure you want to shut down the Load Balancer?";

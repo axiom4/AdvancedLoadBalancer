@@ -21,10 +21,11 @@ ifeq ($(UNAME_S),Darwin)
     SHARED_FLAGS = -dynamiclib -install_name @rpath/libadvlb.$(DYLIB_EXT)
     RPATH_FLAGS = -Wl,-rpath,@loader_path -Wl,-rpath,@loader_path/../libadvnet/lib
 else
+    NCURSES_LIB ?= $(shell pkg-config --libs ncursesw 2>/dev/null || echo "-lncursesw")
     ifneq ($(findstring -DNO_SSL,$(CFLAGS)),-DNO_SSL)
-        LDLIBS = -lssl -lcrypto -lncurses
+        LDLIBS = -lssl -lcrypto $(NCURSES_LIB)
     else
-        LDLIBS = -lncurses
+        LDLIBS = $(NCURSES_LIB)
     endif
     DYLIB_EXT = so
     SHARED_FLAGS = -shared -fPIC -Wl,-soname,libadvlb.$(DYLIB_EXT)

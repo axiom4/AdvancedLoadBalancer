@@ -17,10 +17,11 @@ ifeq ($(UNAME_S),Darwin)
         LDLIBS = -lncurses -lm
     endif
 else
+    NCURSES_LIB ?= $(shell pkg-config --libs ncursesw 2>/dev/null || echo "-lncursesw")
     ifneq ($(findstring -DNO_SSL,$(CFLAGS)),-DNO_SSL)
-        LDLIBS = -lssl -lcrypto -lncurses -lm
+        LDLIBS = -lssl -lcrypto $(NCURSES_LIB) -lm
     else
-        LDLIBS = -lncurses -lm
+        LDLIBS = $(NCURSES_LIB) -lm
     endif
 endif
 
