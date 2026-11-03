@@ -565,6 +565,9 @@ static void *worker_client_thread(void *arg) {
                                 if ((size_t)received_bytes >= header_len + content_len) {
                                     break;
                                 }
+                            } else if (strstr(resp_buf, "\r\n0\r\n\r\n") != NULL ||
+                                       strstr(resp_buf, "\r\n0\r\n") != NULL) {
+                                break;
                             } else if (g_cfg.keep_alive) {
                                 break;
                             }
@@ -639,6 +642,7 @@ static void *worker_client_thread(void *arg) {
         if (!g_cfg.keep_alive || !success) {
 #ifndef NO_SSL
             if (active_ssl) {
+                SSL_set_quiet_shutdown(active_ssl, 1);
                 SSL_shutdown(active_ssl);
                 SSL_free(active_ssl);
                 active_ssl = NULL;
@@ -653,6 +657,7 @@ static void *worker_client_thread(void *arg) {
 
 #ifndef NO_SSL
     if (active_ssl) {
+        SSL_set_quiet_shutdown(active_ssl, 1);
         SSL_shutdown(active_ssl);
         SSL_free(active_ssl);
     }
