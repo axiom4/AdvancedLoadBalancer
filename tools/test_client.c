@@ -357,21 +357,54 @@ static int connect_to_target(const char *ip, int port, bool use_udp) {
         return -1;
     }
 
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+#ifdef TCP_CONNECTIONTIMEOUT
+    int conn_timeout = 2; // macOS connect timeout
+    setsockopt(fd, IPPROTO_TCP, TCP_CONNECTIONTIMEOUT, &conn_timeout, sizeof(conn_timeout));
+#endif
+#ifdef TCP_SYNCNT
+    int syn_retries = 2; // Linux connect timeout
+    setsockopt(fd, IPPROTO_TCP, TCP_SYNCNT, &syn_retries, sizeof(syn_retries));
+#endif
 
     if (!use_udp) {
         int opt = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#endif
-        if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+
+        int rc = connect(fd, (struct sockaddr *)&sin, sizeof(sin));
+        if (rc < 0) {
+            if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                int prc = poll(&pfd, 1, 2500);
+                if (prc > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP))) {
+                    int err = 0;
+                    socklen_t errlen = sizeof(err);
+                    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err == 0) {
+                        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+                        return fd;
+                    } else if (err != 0) {
+                        errno = err;
+                    }
+                } else if (prc == 0) {
+                    errno = ETIMEDOUT;
+                }
+            }
             close(fd);
             return -1;
         }
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
     } else {
         if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
             close(fd);
@@ -445,7 +478,7 @@ static void *worker_client_thread(void *arg) {
         bool success = false;
         ssize_t received_bytes = 0;
 
-        for (int attempt = 0; attempt < 2 && !success && g_running; attempt++) {
+        for (int attempt = 0; attempt < 3 && !success && g_running; attempt++) {
             if (attempt > 0) {
 #ifndef NO_SSL
                 if (active_ssl) {
@@ -457,13 +490,13 @@ static void *worker_client_thread(void *arg) {
                     close(active_fd);
                     active_fd = -1;
                 }
-                usleep(15000); // 15ms backoff for VRRP VIP/listener switchover
+                usleep((useconds_t)(attempt * 15000)); // 15ms, 30ms backoff
             }
 
             if (active_fd < 0) {
                 active_fd = connect_to_target(g_cfg.target_ip, g_cfg.target_port, g_cfg.use_udp);
                 if (active_fd < 0) {
-                    if (attempt == 0) continue;
+                    if (attempt < 2) continue;
                     atomic_fetch_add_explicit(&g_fail_connect, 1, memory_order_relaxed);
                     pthread_mutex_lock(&g_err_str_mutex);
                     snprintf(g_last_conn_err, sizeof(g_last_conn_err), "%s", strerror(errno));
@@ -484,7 +517,7 @@ static void *worker_client_thread(void *arg) {
                         active_ssl = NULL;
                         close(active_fd);
                         active_fd = -1;
-                        if (attempt == 0) continue;
+                        if (attempt < 2) continue;
                         atomic_fetch_add_explicit(&g_fail_ssl, 1, memory_order_relaxed);
                         pthread_mutex_lock(&g_err_str_mutex);
                         snprintf(g_last_ssl_err, sizeof(g_last_ssl_err), "%s", err_buf[0] ? err_buf : strerror(errno));
@@ -607,7 +640,7 @@ static void *worker_client_thread(void *arg) {
                         record_backend_hit(detected_port);
                     }
                 } else {
-                    if (attempt == 0) continue;
+                    if (attempt < 2) continue;
                     atomic_fetch_add_explicit(&g_fail_recv, 1, memory_order_relaxed);
                     pthread_mutex_lock(&g_err_str_mutex);
                     if (received_bytes == 0) {
@@ -653,11 +686,6 @@ static void *worker_client_thread(void *arg) {
             }
 #endif
             if (active_fd >= 0) {
-                if (success && !g_cfg.use_udp) {
-                    /* Reclaim client ephemeral port immediately without 35s macOS/BSD TIME_WAIT buildup */
-                    struct linger sl = { .l_onoff = 1, .l_linger = 0 };
-                    setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
-                }
                 close(active_fd);
                 active_fd = -1;
             }
