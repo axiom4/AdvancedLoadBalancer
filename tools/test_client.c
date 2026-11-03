@@ -64,6 +64,9 @@ static atomic_ulong g_fail_connect = 0;
 static atomic_ulong g_fail_ssl = 0;
 static atomic_ulong g_fail_send = 0;
 static atomic_ulong g_fail_recv = 0;
+static atomic_ulong g_reqs_retried = 0;       // Distinct requests requiring >= 1 retry
+static atomic_ulong g_app_retransmits = 0;    // Total application retry attempts
+static atomic_ulong g_tcp_kernel_retrans = 0; // Kernel TCP packet retransmissions
 static char g_last_ssl_err[128] = "none";
 static char g_last_conn_err[128] = "none";
 static char g_last_recv_err[128] = "none";
@@ -78,6 +81,41 @@ static int g_num_detected = 0;
 #ifndef NO_SSL
 static SSL_CTX *g_ssl_ctx = NULL;
 #endif
+
+// Socket retransmission metric helpers
+static unsigned long get_socket_retransmits(int fd) {
+    if (fd < 0) return 0;
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+    struct tcp_connection_info ci;
+    socklen_t len = sizeof(ci);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &len) == 0) {
+        return (unsigned long)ci.tcpi_txretransmitpackets;
+    }
+#elif defined(TCP_INFO)
+    struct tcp_info ti;
+    socklen_t len = sizeof(ti);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &len) == 0) {
+#if defined(__linux__)
+        return (unsigned long)ti.tcpi_total_retrans;
+#else
+        return (unsigned long)ti.tcpi_retrans;
+#endif
+    }
+#endif
+    return 0;
+}
+
+static void harvest_socket_retransmits(int fd, unsigned long *prev_retrans) {
+    if (fd < 0) return;
+    unsigned long cur = get_socket_retransmits(fd);
+    unsigned long prev = prev_retrans ? *prev_retrans : 0;
+    if (cur > prev) {
+        atomic_fetch_add_explicit(&g_tcp_kernel_retrans, cur - prev, memory_order_relaxed);
+    }
+    if (prev_retrans) {
+        *prev_retrans = cur;
+    }
+}
 
 // High-resolution timer helper
 static double get_time_sec(void) {
@@ -475,6 +513,7 @@ static void *worker_client_thread(void *arg) {
     }
 
     int active_fd = -1;
+    unsigned long active_fd_prev_retrans = 0;
 #ifndef NO_SSL
     SSL *active_ssl = NULL;
 #endif
@@ -487,10 +526,13 @@ static void *worker_client_thread(void *arg) {
 
         double t_start = get_time_sec();
         bool success = false;
+        bool had_retry = false;
         ssize_t received_bytes = 0;
 
         for (int attempt = 0; attempt < MAX_CONN_ATTEMPTS && !success && g_running; attempt++) {
             if (attempt > 0) {
+                had_retry = true;
+                atomic_fetch_add_explicit(&g_app_retransmits, 1, memory_order_relaxed);
 #ifndef NO_SSL
                 if (active_ssl) {
                     SSL_free(active_ssl);
@@ -498,8 +540,10 @@ static void *worker_client_thread(void *arg) {
                 }
 #endif
                 if (active_fd >= 0) {
+                    harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
                     close(active_fd);
                     active_fd = -1;
+                    active_fd_prev_retrans = 0;
                 }
                 useconds_t backoff = s_failover_backoffs[attempt - 1];
                 usleep(backoff);
@@ -507,6 +551,7 @@ static void *worker_client_thread(void *arg) {
 
             if (active_fd < 0) {
                 active_fd = connect_to_target(g_cfg.target_ip, g_cfg.target_port, g_cfg.use_udp);
+                active_fd_prev_retrans = 0;
                 if (active_fd < 0) {
                     if (attempt < MAX_CONN_ATTEMPTS - 1) continue;
                     atomic_fetch_add_explicit(&g_fail_connect, 1, memory_order_relaxed);
@@ -527,8 +572,10 @@ static void *worker_client_thread(void *arg) {
                         ERR_error_string_n(err, err_buf, sizeof(err_buf));
                         SSL_free(active_ssl);
                         active_ssl = NULL;
+                        harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
                         close(active_fd);
                         active_fd = -1;
+                        active_fd_prev_retrans = 0;
                         if (attempt < MAX_CONN_ATTEMPTS - 1) continue;
                         atomic_fetch_add_explicit(&g_fail_ssl, 1, memory_order_relaxed);
                         pthread_mutex_lock(&g_err_str_mutex);
@@ -670,6 +717,14 @@ static void *worker_client_thread(void *arg) {
             }
         }
 
+        if (had_retry) {
+            atomic_fetch_add_explicit(&g_reqs_retried, 1, memory_order_relaxed);
+        }
+
+        if (active_fd >= 0) {
+            harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
+        }
+
         double t_end = get_time_sec();
         double lat_ms = (t_end - t_start) * 1000.0;
 
@@ -698,8 +753,10 @@ static void *worker_client_thread(void *arg) {
             }
 #endif
             if (active_fd >= 0) {
+                harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
                 close(active_fd);
                 active_fd = -1;
+                active_fd_prev_retrans = 0;
             }
         }
     }
@@ -712,6 +769,7 @@ static void *worker_client_thread(void *arg) {
     }
 #endif
     if (active_fd >= 0) {
+        harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
         close(active_fd);
     }
 
@@ -914,6 +972,7 @@ int main(int argc, char *argv[]) {
         double now = get_time_sec();
         unsigned long completed = atomic_load_explicit(&g_reqs_completed, memory_order_relaxed);
         unsigned long failed = atomic_load_explicit(&g_reqs_failed, memory_order_relaxed);
+        unsigned long retries = atomic_load_explicit(&g_app_retransmits, memory_order_relaxed);
         double delta_t = now - last_time;
         double current_rps = (delta_t > 0) ? (double)(completed - last_completed) / delta_t : 0.0;
         last_completed = completed;
@@ -922,8 +981,8 @@ int main(int argc, char *argv[]) {
         double pct = (g_cfg.total_requests > 0) ? ((double)completed / (double)g_cfg.total_requests) * 100.0 : 0.0;
         if (pct > 100.0) pct = 100.0;
 
-        printf("\r\033[K[PROGRESS] %lu/%lu (%5.1f%%) | %8.1f req/s | failures: %lu",
-               completed, g_cfg.total_requests, pct, current_rps, failed);
+        printf("\r\033[K[PROGRESS] %lu/%lu (%5.1f%%) | %8.1f req/s | failures: %lu | retries: %lu",
+               completed, g_cfg.total_requests, pct, current_rps, failed, retries);
         fflush(stdout);
 
         if (g_cfg.duration_sec > 0 && (now - start_time) >= g_cfg.duration_sec) {
@@ -969,6 +1028,9 @@ int main(int argc, char *argv[]) {
     unsigned long total_completed = atomic_load_explicit(&g_reqs_completed, memory_order_relaxed);
     unsigned long total_success = atomic_load_explicit(&g_reqs_success, memory_order_relaxed);
     unsigned long total_failed = atomic_load_explicit(&g_reqs_failed, memory_order_relaxed);
+    unsigned long total_retried = atomic_load_explicit(&g_reqs_retried, memory_order_relaxed);
+    unsigned long total_app_retries = atomic_load_explicit(&g_app_retransmits, memory_order_relaxed);
+    unsigned long total_tcp_retrans = atomic_load_explicit(&g_tcp_kernel_retrans, memory_order_relaxed);
     unsigned long total_bytes = atomic_load_explicit(&g_bytes_received, memory_order_relaxed);
 
     double rps = (total_duration > 0) ? (double)total_completed / total_duration : 0.0;
@@ -1009,6 +1071,11 @@ int main(int argc, char *argv[]) {
     printf("Failed Requests       : %s%lu\033[0m (%5.2f%%)\n",
            total_failed > 0 ? "\033[1;31m" : "\033[1;32m",
            total_failed, total_completed > 0 ? ((double)total_failed / (double)total_completed) * 100.0 : 0.0);
+    printf("Retried Requests      : %s%lu\033[0m (%5.2f%%)\n",
+           total_retried > 0 ? "\033[1;33m" : "\033[1;32m",
+           total_retried, total_completed > 0 ? ((double)total_retried / (double)total_completed) * 100.0 : 0.0);
+    printf("Retransmissions       : %lu (app retries: %lu, kernel TCP pkts: %lu)\n",
+           total_app_retries + total_tcp_retrans, total_app_retries, total_tcp_retrans);
     printf("Throughput (RPS)      : \033[1;36m%8.2f req/sec\033[0m\n", rps);
     printf("Data Transferred      : %6.2f MB (%6.2f MB/s)\n", mb_received, mb_sec);
 
