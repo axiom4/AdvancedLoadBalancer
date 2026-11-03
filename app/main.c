@@ -153,14 +153,11 @@ int main(int argc, char *argv[]) {
     }
 
     // TCP Mode
-    int server_fd = -1;
-    if (!g_config.enable_cluster) {
-        server_fd = create_tcp_server_socket(g_config.listen_port);
-        if (server_fd < 0) {
-            exit(EXIT_FAILURE);
-        }
-        set_nonblocking(server_fd);
+    int server_fd = create_tcp_server_socket(g_config.listen_port);
+    if (server_fd < 0) {
+        exit(EXIT_FAILURE);
     }
+    set_nonblocking(server_fd);
     g_global_server_fd = server_fd;
 
     if (g_config.enable_tui) {
@@ -207,28 +204,8 @@ int main(int argc, char *argv[]) {
         }
 
         if (g_config.enable_cluster) {
-            if (cluster_get_state() == VRRP_STATE_MASTER) {
-                if (server_fd < 0) {
-                    server_fd = create_tcp_server_socket(g_config.listen_port);
-                    if (server_fd >= 0) {
-                        set_nonblocking(server_fd);
-                        g_global_server_fd = server_fd;
-                        add_log("\033[1;32m[VRRP]\033[0m Ingress listener activated on port %d (MASTER)", g_config.listen_port);
-                    } else {
-                        struct timespec ts = {0, 25000000L}; // 25ms
-                        nanosleep(&ts, NULL);
-                        continue;
-                    }
-                }
-            } else {
-                if (server_fd >= 0) {
-                    close(server_fd);
-                    server_fd = -1;
-                    g_global_server_fd = -1;
-                    add_log("\033[1;33m[VRRP]\033[0m Ingress listener released on port %d (BACKUP) — active connections continue draining",
-                            g_config.listen_port);
-                }
-                struct timespec ts = {0, 25000000L}; // 25ms
+            if (cluster_get_state() != VRRP_STATE_MASTER) {
+                struct timespec ts = {0, 10000000L}; // 10ms
                 nanosleep(&ts, NULL);
                 continue;
             }

@@ -415,6 +415,17 @@ static int connect_to_target(const char *ip, int port, bool use_udp) {
     return fd;
 }
 
+static const useconds_t s_failover_backoffs[] = {
+    15000,   // 15ms
+    35000,   // 35ms
+    75000,   // 75ms
+    150000,  // 150ms
+    250000,  // 250ms
+    400000,  // 400ms
+    600000   // 600ms (~1.5s total retry window across cluster switchover)
+};
+#define MAX_CONN_ATTEMPTS (int)(sizeof(s_failover_backoffs) / sizeof(s_failover_backoffs[0]))
+
 static void *worker_client_thread(void *arg) {
     WorkerContext *ctx = (WorkerContext *)arg;
     char req_buf[2048];
@@ -478,7 +489,7 @@ static void *worker_client_thread(void *arg) {
         bool success = false;
         ssize_t received_bytes = 0;
 
-        for (int attempt = 0; attempt < 3 && !success && g_running; attempt++) {
+        for (int attempt = 0; attempt < MAX_CONN_ATTEMPTS && !success && g_running; attempt++) {
             if (attempt > 0) {
 #ifndef NO_SSL
                 if (active_ssl) {
@@ -490,13 +501,14 @@ static void *worker_client_thread(void *arg) {
                     close(active_fd);
                     active_fd = -1;
                 }
-                usleep((useconds_t)(attempt * 15000)); // 15ms, 30ms backoff
+                useconds_t backoff = s_failover_backoffs[attempt - 1];
+                usleep(backoff);
             }
 
             if (active_fd < 0) {
                 active_fd = connect_to_target(g_cfg.target_ip, g_cfg.target_port, g_cfg.use_udp);
                 if (active_fd < 0) {
-                    if (attempt < 2) continue;
+                    if (attempt < MAX_CONN_ATTEMPTS - 1) continue;
                     atomic_fetch_add_explicit(&g_fail_connect, 1, memory_order_relaxed);
                     pthread_mutex_lock(&g_err_str_mutex);
                     snprintf(g_last_conn_err, sizeof(g_last_conn_err), "%s", strerror(errno));
@@ -517,7 +529,7 @@ static void *worker_client_thread(void *arg) {
                         active_ssl = NULL;
                         close(active_fd);
                         active_fd = -1;
-                        if (attempt < 2) continue;
+                        if (attempt < MAX_CONN_ATTEMPTS - 1) continue;
                         atomic_fetch_add_explicit(&g_fail_ssl, 1, memory_order_relaxed);
                         pthread_mutex_lock(&g_err_str_mutex);
                         snprintf(g_last_ssl_err, sizeof(g_last_ssl_err), "%s", err_buf[0] ? err_buf : strerror(errno));
@@ -640,7 +652,7 @@ static void *worker_client_thread(void *arg) {
                         record_backend_hit(detected_port);
                     }
                 } else {
-                    if (attempt < 2) continue;
+                    if (attempt < MAX_CONN_ATTEMPTS - 1) continue;
                     atomic_fetch_add_explicit(&g_fail_recv, 1, memory_order_relaxed);
                     pthread_mutex_lock(&g_err_str_mutex);
                     if (received_bytes == 0) {
