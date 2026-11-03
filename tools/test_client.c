@@ -506,18 +506,80 @@ static void *worker_client_thread(void *arg) {
             }
 
             if (write_ok) {
-                // Read response
+                // Read response completely (supporting Content-Length and stream EOF)
+                size_t total_resp_bytes = 0;
+                size_t content_len = 0;
+                bool has_content_len = false;
+                bool headers_complete = false;
+                size_t header_len = 0;
+
+                while (1) {
+                    ssize_t n = 0;
 #ifndef NO_SSL
-                if (g_cfg.use_ssl && active_ssl) {
-                    received_bytes = SSL_read(active_ssl, resp_buf, sizeof(resp_buf) - 1);
-                } else
+                    if (g_cfg.use_ssl && active_ssl) {
+                        if (total_resp_bytes < sizeof(resp_buf) - 1) {
+                            n = SSL_read(active_ssl, resp_buf + total_resp_bytes,
+                                         (int)(sizeof(resp_buf) - 1 - total_resp_bytes));
+                        } else {
+                            char discard[4096];
+                            n = SSL_read(active_ssl, discard, sizeof(discard));
+                        }
+                    } else
 #endif
-                {
-                    received_bytes = recv(active_fd, resp_buf, sizeof(resp_buf) - 1, 0);
+                    {
+                        if (total_resp_bytes < sizeof(resp_buf) - 1) {
+                            n = recv(active_fd, resp_buf + total_resp_bytes,
+                                     sizeof(resp_buf) - 1 - total_resp_bytes, 0);
+                        } else {
+                            char discard[4096];
+                            n = recv(active_fd, discard, sizeof(discard), 0);
+                        }
+                    }
+
+                    if (n > 0) {
+                        if (total_resp_bytes < sizeof(resp_buf) - 1) {
+                            size_t copy_len = (size_t)n;
+                            if (total_resp_bytes + copy_len > sizeof(resp_buf) - 1) {
+                                copy_len = sizeof(resp_buf) - 1 - total_resp_bytes;
+                            }
+                            total_resp_bytes += copy_len;
+                            resp_buf[total_resp_bytes] = '\0';
+                        }
+                        received_bytes += n;
+
+                        if (!headers_complete) {
+                            char *hdr_end = strstr(resp_buf, "\r\n\r\n");
+                            if (hdr_end) {
+                                headers_complete = true;
+                                header_len = (size_t)(hdr_end - resp_buf) + 4;
+                                char *cl_hdr = strcasestr(resp_buf, "Content-Length:");
+                                if (cl_hdr && cl_hdr < hdr_end) {
+                                    content_len = (size_t)strtoull(cl_hdr + 15, NULL, 10);
+                                    has_content_len = true;
+                                }
+                            }
+                        }
+
+                        if (headers_complete) {
+                            if (has_content_len) {
+                                if ((size_t)received_bytes >= header_len + content_len) {
+                                    break;
+                                }
+                            } else if (g_cfg.keep_alive) {
+                                break;
+                            }
+                        }
+                    } else if (n == 0) {
+                        /* Server closed socket (EOF) - response finished */
+                        break;
+                    } else {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
                 }
 
                 if (received_bytes > 0) {
-                    resp_buf[received_bytes] = '\0';
+                    resp_buf[total_resp_bytes] = '\0';
                     success = true;
 
                     // Inspect response for backend identity
@@ -583,11 +645,6 @@ static void *worker_client_thread(void *arg) {
             }
 #endif
             if (active_fd >= 0) {
-                if (success && !g_cfg.use_udp) {
-                    /* Reclaim client ephemeral port immediately without 30s TIME_WAIT buildup */
-                    struct linger sl = { .l_onoff = 1, .l_linger = 0 };
-                    setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
-                }
                 close(active_fd);
                 active_fd = -1;
             }

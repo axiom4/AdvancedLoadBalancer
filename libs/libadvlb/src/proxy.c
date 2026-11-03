@@ -458,10 +458,6 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         if (!pooled) {
             if (!preserve_for_failover && conn->fds_replicated && g_config.enable_cluster) {
                 shutdown(conn->backend_fd, SHUT_RDWR);
-            } else if (!preserve_for_failover && conn->bytes_from_backend > 0) {
-                /* Reclaim ephemeral port immediately without 30s TIME_WAIT buildup under high-RPS Connection: close */
-                struct linger sl = { .l_onoff = 1, .l_linger = 0 };
-                setsockopt(conn->backend_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
             }
             close(conn->backend_fd);
         }
@@ -1263,9 +1259,9 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
         }
     }
 
-    // If client closed after full response was received and drained, finish immediately
+    // If client closed after validated Keep-Alive response was received and drained, finish immediately
     // (allows Keep-Alive backend socket to be cleanly pooled without sending SHUT_WR)
-    if (conn->client_closed && conn->bytes_from_backend > 0 &&
+    if (conn->client_closed && conn->keep_alive_eligible && conn->bytes_from_backend > 0 &&
         buffer_available(&conn->c2b) == 0 && buffer_available(&conn->b2c) == 0) {
         worker_close_conn(worker, conn);
         return;
