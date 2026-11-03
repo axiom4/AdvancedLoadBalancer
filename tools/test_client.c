@@ -364,6 +364,10 @@ static int connect_to_target(const char *ip, int port, bool use_udp) {
     if (!use_udp) {
         int opt = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
         if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
             close(fd);
             return -1;
@@ -649,6 +653,11 @@ static void *worker_client_thread(void *arg) {
             }
 #endif
             if (active_fd >= 0) {
+                if (success && !g_cfg.use_udp) {
+                    /* Reclaim client ephemeral port immediately without 35s macOS/BSD TIME_WAIT buildup */
+                    struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                    setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+                }
                 close(active_fd);
                 active_fd = -1;
             }
