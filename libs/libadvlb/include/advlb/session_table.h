@@ -84,6 +84,19 @@ bool session_table_fill_wire(ClusterSessionWire *wire,
                              uint32_t remaining_ttl,
                              uint64_t version);
 
+/* Store replicated live shadow sockets (SCM_RIGHTS) on a BACKUP node for zero-drop failover */
+bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
+                                    uint8_t proto,
+                                    int backend_idx,
+                                    int shadow_client_fd,
+                                    int shadow_backend_fd,
+                                    const char *initial_req,
+                                    uint16_t req_len,
+                                    uint64_t bytes_to_client);
+
+/* Promote all passive shadow sockets into the active worker pool upon becoming VRRP MASTER */
+int session_table_promote_shadow_conns(void);
+
 #ifdef __cplusplus
 }
 #endif

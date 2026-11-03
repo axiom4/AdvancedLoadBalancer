@@ -583,6 +583,11 @@ static void *worker_client_thread(void *arg) {
             }
 #endif
             if (active_fd >= 0) {
+                if (success && !g_cfg.use_udp) {
+                    /* Reclaim client ephemeral port immediately without 30s TIME_WAIT buildup */
+                    struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                    setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+                }
                 close(active_fd);
                 active_fd = -1;
             }

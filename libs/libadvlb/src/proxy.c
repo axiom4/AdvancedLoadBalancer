@@ -246,9 +246,18 @@ typedef struct ProxyConnection {
     bool from_pool;
     bool keep_alive_eligible;
     bool l7_session_checked;
+    bool client_want_write;
+    bool handed_over;
+    bool fds_replicated;
 
     size_t bytes_to_backend;
     size_t bytes_from_backend;
+    size_t bytes_to_client;
+    size_t skip_backend_bytes;
+    size_t last_replicated_bytes;
+
+    uint16_t initial_req_len;
+    char initial_req[512];
 
     uint32_t last_client_ev;
     uint32_t last_backend_ev;
@@ -267,6 +276,12 @@ typedef struct ProxyConnection {
 
 typedef struct NewConnNode {
     int client_fd;
+    int backend_fd;
+    int backend_idx;
+    bool is_migrated;
+    uint64_t bytes_to_client;
+    uint16_t req_len;
+    char initial_req[512];
     struct sockaddr_storage client_addr;
     struct NewConnNode *next;
 } NewConnNode;
@@ -295,6 +310,9 @@ typedef struct WorkerThread {
     // 2.3: Worker-local Slab Allocator / Object Pool for ProxyConnection
     ProxyConnection *conn_pool_head;
     int conn_pool_count;
+    atomic_bool handover_requested;
+    atomic_bool handover_done;
+    atomic_bool resync_requested;
     volatile bool running;
 } WorkerThread;
 
@@ -412,13 +430,17 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
     int client_port = 0;
     get_client_ip_port(&conn->client_addr, client_ip, sizeof(client_ip), &client_port);
 
+    bool preserve_for_failover = conn->handed_over || (!g_server_running && g_config.enable_cluster);
+
     if (conn->backend_fd >= 0) {
         epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
         worker_clear_fd(worker, conn->backend_fd);
 
         bool pooled = false;
-        // Only pool validated Keep-Alive connections that completed a request/response without errors
-        if (g_config.enable_upstream_pooling &&
+        // Only pool validated Keep-Alive connections
+        if (!preserve_for_failover &&
+            !conn->fds_replicated &&
+            g_config.enable_upstream_pooling &&
             conn->keep_alive_eligible &&
             !conn->had_error &&
             conn->backend_idx >= 0 &&
@@ -434,11 +456,19 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         }
 
         if (!pooled) {
+            if (!preserve_for_failover && conn->fds_replicated && g_config.enable_cluster) {
+                shutdown(conn->backend_fd, SHUT_RDWR);
+            } else if (!preserve_for_failover && conn->bytes_from_backend > 0) {
+                /* Reclaim ephemeral port immediately without 30s TIME_WAIT buildup under high-RPS Connection: close */
+                struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                setsockopt(conn->backend_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+            }
             close(conn->backend_fd);
         }
         conn->backend_fd = -1;
     }
 
+    int closed_backend_idx = conn->backend_idx;
     if (conn->backend_idx >= 0) {
         release_backend(conn->backend_idx);
         conn->backend_idx = -1;
@@ -448,15 +478,29 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->client_fd, NULL);
         worker_clear_fd(worker, conn->client_fd);
         if (conn->client_ssl) {
-            SSL_shutdown(conn->client_ssl);
+            if (!preserve_for_failover) {
+                SSL_shutdown(conn->client_ssl);
+            }
             SSL_free(conn->client_ssl);
             conn->client_ssl = NULL;
+        } else if (!preserve_for_failover && conn->fds_replicated && g_config.enable_cluster) {
+            shutdown(conn->client_fd, SHUT_RDWR);
         }
         close(conn->client_fd);
         conn->client_fd = -1;
     }
 
-    add_log("\033[1;30m[DISC]\033[0m Connection closed for client %s:%d", client_ip, client_port);
+    if (!preserve_for_failover && g_config.enable_cluster) {
+        if (conn->fds_replicated) {
+            cluster_notify_conn_closed(&conn->client_addr, closed_backend_idx);
+        } else if (!g_config.enable_session_stickiness) {
+            session_table_remove_client(&conn->client_addr, SESSION_PROTO_TCP, true, false);
+        }
+    }
+
+    add_log("\033[1;30m[DISC]\033[0m Connection %s for client %s:%d",
+            preserve_for_failover ? "handed over to HA peer" : "closed",
+            client_ip, client_port);
 
     worker_remove_conn(worker, conn);
     worker_free_conn(worker, conn);
@@ -469,7 +513,7 @@ static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn
     // Configure client epoll interest mask (Automatic Backpressure)
     uint32_t client_mask = 0;
     if (!conn->client_closed && buffer_space(&conn->c2b) > 0) client_mask |= EPOLLIN;
-    if (buffer_available(&conn->b2c) > 0) client_mask |= EPOLLOUT;
+    if (buffer_available(&conn->b2c) > 0 || conn->client_want_write) client_mask |= EPOLLOUT;
     if (client_mask != 0) client_mask |= (EPOLLERR | EPOLLHUP);
 
     if (client_mask != conn->last_client_ev) {
@@ -495,7 +539,7 @@ static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn
     // Configure backend epoll interest mask (Automatic Backpressure)
     if (conn->backend_fd >= 0) {
         uint32_t backend_mask = 0;
-        if (!conn->backend_closed && buffer_space(&conn->b2c) > 0) backend_mask |= EPOLLIN;
+        if (!conn->backend_closed && buffer_space(&conn->b2c) > 0 && !conn->client_want_write) backend_mask |= EPOLLIN;
         if (buffer_available(&conn->c2b) > 0) backend_mask |= EPOLLOUT;
         if (backend_mask != 0) backend_mask |= (EPOLLERR | EPOLLHUP);
 
@@ -797,6 +841,12 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
                     if (conn->c2b.tail == 0 && has_connection_close_header(wptr, (size_t)r)) {
                         conn->keep_alive_eligible = false;
                     }
+                    if (conn->initial_req_len < sizeof(conn->initial_req)) {
+                        size_t can_copy = sizeof(conn->initial_req) - conn->initial_req_len;
+                        if ((size_t)r < can_copy) can_copy = (size_t)r;
+                        memcpy(conn->initial_req + conn->initial_req_len, wptr, can_copy);
+                        conn->initial_req_len += (uint16_t)can_copy;
+                    }
                     buffer_produce(&conn->c2b, (size_t)r);
                     conn->last_activity = time(NULL);
                 } else if (r == 0 && !want_io) {
@@ -879,6 +929,101 @@ static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *con
     }
 }
 
+static bool worker_pump_cluster_b2c(WorkerThread *worker, ProxyConnection *conn, time_t now) {
+    int max_retries = (g_num_backends > 1) ? (g_num_backends * 2) : 2;
+    char peek_buf[16384];
+
+    while (conn->backend_fd >= 0 && conn->client_fd >= 0 &&
+           !conn->backend_closed && !conn->client_closed &&
+           buffer_available(&conn->b2c) == 0) {
+        ssize_t peeked = recv(conn->backend_fd, peek_buf, sizeof(peek_buf), MSG_PEEK);
+        if (peeked > 0) {
+            if (conn->skip_backend_bytes > 0) {
+                size_t skip = ((size_t)peeked < conn->skip_backend_bytes)
+                              ? (size_t)peeked
+                              : conn->skip_backend_bytes;
+                ssize_t cr = recv(conn->backend_fd, peek_buf, skip, 0);
+                if (cr > 0) {
+                    conn->skip_backend_bytes -= (size_t)cr;
+                }
+                continue;
+            }
+            if (conn->bytes_from_backend == 0 && has_connection_close_header(peek_buf, (size_t)peeked)) {
+                conn->keep_alive_eligible = false;
+            }
+
+            bool want_io = false;
+            ssize_t w = nonblocking_write(conn->client_fd, NULL, peek_buf, (size_t)peeked, &want_io);
+            if (w > 0) {
+                size_t to_consume = (size_t)w;
+                while (to_consume > 0) {
+                    ssize_t cr = recv(conn->backend_fd, peek_buf, to_consume, 0);
+                    if (cr > 0) {
+                        to_consume -= (size_t)cr;
+                    } else if (cr < 0 && errno == EINTR) {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                conn->bytes_from_backend += (size_t)w;
+                conn->bytes_to_client += (size_t)w;
+                conn->last_activity = now;
+                conn->client_want_write = ((size_t)w < (size_t)peeked) || want_io;
+
+                if (!conn->fds_replicated && conn->bytes_to_client >= 4096) {
+                    conn->fds_replicated = true;
+                    conn->last_replicated_bytes = conn->bytes_to_client;
+                    cluster_replicate_live_conn(&conn->client_addr, conn->backend_idx,
+                                                conn->client_fd, conn->backend_fd,
+                                                conn->initial_req, conn->initial_req_len,
+                                                (uint64_t)conn->bytes_to_client);
+                }
+                if (conn->client_want_write) {
+                    break;
+                }
+            } else if (w == 0 && want_io) {
+                conn->client_want_write = true;
+                break;
+            } else {
+                conn->had_error = true;
+                worker_close_conn(worker, conn);
+                return false;
+            }
+        } else if (peeked == 0) {
+            if (conn->bytes_from_backend == 0 && conn->c2b.tail > 0 &&
+                conn->c2b.tail <= BUFFER_SIZE && conn->retry_count < max_retries) {
+                conn->c2b.head = 0;
+                conn->bytes_to_backend = 0;
+                conn->from_pool = false;
+                worker_retry_backend_connect(worker, conn);
+                return false;
+            }
+            conn->backend_closed = true;
+            conn->client_want_write = false;
+            break;
+        } else {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                conn->client_want_write = false;
+                break;
+            }
+            if (conn->bytes_from_backend == 0 && conn->c2b.tail > 0 &&
+                conn->c2b.tail <= BUFFER_SIZE && conn->retry_count < max_retries) {
+                conn->c2b.head = 0;
+                conn->bytes_to_backend = 0;
+                conn->from_pool = false;
+                worker_retry_backend_connect(worker, conn);
+                return false;
+            }
+            conn->had_error = true;
+            worker_close_conn(worker, conn);
+            return false;
+        }
+    }
+    return true;
+}
+
 static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *conn, int fd, uint32_t events) {
     time_t now = time(NULL);
     int max_retries = (g_num_backends > 1) ? (g_num_backends * 2) : 2;
@@ -895,6 +1040,12 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                 if (r > 0) {
                     if (conn->c2b.tail == 0 && has_connection_close_header(wptr, (size_t)r)) {
                         conn->keep_alive_eligible = false;
+                    }
+                    if (conn->initial_req_len < sizeof(conn->initial_req)) {
+                        size_t can_copy = sizeof(conn->initial_req) - conn->initial_req_len;
+                        if ((size_t)r < can_copy) can_copy = (size_t)r;
+                        memcpy(conn->initial_req + conn->initial_req_len, wptr, can_copy);
+                        conn->initial_req_len += (uint16_t)can_copy;
                     }
                     buffer_produce(&conn->c2b, (size_t)r);
                     conn->last_activity = now;
@@ -932,6 +1083,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                                               buffer_read_ptr(&conn->b2c), avail, &want_io);
                 if (w > 0) {
                     buffer_consume(&conn->b2c, (size_t)w);
+                    conn->bytes_to_client += (size_t)w;
                     conn->last_activity = now;
                 } else if (w < 0) {
                     conn->had_error = true;
@@ -939,6 +1091,12 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                     return;
                 } else {
                     break;
+                }
+            }
+            if (g_config.enable_cluster && !conn->client_ssl && conn->client_want_write) {
+                conn->client_want_write = false;
+                if (!worker_pump_cluster_b2c(worker, conn, now)) {
+                    return;
                 }
             }
         }
@@ -953,49 +1111,65 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Events on BACKEND socket
     if (fd == conn->backend_fd) {
         if (events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
-            size_t space;
-            while (!conn->backend_closed && (space = buffer_write_len(&conn->b2c)) > 0) {
-                bool want_io = false;
-                char *wptr = buffer_write_ptr(&conn->b2c);
-                ssize_t r = nonblocking_read(conn->backend_fd, NULL,
-                                             wptr, space, &want_io);
-                if (r > 0) {
-                    if (conn->bytes_from_backend == 0 && has_connection_close_header(wptr, (size_t)r)) {
-                        conn->keep_alive_eligible = false;
-                    }
-                    buffer_produce(&conn->b2c, (size_t)r);
-                    conn->bytes_from_backend += (size_t)r;
-                    conn->last_activity = now;
-                } else if (r == 0 && !want_io) {
-                    // If backend closed before sending any response bytes, retry transparently
-                    if (conn->bytes_from_backend == 0 && conn->c2b.tail > 0 &&
-                        conn->c2b.tail <= BUFFER_SIZE && conn->retry_count < max_retries) {
-                        conn->c2b.head = 0;
-                        conn->bytes_to_backend = 0;
-                        conn->from_pool = false;
-                        worker_retry_backend_connect(worker, conn);
-                        return;
-                    }
-                    conn->backend_closed = true;
-                    break;
-                } else if (r < 0) {
-                    if (conn->bytes_from_backend == 0 && conn->c2b.tail > 0 &&
-                        conn->c2b.tail <= BUFFER_SIZE && conn->retry_count < max_retries) {
-                        conn->c2b.head = 0;
-                        conn->bytes_to_backend = 0;
-                        conn->from_pool = false;
-                        worker_retry_backend_connect(worker, conn);
-                        return;
-                    }
-                    conn->had_error = true;
-                    if (conn->bytes_from_backend > 0 && buffer_available(&conn->b2c) > 0) {
+            if (g_config.enable_cluster && !conn->client_ssl && buffer_available(&conn->b2c) == 0) {
+                if (!worker_pump_cluster_b2c(worker, conn, now)) {
+                    return;
+                }
+            } else {
+                size_t space;
+                while (!conn->backend_closed && (space = buffer_write_len(&conn->b2c)) > 0) {
+                    bool want_io = false;
+                    char *wptr = buffer_write_ptr(&conn->b2c);
+                    ssize_t r = nonblocking_read(conn->backend_fd, NULL,
+                                                 wptr, space, &want_io);
+                    if (r > 0) {
+                        if (conn->skip_backend_bytes > 0) {
+                            if ((size_t)r <= conn->skip_backend_bytes) {
+                                conn->skip_backend_bytes -= (size_t)r;
+                                continue;
+                            }
+                            size_t skip = conn->skip_backend_bytes;
+                            conn->skip_backend_bytes = 0;
+                            memmove(wptr, wptr + skip, (size_t)r - skip);
+                            r -= (ssize_t)skip;
+                        }
+                        if (conn->bytes_from_backend == 0 && has_connection_close_header(wptr, (size_t)r)) {
+                            conn->keep_alive_eligible = false;
+                        }
+                        buffer_produce(&conn->b2c, (size_t)r);
+                        conn->bytes_from_backend += (size_t)r;
+                        conn->last_activity = now;
+                    } else if (r == 0 && !want_io) {
+                        // If backend closed before sending any response bytes, retry transparently
+                        if (conn->bytes_from_backend == 0 && conn->c2b.tail > 0 &&
+                            conn->c2b.tail <= BUFFER_SIZE && conn->retry_count < max_retries) {
+                            conn->c2b.head = 0;
+                            conn->bytes_to_backend = 0;
+                            conn->from_pool = false;
+                            worker_retry_backend_connect(worker, conn);
+                            return;
+                        }
                         conn->backend_closed = true;
                         break;
+                    } else if (r < 0) {
+                        if (conn->bytes_from_backend == 0 && conn->c2b.tail > 0 &&
+                            conn->c2b.tail <= BUFFER_SIZE && conn->retry_count < max_retries) {
+                            conn->c2b.head = 0;
+                            conn->bytes_to_backend = 0;
+                            conn->from_pool = false;
+                            worker_retry_backend_connect(worker, conn);
+                            return;
+                        }
+                        conn->had_error = true;
+                        if (conn->bytes_from_backend > 0 && buffer_available(&conn->b2c) > 0) {
+                            conn->backend_closed = true;
+                            break;
+                        }
+                        worker_close_conn(worker, conn);
+                        return;
+                    } else {
+                        break;
                     }
-                    worker_close_conn(worker, conn);
-                    return;
-                } else {
-                    break;
                 }
             }
         }
@@ -1078,6 +1252,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                                       buffer_read_ptr(&conn->b2c), avail, &want_io);
         if (w > 0) {
             buffer_consume(&conn->b2c, (size_t)w);
+            conn->bytes_to_client += (size_t)w;
             conn->last_activity = now;
         } else if (w < 0) {
             conn->had_error = true;
@@ -1127,6 +1302,15 @@ static void worker_check_timeouts(WorkerThread *worker) {
     ProxyConnection *curr = worker->conn_list_head;
     while (curr) {
         ProxyConnection *next = curr->next;
+        if (g_config.enable_cluster && ! curr->client_ssl &&
+            curr->state == CONN_STATE_FORWARDING && curr->backend_fd >= 0 && !curr->fds_replicated) {
+            curr->fds_replicated = true;
+            curr->last_replicated_bytes = curr->bytes_to_client;
+            cluster_replicate_live_conn(&curr->client_addr, curr->backend_idx,
+                                        curr->client_fd, curr->backend_fd,
+                                        curr->initial_req, curr->initial_req_len,
+                                        (uint64_t)curr->bytes_to_client);
+        }
         if (now - curr->last_activity >= timeout_sec) {
             add_log("\033[1;33m[TIMEOUT]\033[0m Connection closed due to inactivity (>%ds) Slowloris protection",
                     timeout_sec);
@@ -1227,9 +1411,116 @@ static void worker_accept_connection(WorkerThread *worker, int client_fd, const 
     }
 }
 
+static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *node) {
+    set_nonblocking(node->client_fd);
+    int flag = 1;
+    setsockopt(node->client_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+    ProxyConnection *conn = worker_alloc_conn(worker);
+    if (!conn) {
+        if (node->backend_fd >= 0) close(node->backend_fd);
+        if (node->backend_idx >= 0) release_backend(node->backend_idx);
+        close(node->client_fd);
+        atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
+        return;
+    }
+
+    conn->client_fd = node->client_fd;
+    conn->backend_fd = node->backend_fd;
+    conn->backend_idx = node->backend_idx;
+    conn->client_addr = node->client_addr;
+    conn->last_activity = time(NULL);
+    conn->worker = worker;
+    conn->keep_alive_eligible = true;
+    conn->l7_session_checked = true;
+    conn->bytes_to_client = (size_t)node->bytes_to_client;
+    conn->bytes_from_backend = (size_t)node->bytes_to_client;
+    conn->last_replicated_bytes = conn->bytes_to_client;
+
+    if (node->req_len > 0) {
+        uint16_t copy_len = (node->req_len <= sizeof(conn->initial_req))
+                            ? node->req_len
+                            : (uint16_t)sizeof(conn->initial_req);
+        memcpy(conn->initial_req, node->initial_req, copy_len);
+        conn->initial_req_len = copy_len;
+    }
+
+    worker_set_fd(worker, conn->client_fd, conn);
+    worker_add_conn(worker, conn);
+
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port = 0;
+    get_client_ip_port(&conn->client_addr, client_ip, sizeof(client_ip), &client_port);
+
+    if (conn->backend_fd >= 0) {
+        set_nonblocking(conn->backend_fd);
+        setsockopt(conn->backend_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+        worker_set_fd(worker, conn->backend_fd, conn);
+        conn->state = CONN_STATE_FORWARDING;
+
+        add_log("\033[1;32m[HA MIGRATED]\033[0m Adopted active TCP stream %s:%d -> Backend [%d] on Worker %d",
+                client_ip, client_port, conn->backend_idx, worker->id);
+
+        if (g_config.enable_cluster) {
+            conn->fds_replicated = true;
+            cluster_replicate_live_conn(&conn->client_addr, conn->backend_idx,
+                                        conn->client_fd, conn->backend_fd,
+                                        conn->initial_req, conn->initial_req_len,
+                                        (uint64_t)conn->bytes_to_client);
+        }
+
+        worker_update_conn_epoll(worker, conn);
+        worker_handle_forwarding_io(worker, conn, conn->backend_fd, EPOLLIN);
+    } else {
+        if (conn->initial_req_len > 0) {
+            memcpy(buffer_write_ptr(&conn->c2b), conn->initial_req, conn->initial_req_len);
+            buffer_produce(&conn->c2b, conn->initial_req_len);
+            conn->skip_backend_bytes = conn->bytes_to_client;
+        }
+        if (conn->backend_idx >= 0) {
+            release_backend(conn->backend_idx);
+            conn->backend_idx = -1;
+        }
+        worker_start_backend_connect(worker, conn);
+    }
+}
+
 static void worker_process_new_conns(WorkerThread *worker) {
     char dummy[128];
     while (read(worker->notify_pipe[0], dummy, sizeof(dummy)) > 0);
+
+    if (atomic_exchange_explicit(&worker->resync_requested, false, memory_order_acq_rel)) {
+        ProxyConnection *c = worker->conn_list_head;
+        while (c) {
+            if (c->state == CONN_STATE_FORWARDING && !c->client_ssl &&
+                c->client_fd >= 0 && c->backend_fd >= 0) {
+                c->fds_replicated = true;
+                cluster_replicate_live_conn(&c->client_addr, c->backend_idx,
+                                            c->client_fd, c->backend_fd,
+                                            c->initial_req, c->initial_req_len,
+                                            (uint64_t)c->bytes_to_client);
+            }
+            c = c->next;
+        }
+    }
+
+    if (atomic_exchange_explicit(&worker->handover_requested, false, memory_order_acq_rel)) {
+        ProxyConnection *c = worker->conn_list_head;
+        while (c) {
+            ProxyConnection *next = c->next;
+            if (!c->client_ssl && c->client_fd >= 0) {
+                c->fds_replicated = true;
+                cluster_replicate_live_conn(&c->client_addr, c->backend_idx,
+                                            c->client_fd, c->backend_fd,
+                                            c->initial_req, c->initial_req_len,
+                                            (uint64_t)c->bytes_to_client);
+                c->handed_over = true;
+            }
+            worker_close_conn(worker, c);
+            c = next;
+        }
+        atomic_store_explicit(&worker->handover_done, true, memory_order_release);
+    }
 
     pthread_mutex_lock(&worker->queue_mutex);
     NewConnNode *node = worker->queue_head;
@@ -1239,7 +1530,11 @@ static void worker_process_new_conns(WorkerThread *worker) {
 
     while (node) {
         NewConnNode *next = node->next;
-        worker_accept_connection(worker, node->client_fd, &node->client_addr);
+        if (node->is_migrated) {
+            worker_adopt_migrated_connection(worker, node);
+        } else {
+            worker_accept_connection(worker, node->client_fd, &node->client_addr);
+        }
         free(node);
         node = next;
     }
@@ -1526,13 +1821,16 @@ void worker_pool_dispatch(int client_fd, const struct sockaddr_storage *client_a
     int idx = (int)((unsigned int)atomic_fetch_add_explicit(&s_next_worker, 1, memory_order_relaxed) % (unsigned int)s_num_workers);
     WorkerThread *worker = &s_workers[idx];
 
-    NewConnNode *node = malloc(sizeof(NewConnNode));
+    NewConnNode *node = calloc(1, sizeof(NewConnNode));
     if (!node) {
         close(client_fd);
         atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
         return;
     }
     node->client_fd = client_fd;
+    node->backend_fd = -1;
+    node->backend_idx = -1;
+    node->is_migrated = false;
     node->client_addr = *client_addr;
     node->next = NULL;
 
@@ -1549,6 +1847,96 @@ void worker_pool_dispatch(int client_fd, const struct sockaddr_storage *client_a
     // Notify worker event loop
     char signal_byte = 'c';
     (void)write(worker->notify_pipe[1], &signal_byte, 1);
+}
+
+void worker_pool_adopt_migrated_conn(int client_fd,
+                                     int backend_fd,
+                                     int backend_idx,
+                                     const struct sockaddr_storage *client_addr,
+                                     const char *initial_req,
+                                     uint16_t req_len,
+                                     uint64_t bytes_to_client) {
+    if (s_num_workers <= 0 || !s_workers || client_fd < 0 || !client_addr) {
+        if (backend_fd >= 0) close(backend_fd);
+        if (client_fd >= 0) close(client_fd);
+        return;
+    }
+
+    NewConnNode *node = calloc(1, sizeof(NewConnNode));
+    if (!node) {
+        if (backend_fd >= 0) close(backend_fd);
+        close(client_fd);
+        return;
+    }
+
+    node->client_fd = client_fd;
+    node->backend_fd = backend_fd;
+    node->backend_idx = backend_idx;
+    node->is_migrated = true;
+    node->bytes_to_client = bytes_to_client;
+    node->client_addr = *client_addr;
+    if (initial_req && req_len > 0) {
+        if (req_len > sizeof(node->initial_req)) req_len = sizeof(node->initial_req);
+        memcpy(node->initial_req, initial_req, req_len);
+        node->req_len = req_len;
+    }
+    node->next = NULL;
+
+    atomic_fetch_add_explicit(&g_active_clients, 1, memory_order_relaxed);
+    if (backend_idx >= 0 && backend_idx < g_num_backends) {
+        atomic_fetch_add_explicit(&g_backends[backend_idx].active_connections, 1, memory_order_relaxed);
+    }
+
+    int idx = (int)((unsigned int)atomic_fetch_add_explicit(&s_next_worker, 1, memory_order_relaxed) % (unsigned int)s_num_workers);
+    WorkerThread *worker = &s_workers[idx];
+
+    pthread_mutex_lock(&worker->queue_mutex);
+    if (worker->queue_tail) {
+        worker->queue_tail->next = node;
+        worker->queue_tail = node;
+    } else {
+        worker->queue_head = node;
+        worker->queue_tail = node;
+    }
+    pthread_mutex_unlock(&worker->queue_mutex);
+
+    char signal_byte = 'm';
+    (void)write(worker->notify_pipe[1], &signal_byte, 1);
+}
+
+void worker_pool_handover_active_conns(void) {
+    if (s_num_workers <= 0 || !s_workers) return;
+
+    for (int i = 0; i < s_num_workers; i++) {
+        WorkerThread *w = &s_workers[i];
+        atomic_store_explicit(&w->handover_done, false, memory_order_relaxed);
+        atomic_store_explicit(&w->handover_requested, true, memory_order_release);
+        char signal_byte = 'h';
+        (void)write(w->notify_pipe[1], &signal_byte, 1);
+    }
+
+    for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
+        bool all_done = true;
+        for (int i = 0; i < s_num_workers; i++) {
+            if (!atomic_load_explicit(&s_workers[i].handover_done, memory_order_acquire)) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) break;
+        struct timespec ts = {0, 1000000L}; // 1ms
+        nanosleep(&ts, NULL);
+    }
+}
+
+void worker_pool_resync_live_conns(void) {
+    if (s_num_workers <= 0 || !s_workers) return;
+    for (int i = 0; i < s_num_workers; i++) {
+        WorkerThread *w = &s_workers[i];
+        atomic_store_explicit(&w->resync_requested, true, memory_order_release);
+        char signal_byte = 'r';
+        (void)write(w->notify_pipe[1], &signal_byte, 1);
+    }
 }
 
 void worker_pool_shutdown(void) {

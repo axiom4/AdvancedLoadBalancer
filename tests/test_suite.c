@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -905,9 +907,210 @@ static void test_cluster_vrrp_and_session_sync(void) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 17. Zero-Drop Active File Download Across MASTER Crash (SIGKILL Failover)  */
+/* -------------------------------------------------------------------------- */
+static void test_cluster_active_download_master_crash_failover(void) {
+    printf("\n=== Running Test Suite: Active File Download Continuity on MASTER Crash (SIGKILL) ===\n");
+    fflush(stdout);
+
+    int client_pair[2] = {-1, -1};
+    int backend_pair[2] = {-1, -1};
+    int vrrp_pair[2] = {-1, -1};
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, client_pair) == 0,
+                "Created client <-> LB stream socketpair for active file download");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, backend_pair) == 0,
+                "Created LB <-> backend stream socketpair for active file download");
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_DGRAM, 0, vrrp_pair) == 0,
+                "Created VRRP datagram socketpair between MASTER and BACKUP processes");
+
+    fflush(stdout);
+    pid_t master_pid = fork();
+    if (master_pid == 0) {
+        /* CHILD PROCESS: Acts as initial VRRP MASTER (prio 180, port 19661) */
+        close(client_pair[0]);
+        close(backend_pair[0]);
+        close(vrrp_pair[1]);
+
+        reset_test_backends(2);
+        session_table_init();
+        session_table_clear();
+        cluster_init();
+        cluster_clear_peers();
+
+        g_config.enable_cluster = true;
+        g_config.enable_session_stickiness = false;
+        g_config.enable_ssl_offloading = false;
+        g_config.enable_proxy_protocol_v1 = false;
+        g_config.enable_accept_proxy = false;
+        g_config.listen_port = 0;
+        g_config.vrrp_router_id = 88;
+        g_config.vrrp_priority = 180;
+        g_config.vrrp_advert_interval_ms = 30;
+        g_config.vrrp_preempt = true;
+        g_config.cluster_port = 19661;
+        g_config.cluster_node_id = 0xAA000001u;
+        strncpy(g_config.virtual_ip, "127.0.0.251", sizeof(g_config.virtual_ip) - 1);
+        strncpy(g_config.cluster_secret, "download-failover-secret-key", sizeof(g_config.cluster_secret) - 1);
+
+        cluster_add_peer("127.0.0.1:19662");
+        worker_pool_init(2);
+        cluster_start_with_socket(vrrp_pair[0]);
+
+        while (cluster_get_state() != VRRP_STATE_MASTER) {
+            usleep(10000);
+        }
+
+        struct sockaddr_storage c_addr;
+        memset(&c_addr, 0, sizeof(c_addr));
+        struct sockaddr_in *c4 = (struct sockaddr_in *)&c_addr;
+        c4->sin_family = AF_INET;
+        c4->sin_port = htons(51234);
+        inet_pton(AF_INET, "192.168.99.10", &c4->sin_addr);
+
+        const char *req = "GET /largefile.bin HTTP/1.1\r\nHost: vip\r\n\r\n";
+        worker_pool_adopt_migrated_conn(client_pair[1], backend_pair[1], 0, &c_addr,
+                                        req, (uint16_t)strlen(req), 0);
+
+        /* Stay alive serving the download until killed with SIGKILL by test harness */
+        while (1) {
+            usleep(50000);
+        }
+        _exit(0);
+    }
+
+    /* PARENT PROCESS: Acts as VRRP BACKUP (prio 120, port 19662) that takes over on MASTER crash */
+    close(client_pair[1]);
+    close(backend_pair[1]);
+    close(vrrp_pair[0]);
+
+    reset_test_backends(2);
+    session_table_init();
+    session_table_clear();
+    cluster_init();
+    cluster_clear_peers();
+
+    g_config.enable_cluster = true;
+    g_config.enable_session_stickiness = false;
+    g_config.enable_ssl_offloading = false;
+    g_config.enable_proxy_protocol_v1 = false;
+    g_config.enable_accept_proxy = false;
+    g_config.listen_port = 0;
+    g_config.vrrp_router_id = 88;
+    g_config.vrrp_priority = 120;
+    g_config.vrrp_advert_interval_ms = 30;
+    g_config.vrrp_preempt = true;
+    g_config.cluster_port = 19662;
+    g_config.cluster_node_id = 0xBB000002u;
+    strncpy(g_config.virtual_ip, "127.0.0.251", sizeof(g_config.virtual_ip) - 1);
+    strncpy(g_config.cluster_secret, "download-failover-secret-key", sizeof(g_config.cluster_secret) - 1);
+
+    cluster_add_peer("127.0.0.1:19661");
+    worker_pool_init(2);
+    cluster_start_with_socket(vrrp_pair[1]);
+
+    /* Wait for MASTER child to elect itself and replicate live socket FDs via SCM_RIGHTS */
+    usleep(220000);
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_BACKUP,
+                "Backup node remained in VRRP_STATE_BACKUP while higher-priority Master is alive");
+
+    const size_t total_file_size = 256 * 1024; /* 256 KB file */
+    const size_t half_file_size  = 128 * 1024; /* 128 KB before crash, 128 KB after crash */
+    uint8_t *tx_file = malloc(total_file_size);
+    uint8_t *rx_file = calloc(1, total_file_size);
+    for (size_t i = 0; i < total_file_size; i++) {
+        tx_file[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+    }
+
+    /* Phase 1: Stream first 128 KB (50% of file) through MASTER node (non-blocking to prevent buffer deadlock) */
+    set_nonblocking(backend_pair[0]);
+    set_nonblocking(client_pair[0]);
+    size_t written = 0;
+    size_t read_total = 0;
+    while (read_total < half_file_size) {
+        if (written < half_file_size && (written - read_total) < 32768) {
+            size_t chunk = (half_file_size - written > 4096) ? 4096 : (half_file_size - written);
+            ssize_t w = send(backend_pair[0], tx_file + written, chunk, MSG_DONTWAIT);
+            if (w > 0) written += (size_t)w;
+        }
+        while (read_total < half_file_size) {
+            ssize_t r = recv(client_pair[0], rx_file + read_total, half_file_size - read_total, MSG_DONTWAIT);
+            if (r > 0) {
+                read_total += (size_t)r;
+            } else {
+                break;
+            }
+        }
+        if (read_total < half_file_size) {
+            usleep(200);
+        }
+    }
+    TEST_ASSERT(read_total == half_file_size,
+                "Client downloaded first 128 KB (50%) of file through MASTER node");
+
+    /* Ensure SCM_RIGHTS FD replication message from MASTER is drained by BACKUP before crash */
+    usleep(30000);
+
+    /* Abruptly crash MASTER node with SIGKILL (kill -9) mid-download! */
+    kill(master_pid, SIGKILL);
+    waitpid(master_pid, NULL, 0);
+
+    /* Wait up to 50ms for instant POLLHUP crash detector to promote BACKUP -> MASTER */
+    for (int w = 0; w < 50 && cluster_get_state() != VRRP_STATE_MASTER; w++) {
+        usleep(1000);
+    }
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_MASTER,
+                "Backup node detected MASTER SIGKILL crash (<50ms) and promoted to VRRP_STATE_MASTER");
+    TEST_ASSERT(cluster_is_vip_active(),
+                "New MASTER immediately acquired Virtual IP (127.0.0.251)");
+
+    /* Phase 2: Stream remaining 128 KB (50%..100%) through NEW MASTER on the EXACT SAME client socket */
+    while (written < total_file_size || read_total < total_file_size) {
+        if (written < total_file_size && (written - read_total) < 32768) {
+            size_t chunk = (total_file_size - written > 4096) ? 4096 : (total_file_size - written);
+            ssize_t w = send(backend_pair[0], tx_file + written, chunk, MSG_DONTWAIT);
+            if (w > 0) written += (size_t)w;
+            if (written == total_file_size) {
+                shutdown(backend_pair[0], SHUT_WR);
+            }
+        }
+        while (read_total < total_file_size) {
+            ssize_t r = recv(client_pair[0], rx_file + read_total, total_file_size - read_total, MSG_DONTWAIT);
+            if (r > 0) {
+                read_total += (size_t)r;
+            } else {
+                break;
+            }
+        }
+        if (read_total < total_file_size) {
+            usleep(200);
+        }
+    }
+    close(backend_pair[0]);
+    close(client_pair[0]);
+
+    TEST_ASSERT(read_total == total_file_size,
+                "Client completed 100% of 256 KB file download on original socket without interruption");
+    TEST_ASSERT(memcmp(tx_file, rx_file, total_file_size) == 0,
+                "Downloaded 256 KB file matches byte-for-byte (0 bytes lost, 0 bytes duplicated across MASTER crash)");
+
+    free(tx_file);
+    free(rx_file);
+
+    cluster_stop();
+    worker_pool_shutdown();
+    unlink("/tmp/adlb_ha_fd_88_19661.sock");
+    unlink("/tmp/adlb_ha_fd_88_19662.sock");
+    g_config.enable_cluster = false;
+    session_table_clear();
+    cluster_clear_peers();
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main Test Runner                                                           */
 /* -------------------------------------------------------------------------- */
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     printf("====================================================================\n");
     printf("          ADVANCED LOAD BALANCER - AUTOMATED TEST SUITE             \n");
     printf("====================================================================\n");
@@ -932,6 +1135,7 @@ int main(void) {
     test_swrr_concurrent_stress();
     test_session_table_stickiness_and_failover();
     test_cluster_vrrp_and_session_sync();
+    test_cluster_active_download_master_crash_failover();
 
     printf("\n====================================================================\n");
     printf("TEST RESULTS: %d Run | \033[1;32m%d Passed\033[0m | \033[1;%sm%d Failed\033[0m\n",

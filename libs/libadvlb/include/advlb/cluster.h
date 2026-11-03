@@ -78,6 +78,18 @@ void cluster_queue_session_delete(const ClusterSessionWire *wire);
 /* Request an immediate bulk session synchronization from current cluster peers */
 void cluster_request_bulk_sync(void);
 
+/* Replicate live active TCP connection descriptors and stream offset to cluster peers */
+void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
+                                 int backend_idx,
+                                 int client_fd,
+                                 int backend_fd,
+                                 const char *initial_req,
+                                 uint16_t req_len,
+                                 uint64_t bytes_to_client);
+
+/* Notify cluster peers that an active TCP connection closed normally */
+void cluster_notify_conn_closed(const struct sockaddr_storage *client_addr, int backend_idx);
+
 /* Telemetry counters */
 uint64_t cluster_get_tx_packets(void);
 uint64_t cluster_get_rx_packets(void);

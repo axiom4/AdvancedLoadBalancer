@@ -4,10 +4,14 @@
 #include "advlb/balancer.h"
 #include "advlb/config.h"
 #include "advlb/log.h"
+#include "advlb/proxy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <stdatomic.h>
@@ -33,6 +37,11 @@ typedef struct SessionNode {
     time_t last_replicated;
     uint32_t ttl_sec;
     uint64_t version;
+    int shadow_client_fd;
+    int shadow_backend_fd;
+    uint64_t bytes_to_client;
+    uint16_t req_len;
+    char initial_req[512];
     struct SessionNode *hash_next;
 } SessionNode;
 
@@ -178,11 +187,27 @@ static int resolve_backend_index(const char *backend_ip, uint16_t backend_port, 
     return -1;
 }
 
+static void close_node_shadow_fds(SessionNode *node) {
+    if (!node) return;
+    if (node->shadow_client_fd >= 0) {
+        close(node->shadow_client_fd);
+        node->shadow_client_fd = -1;
+    }
+    if (node->shadow_backend_fd >= 0) {
+        close(node->shadow_backend_fd);
+        node->shadow_backend_fd = -1;
+    }
+}
+
 void session_table_init(void) {
     if (s_initialized) return;
     for (int s = 0; s < SESSION_SHARDS; s++) {
         pthread_mutex_init(&s_shards[s].mutex, NULL);
         memset(s_shards[s].nodes, 0, sizeof(s_shards[s].nodes));
+        for (int i = 0; i < MAX_SESSIONS_PER_SHARD; i++) {
+            s_shards[s].nodes[i].shadow_client_fd = -1;
+            s_shards[s].nodes[i].shadow_backend_fd = -1;
+        }
         memset(s_shards[s].buckets, 0, sizeof(s_shards[s].buckets));
         s_shards[s].active_count = 0;
     }
@@ -194,7 +219,16 @@ void session_table_clear(void) {
     if (!s_initialized) session_table_init();
     for (int s = 0; s < SESSION_SHARDS; s++) {
         pthread_mutex_lock(&s_shards[s].mutex);
+        for (int i = 0; i < MAX_SESSIONS_PER_SHARD; i++) {
+            if (s_shards[s].nodes[i].in_use) {
+                close_node_shadow_fds(&s_shards[s].nodes[i]);
+            }
+        }
         memset(s_shards[s].nodes, 0, sizeof(s_shards[s].nodes));
+        for (int i = 0; i < MAX_SESSIONS_PER_SHARD; i++) {
+            s_shards[s].nodes[i].shadow_client_fd = -1;
+            s_shards[s].nodes[i].shadow_backend_fd = -1;
+        }
         memset(s_shards[s].buckets, 0, sizeof(s_shards[s].buckets));
         s_shards[s].active_count = 0;
         pthread_mutex_unlock(&s_shards[s].mutex);
@@ -265,7 +299,8 @@ static int lookup_raw_key(uint8_t family, uint8_t proto, const uint8_t ip[16], u
     }
 
     time_t now = time(NULL);
-    if ((uint32_t)(now - node->last_seen) >= node->ttl_sec) {
+    if ((uint32_t)(now - node->last_seen) >= node->ttl_sec && node->shadow_client_fd < 0) {
+        close_node_shadow_fds(node);
         shard_bucket_remove(shard, bucket_idx, node);
         node->in_use = false;
         shard->active_count--;
@@ -284,6 +319,7 @@ static int lookup_raw_key(uint8_t family, uint8_t proto, const uint8_t ip[16], u
 
     if (b_idx < 0 || b_idx >= g_num_backends ||
         !atomic_load_explicit(&g_backends[b_idx].is_alive, memory_order_relaxed)) {
+        close_node_shadow_fds(node);
         shard_bucket_remove(shard, bucket_idx, node);
         node->in_use = false;
         shard->active_count--;
@@ -350,6 +386,7 @@ static SessionNode *shard_alloc_slot_locked(SessionShard *shard, time_t now) {
     int chosen = (free_idx != -1) ? free_idx : ((expired_idx != -1) ? expired_idx : oldest_idx);
     SessionNode *slot = &shard->nodes[chosen];
     if (slot->in_use) {
+        close_node_shadow_fds(slot);
         uint32_t old_h = compute_key_hash(slot->family, slot->proto, slot->client_ip, slot->client_port);
         uint32_t old_bucket = (old_h / SESSION_SHARDS) % SESSION_BUCKETS_PER_SHARD;
         shard_bucket_remove(shard, old_bucket, slot);
@@ -391,6 +428,8 @@ static void upsert_raw_key(uint8_t family,
     if (!node) {
         node = shard_alloc_slot_locked(shard, now);
         memset(node, 0, sizeof(*node));
+        node->shadow_client_fd = -1;
+        node->shadow_backend_fd = -1;
         node->in_use = true;
         node->family = family;
         node->proto = proto;
@@ -476,6 +515,7 @@ void session_table_remove_client(const struct sockaddr_storage *client_addr,
     SessionNode *node = shard_find_locked(shard, bucket_idx, family, proto, ip, port);
     if (node) {
         fill_wire_from_node(&wire_del, node, time(NULL));
+        close_node_shadow_fds(node);
         shard_bucket_remove(shard, bucket_idx, node);
         node->in_use = false;
         shard->active_count--;
@@ -523,6 +563,8 @@ bool session_table_apply_remote(const ClusterSessionWire *wire) {
     if (!node) {
         node = shard_alloc_slot_locked(shard, now);
         memset(node, 0, sizeof(*node));
+        node->shadow_client_fd = -1;
+        node->shadow_backend_fd = -1;
         node->in_use = true;
         node->family = family;
         node->proto = proto;
@@ -564,6 +606,7 @@ bool session_table_delete_remote(const ClusterSessionWire *wire) {
     pthread_mutex_lock(&shard->mutex);
     SessionNode *node = shard_find_locked(shard, bucket_idx, family, wire->proto, wire->client_ip, wire->client_port);
     if (node) {
+        close_node_shadow_fds(node);
         shard_bucket_remove(shard, bucket_idx, node);
         node->in_use = false;
         shard->active_count--;
@@ -572,6 +615,17 @@ bool session_table_delete_remote(const ClusterSessionWire *wire) {
     }
     pthread_mutex_unlock(&shard->mutex);
     return deleted;
+}
+
+static bool is_shadow_fd_closed(int fd) {
+    if (fd < 0) return true;
+    char probe = 0;
+    ssize_t r = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) return true;
+    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        return true;
+    }
+    return false;
 }
 
 int session_table_cleanup_expired(void) {
@@ -584,7 +638,11 @@ int session_table_cleanup_expired(void) {
         pthread_mutex_lock(&shard->mutex);
         for (int i = 0; i < MAX_SESSIONS_PER_SHARD; i++) {
             SessionNode *node = &shard->nodes[i];
-            if (node->in_use && (uint32_t)(now - node->last_seen) >= node->ttl_sec) {
+            if (!node->in_use) continue;
+            bool expired = ((uint32_t)(now - node->last_seen) >= node->ttl_sec);
+            bool dead_shadow = (node->shadow_client_fd >= 0 && is_shadow_fd_closed(node->shadow_client_fd));
+            if (expired || dead_shadow) {
+                close_node_shadow_fds(node);
                 uint32_t h = compute_key_hash(node->family, node->proto, node->client_ip, node->client_port);
                 uint32_t bucket_idx = (h / SESSION_SHARDS) % SESSION_BUCKETS_PER_SHARD;
                 shard_bucket_remove(shard, bucket_idx, node);
@@ -597,6 +655,157 @@ int session_table_cleanup_expired(void) {
         pthread_mutex_unlock(&shard->mutex);
     }
     return purged;
+}
+
+bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
+                                    uint8_t proto,
+                                    int backend_idx,
+                                    int shadow_client_fd,
+                                    int shadow_backend_fd,
+                                    const char *initial_req,
+                                    uint16_t req_len,
+                                    uint64_t bytes_to_client) {
+    if (!s_initialized) session_table_init();
+    if (!client_addr) {
+        if (shadow_client_fd >= 0) close(shadow_client_fd);
+        if (shadow_backend_fd >= 0) close(shadow_backend_fd);
+        return false;
+    }
+
+    if (cluster_get_state() == VRRP_STATE_MASTER && shadow_client_fd >= 0) {
+        worker_pool_adopt_migrated_conn(shadow_client_fd, shadow_backend_fd, backend_idx,
+                                        client_addr, initial_req, req_len, bytes_to_client);
+        return true;
+    }
+
+    uint8_t family = 0;
+    uint8_t ip[16];
+    uint16_t port = 0;
+    if (!extract_client_key(client_addr, true, &family, ip, &port)) {
+        if (shadow_client_fd >= 0) close(shadow_client_fd);
+        if (shadow_backend_fd >= 0) close(shadow_backend_fd);
+        return false;
+    }
+
+    uint32_t h = compute_key_hash(family, proto, ip, port);
+    uint32_t shard_idx = h % SESSION_SHARDS;
+    uint32_t bucket_idx = (h / SESSION_SHARDS) % SESSION_BUCKETS_PER_SHARD;
+
+    SessionShard *shard = &s_shards[shard_idx];
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&shard->mutex);
+    SessionNode *node = shard_find_locked(shard, bucket_idx, family, proto, ip, port);
+    if (!node) {
+        node = shard_alloc_slot_locked(shard, now);
+        memset(node, 0, sizeof(*node));
+        node->shadow_client_fd = -1;
+        node->shadow_backend_fd = -1;
+        node->in_use = true;
+        node->family = family;
+        node->proto = proto;
+        node->client_port = port;
+        memcpy(node->client_ip, ip, 16);
+        node->hash_next = shard->buckets[bucket_idx];
+        shard->buckets[bucket_idx] = node;
+        shard->active_count++;
+        atomic_fetch_add_explicit(&s_total_sessions, 1, memory_order_relaxed);
+    }
+
+    if (shadow_client_fd >= 0) {
+        if (node->shadow_client_fd >= 0 && node->shadow_client_fd != shadow_client_fd) {
+            close(node->shadow_client_fd);
+        }
+        node->shadow_client_fd = shadow_client_fd;
+    }
+    if (shadow_backend_fd >= 0) {
+        if (node->shadow_backend_fd >= 0 && node->shadow_backend_fd != shadow_backend_fd) {
+            close(node->shadow_backend_fd);
+        }
+        node->shadow_backend_fd = shadow_backend_fd;
+    }
+
+    if (backend_idx >= 0 && backend_idx < g_num_backends) {
+        node->backend_idx = backend_idx;
+        strncpy(node->backend_ip, g_backends[backend_idx].ip, sizeof(node->backend_ip) - 1);
+        node->backend_port = (uint16_t)g_backends[backend_idx].port;
+    }
+    node->bytes_to_client = bytes_to_client;
+    if (initial_req && req_len > 0) {
+        if (req_len > sizeof(node->initial_req)) req_len = sizeof(node->initial_req);
+        memcpy(node->initial_req, initial_req, req_len);
+        node->req_len = req_len;
+    }
+    node->last_seen = now;
+    node->ttl_sec = (g_config.session_ttl_sec > 0) ? (uint32_t)g_config.session_ttl_sec : DEFAULT_SESSION_TTL_SEC;
+
+    pthread_mutex_unlock(&shard->mutex);
+    return true;
+}
+
+int session_table_promote_shadow_conns(void) {
+    if (!s_initialized) return 0;
+    int promoted = 0;
+
+    for (int s = 0; s < SESSION_SHARDS; s++) {
+        SessionShard *shard = &s_shards[s];
+        for (int i = 0; i < MAX_SESSIONS_PER_SHARD; i++) {
+            int cfd = -1;
+            int bfd = -1;
+            int b_idx = -1;
+            uint64_t bytes_sent = 0;
+            uint16_t req_len = 0;
+            char req_copy[512];
+            struct sockaddr_storage client_addr;
+
+            pthread_mutex_lock(&shard->mutex);
+            SessionNode *node = &shard->nodes[i];
+            if (node->in_use && node->shadow_client_fd >= 0) {
+                cfd = node->shadow_client_fd;
+                bfd = node->shadow_backend_fd;
+                node->shadow_client_fd = -1;
+                node->shadow_backend_fd = -1;
+
+                b_idx = node->backend_idx;
+                if (b_idx < 0 || b_idx >= g_num_backends) {
+                    b_idx = resolve_backend_index(node->backend_ip, node->backend_port, b_idx);
+                    node->backend_idx = b_idx;
+                }
+                bytes_sent = node->bytes_to_client;
+                req_len = node->req_len;
+                if (req_len > sizeof(req_copy)) req_len = sizeof(req_copy);
+                if (req_len > 0) {
+                    memcpy(req_copy, node->initial_req, req_len);
+                }
+
+                memset(&client_addr, 0, sizeof(client_addr));
+                if (node->family == WIRE_FAMILY_IPV6) {
+                    struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&client_addr;
+                    s6->sin6_family = AF_INET6;
+                    s6->sin6_port = node->client_port;
+                    memcpy(&s6->sin6_addr, node->client_ip, 16);
+                } else {
+                    struct sockaddr_in *s4 = (struct sockaddr_in *)&client_addr;
+                    s4->sin_family = AF_INET;
+                    s4->sin_port = node->client_port;
+                    memcpy(&s4->sin_addr.s_addr, node->client_ip, 4);
+                }
+            }
+            pthread_mutex_unlock(&shard->mutex);
+
+            if (cfd >= 0) {
+                if (is_shadow_fd_closed(cfd)) {
+                    close(cfd);
+                    if (bfd >= 0) close(bfd);
+                } else {
+                    worker_pool_adopt_migrated_conn(cfd, bfd, b_idx, &client_addr,
+                                                    req_copy, req_len, bytes_sent);
+                    promoted++;
+                }
+            }
+        }
+    }
+    return promoted;
 }
 
 int session_table_count(void) {
