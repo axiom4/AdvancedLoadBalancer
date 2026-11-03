@@ -1846,7 +1846,8 @@ void worker_pool_dispatch(int client_fd, const struct sockaddr_storage *client_a
 
     // Notify worker event loop
     char signal_byte = 'c';
-    (void)write(worker->notify_pipe[1], &signal_byte, 1);
+    ssize_t w_ign = write(worker->notify_pipe[1], &signal_byte, 1);
+    (void)w_ign;
 }
 
 void worker_pool_adopt_migrated_conn(int client_fd,
@@ -1901,7 +1902,8 @@ void worker_pool_adopt_migrated_conn(int client_fd,
     pthread_mutex_unlock(&worker->queue_mutex);
 
     char signal_byte = 'm';
-    (void)write(worker->notify_pipe[1], &signal_byte, 1);
+    ssize_t w_ign1 = write(worker->notify_pipe[1], &signal_byte, 1);
+    (void)w_ign1;
 }
 
 void worker_pool_handover_active_conns(void) {
@@ -1912,7 +1914,8 @@ void worker_pool_handover_active_conns(void) {
         atomic_store_explicit(&w->handover_done, false, memory_order_relaxed);
         atomic_store_explicit(&w->handover_requested, true, memory_order_release);
         char signal_byte = 'h';
-        (void)write(w->notify_pipe[1], &signal_byte, 1);
+        ssize_t w_ign2 = write(w->notify_pipe[1], &signal_byte, 1);
+        (void)w_ign2;
     }
 
     for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
@@ -1935,7 +1938,8 @@ void worker_pool_resync_live_conns(void) {
         WorkerThread *w = &s_workers[i];
         atomic_store_explicit(&w->resync_requested, true, memory_order_release);
         char signal_byte = 'r';
-        (void)write(w->notify_pipe[1], &signal_byte, 1);
+        ssize_t w_ign3 = write(w->notify_pipe[1], &signal_byte, 1);
+        (void)w_ign3;
     }
 }
 
@@ -1964,7 +1968,8 @@ void worker_pool_shutdown(void) {
         WorkerThread *w = &s_workers[i];
         w->running = false;
         char c = 'q';
-        (void)write(w->notify_pipe[1], &c, 1);
+        ssize_t w_ign4 = write(w->notify_pipe[1], &c, 1);
+        (void)w_ign4;
         pthread_join(w->thread, NULL);
 
         close(w->notify_pipe[0]);
@@ -2334,10 +2339,10 @@ void *client_handler_thread(void *arg) {
         backend_idx = get_healthy_backend(&client_addr);
         if (backend_idx < 0) break;
 
-        char b_ip[INET6_ADDRSTRLEN];
+        char b_ip[64];
         int b_port;
         pthread_mutex_lock(&g_backend_mutex);
-        strncpy(b_ip, g_backends[backend_idx].ip, sizeof(b_ip));
+        snprintf(b_ip, sizeof(b_ip), "%s", g_backends[backend_idx].ip);
         b_port = g_backends[backend_idx].port;
         pthread_mutex_unlock(&g_backend_mutex);
 

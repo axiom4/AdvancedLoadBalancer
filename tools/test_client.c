@@ -386,7 +386,7 @@ static void *worker_client_thread(void *arg) {
     // Build HTTP request payload
     int req_len = 0;
     if (!g_cfg.use_udp) {
-        char proxy_hdr[128] = "";
+        char proxy_hdr[256] = "";
         if (g_cfg.send_proxy_proto) {
             snprintf(proxy_hdr, sizeof(proxy_hdr), "PROXY TCP4 192.168.1.100 %s 54321 %d\r\n",
                      g_cfg.target_ip, g_cfg.target_port);
@@ -646,7 +646,7 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     // Default configuration
-    strncpy(g_cfg.target_ip, "127.0.0.1", sizeof(g_cfg.target_ip));
+    snprintf(g_cfg.target_ip, sizeof(g_cfg.target_ip), "%s", "127.0.0.1");
     g_cfg.target_port = 8080;
     g_cfg.concurrency = 10;
     g_cfg.total_requests = 1000;
@@ -656,7 +656,7 @@ int main(int argc, char *argv[]) {
     g_cfg.use_ssl = false;
     g_cfg.send_proxy_proto = false;
     g_cfg.use_session = false;
-    strncpy(g_cfg.http_path, "/", sizeof(g_cfg.http_path));
+    snprintf(g_cfg.http_path, sizeof(g_cfg.http_path), "%s", "/");
     g_cfg.post_data[0] = '\0';
     g_cfg.mock_backends_count = 0;
     g_cfg.mock_backend_base_port = 9001;
@@ -670,10 +670,10 @@ int main(int argc, char *argv[]) {
                 char *colon = strchr(argv[i], ':');
                 if (colon) {
                     *colon = '\0';
-                    strncpy(g_cfg.target_ip, argv[i], sizeof(g_cfg.target_ip));
+                    snprintf(g_cfg.target_ip, sizeof(g_cfg.target_ip), "%s", argv[i]);
                     g_cfg.target_port = atoi(colon + 1);
                 } else {
-                    strncpy(g_cfg.target_ip, argv[i], sizeof(g_cfg.target_ip));
+                    snprintf(g_cfg.target_ip, sizeof(g_cfg.target_ip), "%s", argv[i]);
                 }
             }
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--concurrency") == 0) {
@@ -693,9 +693,9 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "--session") == 0) {
             g_cfg.use_session = true;
         } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--path") == 0) {
-            if (++i < argc) strncpy(g_cfg.http_path, argv[i], sizeof(g_cfg.http_path));
+            if (++i < argc) snprintf(g_cfg.http_path, sizeof(g_cfg.http_path), "%s", argv[i]);
         } else if (strcmp(argv[i], "--post") == 0) {
-            if (++i < argc) strncpy(g_cfg.post_data, argv[i], sizeof(g_cfg.post_data));
+            if (++i < argc) snprintf(g_cfg.post_data, sizeof(g_cfg.post_data), "%s", argv[i]);
         } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--mock-backends") == 0) {
             if (++i < argc) g_cfg.mock_backends_count = atoi(argv[i]);
         } else if (strcmp(argv[i], "--backend-port") == 0) {

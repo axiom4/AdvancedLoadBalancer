@@ -205,14 +205,16 @@ void add_log(const char *fmt, ...) {
         snprintf(time_str, sizeof(time_str), "00:00:00");
     }
 
-    char body[LOG_LINE_LEN];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(body, sizeof(body), fmt, args);
-    va_end(args);
-
     char full_line[LOG_LINE_LEN];
-    snprintf(full_line, sizeof(full_line), "[%s] %s", time_str, body);
+    int pfx_len = snprintf(full_line, sizeof(full_line), "[%s] ", time_str);
+    if (pfx_len > 0 && (size_t)pfx_len < sizeof(full_line)) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(full_line + pfx_len, sizeof(full_line) - (size_t)pfx_len, fmt, args);
+        va_end(args);
+    } else {
+        full_line[0] = '\0';
+    }
 
     if (!atomic_load_explicit(&s_drain_running, memory_order_relaxed)) {
         if (!g_config.enable_tui) {

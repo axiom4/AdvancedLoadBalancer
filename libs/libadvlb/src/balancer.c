@@ -426,9 +426,9 @@ void record_backend_failure(int index) {
             atomic_store_explicit(&g_backends[index].is_alive, false, memory_order_relaxed);
             conn_pool_purge_backend(index);
         }
-        char b_ip[INET_ADDRSTRLEN];
+        char b_ip[64];
         int b_port = g_backends[index].port;
-        strncpy(b_ip, g_backends[index].ip, sizeof(b_ip));
+        snprintf(b_ip, sizeof(b_ip), "%s", g_backends[index].ip);
         pthread_mutex_unlock(&g_backend_mutex);
 
         add_log("\033[1;33m[CIRCUIT BREAKER]\033[0m Backend [%d] %s:%d conn error (fail %d/%d)",

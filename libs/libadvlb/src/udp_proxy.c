@@ -193,10 +193,10 @@ static UdpSession *worker_find_or_create_session(UdpWorker *w, const struct sock
         return NULL;
     }
 
-    char b_ip[INET6_ADDRSTRLEN];
+    char b_ip[64];
     int b_port;
     pthread_mutex_lock(&g_backend_mutex);
-    strncpy(b_ip, g_backends[backend_idx].ip, sizeof(b_ip));
+    snprintf(b_ip, sizeof(b_ip), "%s", g_backends[backend_idx].ip);
     b_port = g_backends[backend_idx].port;
     pthread_mutex_unlock(&g_backend_mutex);
 

@@ -313,7 +313,7 @@ void render_tui(void) {
 
     // Separator line
     attron(COLOR_PAIR(CP_BLUE) | A_BOLD);
-    mvprintw(row, 0, "");
+    move(row, 0);
     for (int col = 0; col < max_x; col++) {
         printw("─");
     }
@@ -382,7 +382,7 @@ void render_tui(void) {
     // Backend rows
     pthread_mutex_lock(&g_backend_mutex);
     for (int i = 0; i < g_num_backends; i++) {
-        char addr_buf[64];
+        char addr_buf[128];
         if (g_backends[i].weight > 1) {
             snprintf(addr_buf, sizeof(addr_buf), "%s:%d [W:%d]", g_backends[i].ip, g_backends[i].port, g_backends[i].weight);
         } else {
