@@ -464,11 +464,11 @@ int parse_cli_args(int argc, char *argv[]) {
                 char *colon = strrchr(tmp, ':');
                 if (colon && strchr(tmp, ':') == colon) {
                     *colon = '\0';
-                    strncpy(g_config.cluster_bind_ip, tmp, sizeof(g_config.cluster_bind_ip) - 1);
+                    snprintf(g_config.cluster_bind_ip, sizeof(g_config.cluster_bind_ip), "%s", tmp);
                     int cp = atoi(colon + 1);
                     if (cp > 0 && cp <= 65535) g_config.cluster_port = cp;
                 } else {
-                    strncpy(g_config.cluster_bind_ip, tmp, sizeof(g_config.cluster_bind_ip) - 1);
+                    snprintf(g_config.cluster_bind_ip, sizeof(g_config.cluster_bind_ip), "%s", tmp);
                 }
                 g_config.enable_cluster = true;
                 break;

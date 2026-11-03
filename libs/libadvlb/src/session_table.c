@@ -272,7 +272,8 @@ static void fill_wire_from_node(ClusterSessionWire *wire, const SessionNode *nod
     wire->proto = node->proto;
     wire->client_port = node->client_port;
     memcpy(wire->client_ip, node->client_ip, 16);
-    strncpy(wire->backend_ip, node->backend_ip, sizeof(wire->backend_ip) - 1);
+    memcpy(wire->backend_ip, node->backend_ip, sizeof(wire->backend_ip) - 1);
+    wire->backend_ip[sizeof(wire->backend_ip) - 1] = '\0';
     wire->backend_port = htons(node->backend_port);
     wire->backend_idx = htons((uint16_t)(node->backend_idx >= 0 ? node->backend_idx : 0));
 

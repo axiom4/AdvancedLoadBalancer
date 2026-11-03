@@ -441,7 +441,7 @@ bool cluster_add_peer(const char *ip_port) {
         if (!exists && s_num_peers < MAX_CLUSTER_PEERS) {
             ClusterPeer *p = &s_peers[s_num_peers++];
             memset(p, 0, sizeof(*p));
-            strncpy(p->ip, host, sizeof(p->ip) - 1);
+            snprintf(p->ip, sizeof(p->ip), "%s", host);
             p->port = port;
             p->addr = ss;
             p->addr_len = ss_len;
@@ -805,7 +805,7 @@ static size_t prepare_packet(ClusterWirePacket *pkt,
     uint64_t seq = atomic_fetch_add_explicit(&s_seq_counter, 1, memory_order_relaxed);
     pkt->hdr.seq_num = u64_to_net(seq);
     pkt->hdr.timestamp_ms = u64_to_net(now_wallclock_ms());
-    strncpy(pkt->hdr.virtual_ip, g_config.virtual_ip, sizeof(pkt->hdr.virtual_ip) - 1);
+    snprintf(pkt->hdr.virtual_ip, sizeof(pkt->hdr.virtual_ip), "%s", g_config.virtual_ip);
     pkt->hdr.session_count = htons(session_count);
 
     if (session_count > 0 && sessions != NULL) {
@@ -952,7 +952,7 @@ static ClusterPeer *update_or_register_peer_locked(uint32_t sender_id,
     if (!found && s_num_peers < MAX_CLUSTER_PEERS && (src_port > 0 || s_is_custom_socket)) {
         found = &s_peers[s_num_peers++];
         memset(found, 0, sizeof(*found));
-        strncpy(found->ip, (src_ip[0] != '\0') ? src_ip : "unix-peer", sizeof(found->ip) - 1);
+        snprintf(found->ip, sizeof(found->ip), "%s", (src_ip[0] != '\0') ? src_ip : "unix-peer");
         found->port = src_port;
         if (src_addr && src_len > 0) {
             found->addr = *src_addr;
@@ -1394,7 +1394,7 @@ static void init_local_unix_fd_channel(int cport) {
         struct sockaddr_un uaddr;
         memset(&uaddr, 0, sizeof(uaddr));
         uaddr.sun_family = AF_UNIX;
-        strncpy(uaddr.sun_path, s_unix_path, sizeof(uaddr.sun_path) - 1);
+        snprintf(uaddr.sun_path, sizeof(uaddr.sun_path), "%s", s_unix_path);
         if (bind(s_unix_fd, (struct sockaddr *)&uaddr, sizeof(uaddr)) < 0) {
             close(s_unix_fd);
             s_unix_fd = -1;

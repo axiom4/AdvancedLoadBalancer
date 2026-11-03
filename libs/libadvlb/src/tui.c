@@ -384,9 +384,9 @@ void render_tui(void) {
     for (int i = 0; i < g_num_backends; i++) {
         char addr_buf[128];
         if (g_backends[i].weight > 1) {
-            snprintf(addr_buf, sizeof(addr_buf), "%s:%d [W:%d]", g_backends[i].ip, g_backends[i].port, g_backends[i].weight);
+            snprintf(addr_buf, sizeof(addr_buf), "%.63s:%d [W:%d]", g_backends[i].ip, g_backends[i].port, g_backends[i].weight);
         } else {
-            snprintf(addr_buf, sizeof(addr_buf), "%s:%d", g_backends[i].ip, g_backends[i].port);
+            snprintf(addr_buf, sizeof(addr_buf), "%.63s:%d", g_backends[i].ip, g_backends[i].port);
         }
 
         char lat_buf[16];

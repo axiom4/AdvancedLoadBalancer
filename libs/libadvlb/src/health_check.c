@@ -93,7 +93,7 @@ void perform_health_check_cycle(bool is_startup) {
         char ip[64];
         int port;
         pthread_mutex_lock(&g_backend_mutex);
-        snprintf(ip, sizeof(ip), "%s", g_backends[i].ip);
+        snprintf(ip, sizeof(ip), "%.63s", g_backends[i].ip);
         port = g_backends[i].port;
         pthread_mutex_unlock(&g_backend_mutex);
 
@@ -210,7 +210,7 @@ void perform_health_check_cycle(bool is_startup) {
                     char ip[64];
                     int port;
                     pthread_mutex_lock(&g_backend_mutex);
-                    snprintf(ip, sizeof(ip), "%s", g_backends[idx].ip);
+                    snprintf(ip, sizeof(ip), "%.63s", g_backends[idx].ip);
                     port = g_backends[idx].port;
                     pthread_mutex_unlock(&g_backend_mutex);
 
@@ -309,7 +309,7 @@ void perform_health_check_cycle(bool is_startup) {
                 g_backends[i].latency_ms = rtt_ms;
                 log_events[event_count].idx = i;
                 log_events[event_count].event_type = 1;
-                snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%s", g_backends[i].ip);
+                snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%.63s", g_backends[i].ip);
                 log_events[event_count].port = g_backends[i].port;
                 log_events[event_count].latency = rtt_ms;
                 event_count++;
@@ -319,7 +319,7 @@ void perform_health_check_cycle(bool is_startup) {
                 g_backends[i].consecutive_failures = FALL_THRESHOLD;
                 log_events[event_count].idx = i;
                 log_events[event_count].event_type = 2;
-                snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%s", g_backends[i].ip);
+                snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%.63s", g_backends[i].ip);
                 log_events[event_count].port = g_backends[i].port;
                 event_count++;
             }
@@ -333,7 +333,7 @@ void perform_health_check_cycle(bool is_startup) {
                     atomic_store_explicit(&g_backends[i].is_alive, true, memory_order_relaxed);
                     log_events[event_count].idx = i;
                     log_events[event_count].event_type = 3;
-                    snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%s", g_backends[i].ip);
+                    snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%.63s", g_backends[i].ip);
                     log_events[event_count].port = g_backends[i].port;
                     log_events[event_count].latency = rtt_ms;
                     event_count++;
@@ -347,7 +347,7 @@ void perform_health_check_cycle(bool is_startup) {
                     conn_pool_purge_backend(i);
                     log_events[event_count].idx = i;
                     log_events[event_count].event_type = 4;
-                    snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%s", g_backends[i].ip);
+                    snprintf(log_events[event_count].ip, sizeof(log_events[event_count].ip), "%.63s", g_backends[i].ip);
                     log_events[event_count].port = g_backends[i].port;
                     log_events[event_count].fails = g_backends[i].consecutive_failures;
                     event_count++;
