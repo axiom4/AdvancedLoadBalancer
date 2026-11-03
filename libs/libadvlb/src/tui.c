@@ -486,11 +486,6 @@ void render_tui(void) {
     row++;
 
     // --- 3. SEZIONE LIVE CONNECTION LOGS ---
-    attron(COLOR_PAIR(CP_YELLOW) | A_BOLD);
-    mvprintw(row, 1, "LIVE CONNECTION LOGS & EVENTS STREAM");
-    attroff(COLOR_PAIR(CP_YELLOW) | A_BOLD);
-    row++;
-
     int inner_w = max_x - 4;
     if (inner_w < 40) inner_w = 40;
 
@@ -515,7 +510,7 @@ void render_tui(void) {
     attroff(COLOR_PAIR(CP_BLUE) | A_BOLD);
     row++;
 
-    int fixed_lines = 12 + num_b;
+    int fixed_lines = 11 + num_b;
     int log_window = max_y - fixed_lines;
     if (log_window < 2) log_window = 2;
 
