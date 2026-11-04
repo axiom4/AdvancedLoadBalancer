@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+#include <stdio.h>
+#include <arpa/inet.h>
 #include "advlb/net_utils.h"
 #include "advlb/config.h"
 #include "advlb/log.h"
@@ -48,4 +50,19 @@ int create_tcp_server_socket(int port) {
 
 int create_udp_server_socket(int port) {
     return net_create_udp_server(port);
+}
+
+void get_client_ip_port(const struct sockaddr_storage *ss, char *ip_buf, size_t ip_len, int *port) {
+    if (ss && ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ip_buf, (socklen_t)ip_len);
+        if (port) *port = ntohs(sin6->sin6_port);
+    } else if (ss && ss->ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+        inet_ntop(AF_INET, &sin->sin_addr, ip_buf, (socklen_t)ip_len);
+        if (port) *port = ntohs(sin->sin_port);
+    } else {
+        snprintf(ip_buf, ip_len, "unknown");
+        if (port) *port = 0;
+    }
 }

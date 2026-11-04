@@ -832,9 +832,12 @@ int session_table_promote_shadow_conns(void) {
                     node->shadow_client_fd = -1;
                     node->shadow_backend_fd = -1;
                 } else if (node->has_tcp_checkpoint) {
+                    bool was_ktls = node->checkpoint.is_ktls;
                     cfd = tcp_repair_restore(&node->checkpoint);
                     bfd = -1;
                     node->has_tcp_checkpoint = false;
+                    add_log("\033[1;34m[HA RESTORE]\033[0m Restored live stream (fd=%d, kTLS=%s)",
+                            cfd, was_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m");
                 }
 
                 if (cfd >= 0) {

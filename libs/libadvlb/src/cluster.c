@@ -1328,6 +1328,12 @@ void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
             tcp_checkpoint_to_wire(&cp, backend_idx, b_ip, b_port, bytes_to_client, initial_req, req_len, &pkt.tcp_cp);
             size_t total_len = prepare_tcp_checkpoint_packet(&pkt, &pkt.tcp_cp);
             broadcast_cluster_packet(&pkt, total_len);
+
+            char cip[INET6_ADDRSTRLEN];
+            int cport = 0;
+            get_client_ip_port(client_addr, cip, sizeof(cip), &cport);
+            add_log("\033[1;34m[HA SYNC]\033[0m Replicated TCP stream for %s:%d (kTLS=%s, snd_seq=%u)",
+                    cip, cport, cp.is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", cp.snd_seq);
         }
     }
 

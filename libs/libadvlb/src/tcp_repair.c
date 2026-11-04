@@ -151,25 +151,47 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &off, sizeof(off));
     }
 
-    /* Check kTLS state */
-    struct adlb_tls12_crypto_info_aes_gcm_128 tx128;
-    socklen_t klen = sizeof(tx128);
-    if (getsockopt(sock_fd, SOL_TLS, TLS_TX, &tx128, &klen) == 0) {
+    /* Check kTLS state (supports both AES-128 and AES-256 GCM) */
+    union {
+        struct adlb_tls_crypto_info info;
+        struct adlb_tls12_crypto_info_aes_gcm_128 gcm128;
+        struct adlb_tls12_crypto_info_aes_gcm_256 gcm256;
+    } tx_u;
+    socklen_t klen = sizeof(tx_u);
+    if (getsockopt(sock_fd, SOL_TLS, TLS_TX, &tx_u, &klen) == 0) {
         out_cp->is_ktls = true;
-        out_cp->ktls.tls_version = tx128.info.version;
-        out_cp->ktls.cipher_type = tx128.info.cipher_type;
-        memcpy(out_cp->ktls.tx_iv, tx128.iv, 8);
-        memcpy(out_cp->ktls.tx_key, tx128.key, 16);
-        memcpy(out_cp->ktls.tx_salt, tx128.salt, 4);
-        memcpy(out_cp->ktls.tx_rec_seq, tx128.rec_seq, 8);
+        out_cp->ktls.tls_version = tx_u.info.version;
+        out_cp->ktls.cipher_type = tx_u.info.cipher_type;
+        if (tx_u.info.cipher_type == KTLS_CIPHER_AES_GCM_256) {
+            memcpy(out_cp->ktls.tx_iv, tx_u.gcm256.iv, 8);
+            memcpy(out_cp->ktls.tx_key, tx_u.gcm256.key, 32);
+            memcpy(out_cp->ktls.tx_salt, tx_u.gcm256.salt, 4);
+            memcpy(out_cp->ktls.tx_rec_seq, tx_u.gcm256.rec_seq, 8);
+        } else {
+            memcpy(out_cp->ktls.tx_iv, tx_u.gcm128.iv, 8);
+            memcpy(out_cp->ktls.tx_key, tx_u.gcm128.key, 16);
+            memcpy(out_cp->ktls.tx_salt, tx_u.gcm128.salt, 4);
+            memcpy(out_cp->ktls.tx_rec_seq, tx_u.gcm128.rec_seq, 8);
+        }
 
-        struct adlb_tls12_crypto_info_aes_gcm_128 rx128;
-        klen = sizeof(rx128);
-        if (getsockopt(sock_fd, SOL_TLS, TLS_RX, &rx128, &klen) == 0) {
-            memcpy(out_cp->ktls.rx_iv, rx128.iv, 8);
-            memcpy(out_cp->ktls.rx_key, rx128.key, 16);
-            memcpy(out_cp->ktls.rx_salt, rx128.salt, 4);
-            memcpy(out_cp->ktls.rx_rec_seq, rx128.rec_seq, 8);
+        union {
+            struct adlb_tls_crypto_info info;
+            struct adlb_tls12_crypto_info_aes_gcm_128 gcm128;
+            struct adlb_tls12_crypto_info_aes_gcm_256 gcm256;
+        } rx_u;
+        klen = sizeof(rx_u);
+        if (getsockopt(sock_fd, SOL_TLS, TLS_RX, &rx_u, &klen) == 0) {
+            if (rx_u.info.cipher_type == KTLS_CIPHER_AES_GCM_256) {
+                memcpy(out_cp->ktls.rx_iv, rx_u.gcm256.iv, 8);
+                memcpy(out_cp->ktls.rx_key, rx_u.gcm256.key, 32);
+                memcpy(out_cp->ktls.rx_salt, rx_u.gcm256.salt, 4);
+                memcpy(out_cp->ktls.rx_rec_seq, rx_u.gcm256.rec_seq, 8);
+            } else {
+                memcpy(out_cp->ktls.rx_iv, rx_u.gcm128.iv, 8);
+                memcpy(out_cp->ktls.rx_key, rx_u.gcm128.key, 16);
+                memcpy(out_cp->ktls.rx_salt, rx_u.gcm128.salt, 4);
+                memcpy(out_cp->ktls.rx_rec_seq, rx_u.gcm128.rec_seq, 8);
+            }
         }
     }
     return true;

@@ -19,6 +19,7 @@ int connect_nonblocking_transparent(const char *ip, int port, const struct socka
 int create_tcp_server_socket(int port);
 int create_udp_server_socket(int port);
 void increase_fd_limit(void);
+void get_client_ip_port(const struct sockaddr_storage *ss, char *ip_buf, size_t ip_len, int *port);
 
 #endif /* ADVLB_NET_UTILS_H */
 

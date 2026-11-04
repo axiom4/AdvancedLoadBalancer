@@ -154,21 +154,6 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
  * WORKER POOL ARCHITECTURE (Epoll Event-Loop per Worker)
  * ============================================================================ */
 
-static inline void get_client_ip_port(const struct sockaddr_storage *ss, char *ip_buf, size_t ip_len, int *port) {
-    if (ss && ss->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
-        inet_ntop(AF_INET6, &sin6->sin6_addr, ip_buf, (socklen_t)ip_len);
-        if (port) *port = ntohs(sin6->sin6_port);
-    } else if (ss && ss->ss_family == AF_INET) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
-        inet_ntop(AF_INET, &sin->sin_addr, ip_buf, (socklen_t)ip_len);
-        if (port) *port = ntohs(sin->sin_port);
-    } else {
-        snprintf(ip_buf, ip_len, "unknown");
-        if (port) *port = 0;
-    }
-}
-
 static inline bool has_connection_close_header(const char *buf, size_t len) {
     if (!buf || len < 8) return false;
     size_t scan_len = (len < 1024) ? len : 1024;
@@ -894,6 +879,16 @@ static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *con
         int acc_res = SSL_accept(conn->client_ssl);
         if (acc_res > 0) {
             conn->last_activity = time(NULL);
+#if defined(BIO_get_ktls_send) && defined(BIO_get_ktls_recv)
+            BIO *wb = SSL_get_wbio(conn->client_ssl);
+            BIO *rb = SSL_get_rbio(conn->client_ssl);
+            bool ktls_tx = wb && BIO_get_ktls_send(wb);
+            bool ktls_rx = rb && BIO_get_ktls_recv(rb);
+            add_log("\033[1;34m[TLS ACCEPT]\033[0m Handshake ok: %s | kTLS: TX=%s, RX=%s",
+                    SSL_get_cipher_name(conn->client_ssl),
+                    ktls_tx ? "\033[1;32mON\033[0m" : "\033[1;33mOFF\033[0m",
+                    ktls_rx ? "\033[1;32mON\033[0m" : "\033[1;33mOFF\033[0m");
+#endif
             worker_start_backend_connect(worker, conn);
             return;
         }
@@ -1468,7 +1463,7 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
         worker_update_conn_epoll(worker, conn);
         worker_handle_forwarding_io(worker, conn, conn->backend_fd, EPOLLIN);
     } else {
-        if (conn->initial_req_len > 0) {
+        if (conn->initial_req_len > 0 && conn->bytes_to_client == 0) {
             memcpy(buffer_write_ptr(&conn->c2b), conn->initial_req, conn->initial_req_len);
             buffer_produce(&conn->c2b, conn->initial_req_len);
             conn->skip_backend_bytes = conn->bytes_to_client;
