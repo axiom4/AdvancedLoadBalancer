@@ -267,12 +267,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m bind failed: %s (errno %d)", strerror(errno), errno);
     }
 
-    socklen_t rem_len = (cp->remote_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-    if (connect(s, (const struct sockaddr *)&cp->remote_addr, rem_len) < 0 && errno != EINPROGRESS) {
-        add_log("\033[1;31m[HA RESTORE ERR]\033[0m connect failed: %s (errno %d)", strerror(errno), errno);
-    }
-
-    /* Set Sequence numbers */
+    /* Set Sequence numbers while socket is in TCP_CLOSE (mandatory for Linux TCP_REPAIR) */
     int q = TCP_SEND_QUEUE;
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
     if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->snd_seq, sizeof(cp->snd_seq)) < 0) {
@@ -283,6 +278,12 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
     if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->rcv_seq, sizeof(cp->rcv_seq)) < 0) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m set rcv_seq failed: %s (errno %d)", strerror(errno), errno);
+    }
+
+    /* Connect in repair mode transitions TCP_CLOSE -> TCP_ESTABLISHED */
+    socklen_t rem_len = (cp->remote_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+    if (connect(s, (const struct sockaddr *)&cp->remote_addr, rem_len) < 0 && errno != EINPROGRESS) {
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m connect failed: %s (errno %d)", strerror(errno), errno);
     }
 
     /* kTLS restore */
