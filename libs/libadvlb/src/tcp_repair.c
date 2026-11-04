@@ -149,6 +149,9 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         slen = sizeof(out_cp->rcv_seq);
         getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->rcv_seq, &slen);
 
+        int no_q = TCP_NO_QUEUE;
+        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
+
         int off = 0;
         setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &off, sizeof(off));
     }
@@ -313,8 +316,14 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         }
     }
 
+    int no_q = TCP_NO_QUEUE;
+    setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
+
     int off = 0;
-    setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off));
+    if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
+        int err = errno;
+        fprintf(stderr, "[TCP_REPAIR ERR] Failed to disable TCP_REPAIR: %s (errno %d)\n", strerror(err), err);
+    }
     set_nonblocking(s);
     return s;
 #else

@@ -1467,6 +1467,7 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
         worker_update_conn_epoll(worker, conn);
         worker_handle_forwarding_io(worker, conn, conn->backend_fd, EPOLLIN);
     } else {
+        conn->fds_replicated = true;
         if (conn->backend_idx >= 0) {
             release_backend(conn->backend_idx);
             conn->backend_idx = -1;
