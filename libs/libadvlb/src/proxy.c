@@ -339,7 +339,7 @@ static ProxyConnection *worker_get_fd(WorkerThread *worker, int fd);
 static void worker_clear_fd(WorkerThread *worker, int fd);
 static void worker_add_conn(WorkerThread *worker, ProxyConnection *conn);
 static void worker_remove_conn(WorkerThread *worker, ProxyConnection *conn);
-static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn);
+static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const char *reason);
 static void worker_update_conn_epoll(WorkerThread *worker, ProxyConnection *conn);
 static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *conn);
 static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *conn);
@@ -410,7 +410,7 @@ static void worker_remove_conn(WorkerThread *worker, ProxyConnection *conn) {
     worker->active_conn_count--;
 }
 
-static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
+static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const char *reason) {
     char client_ip[INET6_ADDRSTRLEN];
     int client_port = 0;
     get_client_ip_port(&conn->client_addr, client_ip, sizeof(client_ip), &client_port);
@@ -464,6 +464,8 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
             conn->client_ssl = NULL;
         } else if (!preserve_for_failover && g_config.enable_ssl_offloading) {
             /* Send TLS close_notify alert over kTLS socket so peer terminates cleanly */
+            add_log("\033[1;33m[HA CLOSE]\033[0m ktls_send_close_notify fd=%d (reason: %s)",
+                    conn->client_fd, reason ? reason : "unspecified");
             ktls_send_close_notify(conn->client_fd);
         }
         if (!preserve_for_failover) {
@@ -487,9 +489,9 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         }
     }
 
-    add_log("\033[1;30m[DISC]\033[0m Connection %s for client %s:%d",
+    add_log("\033[1;30m[DISC]\033[0m Connection %s for client %s:%d (reason: %s)",
             preserve_for_failover ? "handed over to HA peer" : "closed",
-            client_ip, client_port);
+            client_ip, client_port, reason ? reason : "unspecified");
 
     worker_remove_conn(worker, conn);
     worker_free_conn(worker, conn);
@@ -607,7 +609,7 @@ static void worker_on_backend_connected(WorkerThread *worker, ProxyConnection *c
                 return;
             }
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "backend_write_err_on_connect");
             return;
         } else {
             break;
@@ -715,7 +717,7 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
 
     add_log("\033[1;31m[DROP]\033[0m No healthy backend available for %s:%d", client_ip, client_port);
     conn->had_error = true;
-    worker_close_conn(worker, conn);
+    worker_close_conn(worker, conn, "no_healthy_backend");
 }
 
 static bool worker_apply_l7_session_affinity(WorkerThread *worker, ProxyConnection *conn) {
@@ -816,7 +818,7 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
     if (fd == conn->client_fd) {
         if (events & EPOLLERR) {
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "backend_connecting_client_epollerr");
             return;
         }
         if (events & (EPOLLIN | EPOLLHUP)) {
@@ -843,7 +845,7 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
                     break;
                 } else if (r < 0) {
                     conn->had_error = true;
-                    worker_close_conn(worker, conn);
+                    worker_close_conn(worker, conn, "backend_connecting_client_read_err");
                     return;
                 } else {
                     break;
@@ -927,7 +929,7 @@ static void worker_step_ssl_handshake(WorkerThread *worker, ProxyConnection *con
         }
 
         conn->had_error = true;
-        worker_close_conn(worker, conn);
+        worker_close_conn(worker, conn, "ssl_handshake_failed");
         return;
     }
 }
@@ -990,7 +992,7 @@ static bool worker_pump_cluster_b2c(WorkerThread *worker, ProxyConnection *conn,
                 break;
             } else {
                 conn->had_error = true;
-                worker_close_conn(worker, conn);
+                worker_close_conn(worker, conn, "pump_client_write_err");
                 return false;
             }
         } else if (peeked == 0) {
@@ -1020,7 +1022,7 @@ static bool worker_pump_cluster_b2c(WorkerThread *worker, ProxyConnection *conn,
                 return false;
             }
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "pump_backend_recv_err");
             return false;
         }
     }
@@ -1053,11 +1055,12 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                     buffer_produce(&conn->c2b, (size_t)r);
                     conn->last_activity = now;
                 } else if (r == 0 && !want_io) {
+                    add_log("\033[1;33m[HA EOF]\033[0m Client closed connection on fd=%d", conn->client_fd);
                     conn->client_closed = true;
                     break;
                 } else if (r < 0) {
                     conn->had_error = true;
-                    worker_close_conn(worker, conn);
+                    worker_close_conn(worker, conn, "client_read_err");
                     return;
                 } else {
                     break;
@@ -1094,13 +1097,13 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                     conn->last_activity = now;
                 } else if (w < 0) {
                     conn->had_error = true;
-                    worker_close_conn(worker, conn);
+                    worker_close_conn(worker, conn, "client_write_err");
                     return;
                 } else {
                     break;
                 }
             }
-            if (g_config.enable_cluster && !conn->client_ssl && conn->client_want_write) {
+            if (g_config.enable_cluster && !g_config.enable_ssl_offloading && !conn->client_ssl && conn->client_want_write) {
                 conn->client_want_write = false;
                 if (!worker_pump_cluster_b2c(worker, conn, now)) {
                     return;
@@ -1110,7 +1113,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
 
         if (events & EPOLLERR) {
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "client_epollerr");
             return;
         }
     }
@@ -1118,7 +1121,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Events on BACKEND socket
     if (fd == conn->backend_fd) {
         if (events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
-            if (g_config.enable_cluster && !conn->client_ssl && buffer_available(&conn->b2c) == 0) {
+            if (g_config.enable_cluster && !g_config.enable_ssl_offloading && !conn->client_ssl && buffer_available(&conn->b2c) == 0) {
                 if (!worker_pump_cluster_b2c(worker, conn, now)) {
                     return;
                 }
@@ -1156,6 +1159,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                             worker_retry_backend_connect(worker, conn);
                             return;
                         }
+                        add_log("\033[1;33m[HA EOF]\033[0m Backend closed connection on fd=%d", conn->backend_fd);
                         conn->backend_closed = true;
                         break;
                     } else if (r < 0) {
@@ -1172,7 +1176,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                             conn->backend_closed = true;
                             break;
                         }
-                        worker_close_conn(worker, conn);
+                        worker_close_conn(worker, conn, "backend_read_err");
                         return;
                     } else {
                         break;
@@ -1201,7 +1205,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                         return;
                     }
                     conn->had_error = true;
-                    worker_close_conn(worker, conn);
+                    worker_close_conn(worker, conn, "backend_write_err");
                     return;
                 } else {
                     break;
@@ -1219,7 +1223,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                 return;
             }
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "backend_epollerr");
             return;
         }
     }
@@ -1244,7 +1248,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                 return;
             }
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "c2b_flush_err");
             return;
         } else {
             break;
@@ -1263,7 +1267,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
             conn->last_activity = now;
         } else if (w < 0) {
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "b2c_flush_err");
             return;
         } else {
             break;
@@ -1274,7 +1278,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // (allows Keep-Alive backend socket to be cleanly pooled or closed gracefully)
     if (conn->client_closed &&
         buffer_available(&conn->c2b) == 0 && buffer_available(&conn->b2c) == 0) {
-        worker_close_conn(worker, conn);
+        worker_close_conn(worker, conn, "client_closed_and_drained");
         return;
     }
 
@@ -1284,6 +1288,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
         conn->backend_shut_wr = true;
     }
     if (conn->backend_closed && buffer_available(&conn->b2c) == 0 && !conn->client_shut_wr) {
+        add_log("\033[1;33m[HA HALF-CLOSE]\033[0m backend_closed=true, shutting down client_fd=%d SHUT_WR", conn->client_fd);
         if (conn->client_ssl) {
             SSL_shutdown(conn->client_ssl);
         } else if (conn->client_fd >= 0) {
@@ -1295,7 +1300,7 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // If both closed and buffers drained, terminate connection gracefully
     if (conn->client_closed && conn->backend_closed &&
         buffer_available(&conn->c2b) == 0 && buffer_available(&conn->b2c) == 0) {
-        worker_close_conn(worker, conn);
+        worker_close_conn(worker, conn, "both_closed_and_drained");
         return;
     }
 
@@ -1322,15 +1327,15 @@ static void worker_check_timeouts(WorkerThread *worker) {
             add_log("\033[1;33m[TIMEOUT]\033[0m Connection closed due to inactivity (>%ds) Slowloris protection",
                     timeout_sec);
             curr->had_error = true;
-            worker_close_conn(worker, curr);
+            worker_close_conn(worker, curr, "inactivity_timeout");
         } else if (curr->state == CONN_STATE_PROXY_PROTOCOL && (now - curr->last_activity >= 3)) {
             add_log("\033[1;33m[TIMEOUT]\033[0m PROXY protocol header timeout (>3s) Slowloris protection");
             curr->had_error = true;
-            worker_close_conn(worker, curr);
+            worker_close_conn(worker, curr, "proxy_protocol_timeout");
         } else if (curr->state == CONN_STATE_SSL_HANDSHAKE && (now - curr->hs_start >= 5)) {
             add_log("\033[1;33m[TIMEOUT]\033[0m SSL handshake timeout (>5s)");
             curr->had_error = true;
-            worker_close_conn(worker, curr);
+            worker_close_conn(worker, curr, "ssl_handshake_timeout");
         } else if (curr->state == CONN_STATE_BACKEND_CONNECTING && (now - curr->last_activity >= 2)) {
             add_log("\033[1;33m[TIMEOUT]\033[0m Backend connect timeout (>2s)");
             if (curr->backend_idx >= 0) {
@@ -1389,7 +1394,7 @@ static void worker_accept_connection(WorkerThread *worker, int client_fd, const 
         } else {
             add_log("\033[1;31m[PPv1 ERR]\033[0m Connection rejected: missing or invalid PROXY v1 header");
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "missing_or_invalid_pp");
             return;
         }
     }
@@ -1398,7 +1403,7 @@ static void worker_accept_connection(WorkerThread *worker, int client_fd, const 
         conn->client_ssl = SSL_new(g_global_ssl_ctx);
         if (!conn->client_ssl) {
             conn->had_error = true;
-            worker_close_conn(worker, conn);
+            worker_close_conn(worker, conn, "ssl_new_failed");
             return;
         }
         SSL_set_fd(conn->client_ssl, client_fd);
@@ -1528,7 +1533,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
                                             (uint64_t)c->bytes_to_client);
                 c->handed_over = true;
             }
-            worker_close_conn(worker, c);
+            worker_close_conn(worker, c, "failover_handover");
             c = next;
         }
         atomic_store_explicit(&worker->handover_done, true, memory_order_release);
@@ -1585,14 +1590,14 @@ static void *worker_event_loop(void *arg) {
                                 c->bytes_to_backend += (size_t)w;
                             } else if (w < 0) {
                                 c->had_error = true;
-                                worker_close_conn(worker, c);
+                                worker_close_conn(worker, c, "ssl_pending_backend_write_err");
                                 c = next_c;
                                 continue;
                             }
                         }
                     } else if (r < 0) {
                         c->had_error = true;
-                        worker_close_conn(worker, c);
+                        worker_close_conn(worker, c, "ssl_pending_client_read_err");
                         c = next_c;
                         continue;
                     }
@@ -1644,7 +1649,7 @@ static void *worker_event_loop(void *arg) {
             if (conn->state == CONN_STATE_PROXY_PROTOCOL) {
                 if (ev_mask & EPOLLERR) {
                     conn->had_error = true;
-                    worker_close_conn(worker, conn);
+                    worker_close_conn(worker, conn, "pp_epollerr");
                     continue;
                 }
                 bool need_more = false;
@@ -1661,7 +1666,7 @@ static void *worker_event_loop(void *arg) {
                         conn->client_ssl = SSL_new(g_global_ssl_ctx);
                         if (!conn->client_ssl) {
                             conn->had_error = true;
-                            worker_close_conn(worker, conn);
+                            worker_close_conn(worker, conn, "pp_ssl_new_failed");
                             continue;
                         }
                         SSL_set_fd(conn->client_ssl, conn->client_fd);
@@ -1678,7 +1683,7 @@ static void *worker_event_loop(void *arg) {
                 } else {
                     add_log("\033[1;31m[PPv1 ERR]\033[0m Connection rejected: malformed PROXY v1 header");
                     conn->had_error = true;
-                    worker_close_conn(worker, conn);
+                    worker_close_conn(worker, conn, "malformed_pp_header");
                 }
             } else if (conn->state == CONN_STATE_SSL_HANDSHAKE) {
                 worker_step_ssl_handshake(worker, conn);
@@ -1727,7 +1732,7 @@ static void *worker_event_loop(void *arg) {
 
     // Shutdown cleanup of active connections
     while (worker->conn_list_head) {
-        worker_close_conn(worker, worker->conn_list_head);
+        worker_close_conn(worker, worker->conn_list_head, "worker_cleanup");
     }
 
     // Drain worker local slab pool
