@@ -1412,6 +1412,15 @@ static void worker_accept_connection(WorkerThread *worker, int client_fd, const 
     int flag = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    if (g_config.enable_cluster) {
+        const char *vip_iface = cluster_get_active_vip_iface();
+        if (vip_iface && vip_iface[0] != '\0') {
+            setsockopt(client_fd, SOL_SOCKET, SO_BINDTODEVICE, vip_iface, (socklen_t)(strlen(vip_iface) + 1));
+        }
+    }
+#endif
+
     ProxyConnection *conn = worker_alloc_conn(worker);
     if (!conn) {
         close(client_fd);

@@ -636,36 +636,6 @@ static void broadcast_active_vip_garp(void) {
     }
 }
 
-static __attribute__((unused)) void install_vip_rst_filter(const char *parent_iface, const char *vip) {
-#ifdef __linux__
-    if (geteuid() != 0 || !parent_iface || !vip || parent_iface[0] == '\0' || vip[0] == '\0') return;
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "iptables -C OUTPUT -o %.31s -p tcp -s %.45s --tcp-flags RST RST -j DROP >/dev/null 2>&1 || "
-             "iptables -I OUTPUT -o %.31s -p tcp -s %.45s --tcp-flags RST RST -j DROP >/dev/null 2>&1 || true",
-             parent_iface, vip, parent_iface, vip);
-    int rc = system(cmd);
-    (void)rc;
-#else
-    (void)parent_iface;
-    (void)vip;
-#endif
-}
-
-static void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
-#ifdef __linux__
-    if (geteuid() != 0 || !parent_iface || !vip || parent_iface[0] == '\0' || vip[0] == '\0') return;
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "iptables -D OUTPUT -o %.31s -p tcp -s %.45s --tcp-flags RST RST -j DROP >/dev/null 2>&1 || true",
-             parent_iface, vip);
-    int rc = system(cmd);
-    (void)rc;
-#else
-    (void)parent_iface;
-    (void)vip;
-#endif
-}
 
 static void disarm_vip_cleanup_guard(void) {
     if (s_vip_guard_pipe[1] >= 0) {
@@ -917,7 +887,6 @@ static void acquire_virtual_ip(void) {
                     int prc = system(cmd);
                     (void)prc;
                 }
-                install_vip_rst_filter(iface, clean_vip);
             } else {
                 /* Fallback if macvlan kernel module is unavailable: labeled IP alias without altering parent MAC */
                 snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "%.63s", iface);
@@ -1038,7 +1007,6 @@ static void release_virtual_ip(void) {
             int rc = system(cmd);
             (void)rc;
         }
-        install_vip_rst_filter(g_config.vip_interface, clean_vip);
 #endif
         s_vip_bound_kernel = false;
     }
@@ -2388,7 +2356,6 @@ bool cluster_start(void) {
                 if (s_iface_primary_ip[0] != '\0' && s_saved_orig_mac[0] != '\0') {
                     send_vrrp_garp_on_iface(parent_iface, s_iface_primary_ip, s_saved_orig_mac);
                 }
-                install_vip_rst_filter(parent_iface, clean_vip);
             }
 #endif
         }
@@ -2509,12 +2476,6 @@ void cluster_stop(void) {
     if (s_wakeup_pipe[1] >= 0) {
         close(s_wakeup_pipe[1]);
         s_wakeup_pipe[1] = -1;
-    }
-
-    char clean_vip[64] = {0};
-    int prefix = 32;
-    if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
-        remove_vip_rst_filter(g_config.vip_interface, clean_vip);
     }
 
     atomic_store(&s_vrrp_state, VRRP_STATE_DISABLED);

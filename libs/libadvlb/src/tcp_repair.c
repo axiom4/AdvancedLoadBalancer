@@ -1,4 +1,5 @@
 #include "advlb/tcp_repair.h"
+#include "advlb/cluster.h"
 #include "advlb/net_utils.h"
 #include "advlb/log.h"
 #include <stdio.h>
@@ -376,6 +377,12 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #ifdef SO_REUSEPORT
     setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+#ifdef SO_BINDTODEVICE
+    const char *vip_iface = cluster_get_active_vip_iface();
+    if (vip_iface && vip_iface[0] != '\0') {
+        setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, vip_iface, (socklen_t)(strlen(vip_iface) + 1));
+    }
 #endif
     int one = 1;
     setsockopt(s, SOL_IP, IP_FREEBIND, &one, sizeof(one));
