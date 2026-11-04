@@ -472,7 +472,17 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const
             shutdown(conn->client_fd, SHUT_WR);
         } else {
 #ifdef __linux__
-            /* Enable TCP_REPAIR before close so kernel frees 4-tuple immediately without RST/FIN or TIME_WAIT */
+            /* Drain any pending bytes from receive queue so data_was_unread == 0 in tcp_close() */
+            char drain_buf[2048];
+            while (recv(conn->client_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0);
+
+            /* Clear any pending socket error before TCP_REPAIR so sk->sk_err is 0 */
+            int so_err = 0;
+            socklen_t so_err_len = sizeof(so_err);
+            getsockopt(conn->client_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
+
+            /* Enable TCP_REPAIR mode with TCP_NO_QUEUE: Linux tcp_close() checks sk->sk_repair
+             * and cleanly runs sk_prot->disconnect(sk, 0), freeing descriptor with ZERO RST/FIN emitted */
             int repair_on = 1;
             if (setsockopt(conn->client_fd, 6 /* SOL_TCP */, 19 /* TCP_REPAIR */, &repair_on, sizeof(repair_on)) < 0) {
                 add_log("\033[1;33m[HA CLOSE]\033[0m setsockopt TCP_REPAIR before close: %s (errno %d, fd=%d)",
@@ -481,11 +491,9 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const
             int no_q = 0; /* TCP_NO_QUEUE */
             setsockopt(conn->client_fd, 6 /* SOL_TCP */, 20 /* TCP_REPAIR_QUEUE */, &no_q, sizeof(no_q));
 
-            /* Disconnect socket cleanly to TCP_CLOSE state before closing descriptor */
-            struct sockaddr sa_unspec;
-            memset(&sa_unspec, 0, sizeof(sa_unspec));
-            sa_unspec.sa_family = AF_UNSPEC;
-            connect(conn->client_fd, &sa_unspec, sizeof(sa_unspec));
+            /* Clear SO_ERROR again to guarantee clean closure without abort */
+            so_err = 0;
+            getsockopt(conn->client_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
 #endif
         }
         close(conn->client_fd);

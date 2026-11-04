@@ -708,6 +708,7 @@ static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
     snprintf(info.name, sizeof(info.name), "filter");
     socklen_t in_len = sizeof(info);
     if (getsockopt(s, IPPROTO_IP, IPT_SO_GET_INFO, &info, &in_len) < 0) {
+        add_log("\033[1;33m[HA RST FILTER]\033[0m IPT_SO_GET_INFO error: %s (errno %d)", strerror(errno), errno);
         close(s);
         return;
     }
@@ -776,7 +777,11 @@ static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
     memcpy(dst + ins_off, &rule, rule_size);
     memcpy(dst + ins_off + rule_size, (char *)entries->entrytable + ins_off, info.size - ins_off);
 
-    setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size));
+    if (setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size)) < 0) {
+        add_log("\033[1;33m[HA RST FILTER]\033[0m IPT_SO_SET_REPLACE error: %s (errno %d)", strerror(errno), errno);
+    } else {
+        add_log("\033[1;32m[HA RST FILTER]\033[0m Injected kernel Netfilter RST drop rule on %s for %s", parent_iface, vip);
+    }
 
     free(repl);
     free(entries);
@@ -794,6 +799,7 @@ static void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
     snprintf(info.name, sizeof(info.name), "filter");
     socklen_t in_len = sizeof(info);
     if (getsockopt(s, IPPROTO_IP, IPT_SO_GET_INFO, &info, &in_len) < 0) {
+        add_log("\033[1;33m[HA RST FILTER]\033[0m IPT_SO_GET_INFO error: %s (errno %d)", strerror(errno), errno);
         close(s);
         return;
     }
@@ -863,7 +869,11 @@ static void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
     memcpy(dst, entries->entrytable, rem_off);
     memcpy(dst + rem_off, (char *)entries->entrytable + rem_off + rem_size, info.size - (rem_off + rem_size));
 
-    setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size));
+    if (setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size)) < 0) {
+        add_log("\033[1;33m[HA RST FILTER]\033[0m IPT_SO_SET_REPLACE error: %s (errno %d)", strerror(errno), errno);
+    } else {
+        add_log("\033[1;32m[HA RST FILTER]\033[0m Injected kernel Netfilter RST drop rule on %s for %s", parent_iface, vip);
+    }
 
     free(repl);
     free(entries);
