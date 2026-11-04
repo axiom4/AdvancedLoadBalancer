@@ -831,6 +831,8 @@ static void test_cluster_vrrp_and_session_sync(void) {
                 "Virtual IP (127.0.0.250) marked ACTIVE upon becoming VRRP MASTER");
     TEST_ASSERT(strcmp(cluster_get_active_vmac(), "00:00:5e:00:01:4d") == 0,
                 "Active VRRP Virtual MAC matches RFC 5798 00:00:5e:00:01:4d for VRID 77 (0x4D)");
+    TEST_ASSERT(strcmp(cluster_get_active_vip_iface(), "vrrp77") == 0,
+                "Active VRRP interface is isolated on virtual interface vrrp77 (vrrp<VRID>)");
 
     /* Verify RFC 5798 VMAC formatting and Gratuitous ARP Ethernet frame generation */
     char vmac51[32] = {0};
