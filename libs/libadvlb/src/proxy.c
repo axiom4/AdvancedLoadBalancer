@@ -653,7 +653,13 @@ static void worker_start_backend_connect(WorkerThread *worker, ProxyConnection *
         epoll_ctl(worker->epfd, EPOLL_CTL_ADD, conn->client_fd, &ev);
     }
 
+    conn->bytes_to_backend = 0;
+    conn->bytes_from_backend = 0;
+
     int max_retries = (g_num_backends > 1) ? (g_num_backends * 2) : 2;
+    if (conn->retry_count >= max_retries) {
+        conn->retry_count = 0;
+    }
     while (conn->retry_count < max_retries) {
         conn->retry_count++;
         int b_idx = get_healthy_backend(&conn->client_addr);
@@ -1043,6 +1049,12 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                 ssize_t r = nonblocking_read(conn->client_fd, conn->client_ssl,
                                              wptr, space, &want_io);
                 if (r > 0) {
+                    if (conn->c2b.head == 0 && conn->c2b.tail == 0 && buffer_available(&conn->b2c) == 0) {
+                        /* Start of new HTTP request transaction on keep-alive stream */
+                        conn->bytes_to_backend = 0;
+                        conn->bytes_from_backend = 0;
+                        conn->retry_count = 0;
+                    }
                     if (conn->c2b.tail == 0 && has_connection_close_header(wptr, (size_t)r)) {
                         conn->keep_alive_eligible = false;
                     }
@@ -1059,6 +1071,9 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                     conn->client_closed = true;
                     break;
                 } else if (r < 0) {
+                    int r_err = errno;
+                    add_log("\033[1;31m[HA ERR]\033[0m Client read error on fd=%d: %s (errno %d)",
+                            conn->client_fd, strerror(r_err), r_err);
                     conn->had_error = true;
                     worker_close_conn(worker, conn, "client_read_err");
                     return;
@@ -1265,6 +1280,10 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
             buffer_consume(&conn->b2c, (size_t)w);
             conn->bytes_to_client += (size_t)w;
             conn->last_activity = now;
+#ifdef TCP_QUICKACK
+            int qack = 1;
+            setsockopt(conn->client_fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+#endif
         } else if (w < 0) {
             conn->had_error = true;
             worker_close_conn(worker, conn, "b2c_flush_err");
@@ -1475,7 +1494,9 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
     conn->keep_alive_eligible = true;
     conn->l7_session_checked = true;
     conn->bytes_to_client = (size_t)node->bytes_to_client;
-    conn->bytes_from_backend = (size_t)node->bytes_to_client;
+    conn->bytes_from_backend = 0;
+    conn->bytes_to_backend = 0;
+    conn->retry_count = 0;
     conn->last_replicated_bytes = conn->bytes_to_client;
 
     if (node->req_len > 0) {
@@ -1513,7 +1534,7 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
         worker_update_conn_epoll(worker, conn);
         worker_handle_forwarding_io(worker, conn, conn->backend_fd, EPOLLIN);
     } else {
-        conn->fds_replicated = true;
+        conn->fds_replicated = false;
         if (conn->backend_idx >= 0) {
             release_backend(conn->backend_idx);
             conn->backend_idx = -1;
@@ -1522,11 +1543,16 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
             memcpy(buffer_write_ptr(&conn->c2b), conn->initial_req, conn->initial_req_len);
             buffer_produce(&conn->c2b, conn->initial_req_len);
             conn->skip_backend_bytes = 0;
+            conn->retry_count = 0;
             worker_start_backend_connect(worker, conn);
         } else {
             /* Client is idle in Keep-Alive waiting for the next request */
             conn->skip_backend_bytes = 0;
-            worker_start_backend_connect(worker, conn);
+            conn->retry_count = 0;
+            conn->state = CONN_STATE_FORWARDING;
+            worker_update_conn_epoll(worker, conn);
+            add_log("\033[1;32m[HA MIGRATED]\033[0m Adopted idle Keep-Alive stream %s:%d (Worker %d)",
+                    client_ip, client_port, worker->id);
         }
     }
 }

@@ -1171,9 +1171,12 @@ static void test_tcp_repair_and_ktls_wire_sync(void) {
     cp.rcv_seq = 50006000;
     cp.snd_wnd = 65535;
     cp.rcv_wnd = 32768;
+    cp.max_window = 131072;
+    cp.snd_wl1 = 50006000;
+    cp.rcv_wup = 50006000;
     cp.mss_clamp = 1460;
     cp.snd_wscale = 7;
-    cp.rcv_wscale = 7;
+    cp.rcv_wscale = 8;
     cp.has_timestamps = true;
     cp.ts_val = 1234567;
     cp.ts_ecr = 7654321;
@@ -1213,6 +1216,9 @@ static void test_tcp_repair_and_ktls_wire_sync(void) {
     TEST_ASSERT(bytes == 1048576, "Stream bytes to client preserved across wire");
     TEST_ASSERT(req_len == strlen(test_req) && strcmp(req, test_req) == 0, "Initial HTTP request preserved");
     TEST_ASSERT(restored_cp.snd_seq == 10002000 && restored_cp.rcv_seq == 50006000, "TCP sequence numbers match byte-for-byte");
+    TEST_ASSERT(restored_cp.snd_wnd == 65535 && restored_cp.rcv_wnd == 32768, "TCP sliding window sizes preserved");
+    TEST_ASSERT(restored_cp.max_window == 131072, "TCP max_window preserved");
+    TEST_ASSERT(restored_cp.snd_wscale == 7 && restored_cp.rcv_wscale == 8, "TCP window scales preserved without inversion");
     TEST_ASSERT(restored_cp.is_ktls == true, "Restored socket checkpoint retains is_ktls = true");
     TEST_ASSERT(restored_cp.ktls.tls_version == KTLS_VERSION_1_3, "kTLS version TLS 1.3 preserved");
     TEST_ASSERT(restored_cp.ktls.cipher_type == KTLS_CIPHER_AES_GCM_256, "kTLS cipher AES-GCM-256 preserved");

@@ -37,6 +37,9 @@ typedef struct {
     uint32_t rcv_seq;
     uint32_t snd_wnd;
     uint32_t rcv_wnd;
+    uint32_t max_window;
+    uint32_t snd_wl1;
+    uint32_t rcv_wup;
     uint32_t mss_clamp;
     uint8_t  snd_wscale;
     uint8_t  rcv_wscale;
@@ -64,6 +67,9 @@ typedef struct __attribute__((packed)) {
     uint32_t rcv_seq;         /* Network byte order */
     uint32_t snd_wnd;         /* Network byte order */
     uint32_t rcv_wnd;         /* Network byte order */
+    uint32_t max_window;      /* Network byte order */
+    uint32_t snd_wl1;         /* Network byte order */
+    uint32_t rcv_wup;         /* Network byte order */
     uint32_t mss_clamp;       /* Network byte order */
     uint8_t  snd_wscale;
     uint8_t  rcv_wscale;

@@ -75,6 +75,14 @@ struct adlb_tcp_repair_opt {
     uint32_t opt_val;
 };
 
+struct adlb_tcp_repair_window {
+    uint32_t snd_wl1;
+    uint32_t snd_wnd;
+    uint32_t max_window;
+    uint32_t rcv_wnd;
+    uint32_t rcv_wup;
+};
+
 struct adlb_tls_crypto_info {
     uint16_t version;
     uint16_t cipher_type;
@@ -186,8 +194,6 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         out_cp->snd_wscale = ti.tcpi_snd_wscale;
         out_cp->rcv_wscale = ti.tcpi_rcv_wscale;
         out_cp->mss_clamp = ti.tcpi_snd_mss;
-        out_cp->snd_wnd = ti.tcpi_snd_cwnd;
-        out_cp->rcv_wnd = ti.tcpi_rcv_space;
     }
 
     int on = 1;
@@ -201,6 +207,16 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
         slen = sizeof(out_cp->rcv_seq);
         getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->rcv_seq, &slen);
+
+        struct adlb_tcp_repair_window wnd;
+        socklen_t wlen = sizeof(wnd);
+        if (getsockopt(sock_fd, SOL_TCP, TCP_REPAIR_WINDOW, &wnd, &wlen) == 0) {
+            out_cp->snd_wl1 = wnd.snd_wl1;
+            out_cp->snd_wnd = wnd.snd_wnd;
+            out_cp->max_window = wnd.max_window;
+            out_cp->rcv_wnd = wnd.rcv_wnd;
+            out_cp->rcv_wup = wnd.rcv_wup;
+        }
 
         int no_q = TCP_NO_QUEUE;
         setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
@@ -284,7 +300,11 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     }
     if (cp->snd_wscale > 0 || cp->rcv_wscale > 0) {
         opts[nopts].opt_code = 3; /* TCPOPT_WINDOW */
-        opts[nopts].opt_val = ((uint32_t)cp->snd_wscale << 16) | (uint32_t)cp->rcv_wscale;
+        /* Linux kernel tcp_repair_options_est:
+         * u16 snd_wscale = opt.opt_val & 0xFFFF;
+         * u16 rcv_wscale = opt.opt_val >> 16;
+         * Therefore lower 16 bits MUST be snd_wscale, upper 16 bits rcv_wscale */
+        opts[nopts].opt_val = ((uint32_t)cp->rcv_wscale << 16) | (uint32_t)cp->snd_wscale;
         nopts++;
     }
     if (cp->has_timestamps) {
@@ -293,7 +313,10 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         nopts++;
     }
     for (int i = 0; i < nopts; i++) {
-        setsockopt(s, SOL_TCP, TCP_REPAIR_OPTIONS, &opts[i], sizeof(opts[i]));
+        if (setsockopt(s, SOL_TCP, TCP_REPAIR_OPTIONS, &opts[i], sizeof(opts[i])) < 0) {
+            add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_REPAIR_OPTIONS (%d) failed: %s (errno %d)",
+                    opts[i].opt_code, strerror(errno), errno);
+        }
     }
 
     int reuse = 1;
@@ -329,6 +352,23 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     socklen_t rem_len = (cp->remote_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
     if (connect(s, (const struct sockaddr *)&cp->remote_addr, rem_len) < 0 && errno != EINPROGRESS) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m connect failed: %s (errno %d)", strerror(errno), errno);
+    }
+
+    /* Restore TCP sliding window parameters */
+    struct adlb_tcp_repair_window wnd;
+    memset(&wnd, 0, sizeof(wnd));
+    wnd.snd_wnd = (cp->snd_wnd > 0) ? cp->snd_wnd : 65535;
+    wnd.max_window = (cp->max_window >= wnd.snd_wnd) ? cp->max_window : wnd.snd_wnd;
+    wnd.rcv_wnd = (cp->rcv_wnd > 0) ? cp->rcv_wnd : 65535;
+    wnd.snd_wl1 = (cp->snd_wl1 != 0) ? cp->snd_wl1 : cp->rcv_seq;
+    wnd.rcv_wup = (cp->rcv_wup != 0) ? cp->rcv_wup : cp->rcv_seq;
+
+    if (wnd.max_window < wnd.snd_wnd) wnd.max_window = wnd.snd_wnd;
+    if ((int32_t)(wnd.snd_wl1 - (cp->rcv_seq + wnd.rcv_wnd)) > 0) wnd.snd_wl1 = cp->rcv_seq;
+    if ((int32_t)(wnd.rcv_wup - cp->rcv_seq) > 0) wnd.rcv_wup = cp->rcv_seq;
+
+    if (setsockopt(s, SOL_TCP, TCP_REPAIR_WINDOW, &wnd, sizeof(wnd)) < 0) {
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_REPAIR_WINDOW failed: %s (errno %d)", strerror(errno), errno);
     }
 
     /* kTLS restore */
@@ -395,6 +435,13 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         int err = errno;
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
     }
+
+    /* Enable TCP_NODELAY and TCP_QUICKACK to avoid Nagle and delayed ACK delays */
+    int one_flag = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one_flag, sizeof(one_flag));
+#ifdef TCP_QUICKACK
+    setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &one_flag, sizeof(one_flag));
+#endif
     set_nonblocking(s);
     return s;
 #else
@@ -442,6 +489,9 @@ void tcp_checkpoint_to_wire(const TcpSocketCheckpoint *cp,
     wire->rcv_seq = htonl(cp->rcv_seq);
     wire->snd_wnd = htonl(cp->snd_wnd);
     wire->rcv_wnd = htonl(cp->rcv_wnd);
+    wire->max_window = htonl(cp->max_window);
+    wire->snd_wl1 = htonl(cp->snd_wl1);
+    wire->rcv_wup = htonl(cp->rcv_wup);
     wire->mss_clamp = htonl(cp->mss_clamp);
     wire->snd_wscale = cp->snd_wscale;
     wire->rcv_wscale = cp->rcv_wscale;
@@ -517,6 +567,9 @@ void tcp_checkpoint_from_wire(const ClusterTcpCheckpointWire *wire,
     out_cp->rcv_seq = ntohl(wire->rcv_seq);
     out_cp->snd_wnd = ntohl(wire->snd_wnd);
     out_cp->rcv_wnd = ntohl(wire->rcv_wnd);
+    out_cp->max_window = ntohl(wire->max_window);
+    out_cp->snd_wl1 = ntohl(wire->snd_wl1);
+    out_cp->rcv_wup = ntohl(wire->rcv_wup);
     out_cp->mss_clamp = ntohl(wire->mss_clamp);
     out_cp->snd_wscale = wire->snd_wscale;
     out_cp->rcv_wscale = wire->rcv_wscale;
