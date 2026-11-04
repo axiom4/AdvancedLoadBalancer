@@ -1051,6 +1051,10 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
                     break;
                 }
             }
+            if (conn->backend_fd < 0 && buffer_available(&conn->c2b) > 0) {
+                worker_start_backend_connect(worker, conn);
+                return;
+            }
             if (!conn->l7_session_checked && conn->bytes_to_backend == 0 && buffer_available(&conn->c2b) > 0) {
                 if (worker_apply_l7_session_affinity(worker, conn)) {
                     return;
@@ -1463,19 +1467,19 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
         worker_update_conn_epoll(worker, conn);
         worker_handle_forwarding_io(worker, conn, conn->backend_fd, EPOLLIN);
     } else {
+        if (conn->backend_idx >= 0) {
+            release_backend(conn->backend_idx);
+            conn->backend_idx = -1;
+        }
         if (conn->initial_req_len > 0 && conn->bytes_to_client == 0) {
             memcpy(buffer_write_ptr(&conn->c2b), conn->initial_req, conn->initial_req_len);
             buffer_produce(&conn->c2b, conn->initial_req_len);
-            conn->skip_backend_bytes = conn->bytes_to_client;
-            if (conn->backend_idx >= 0) {
-                release_backend(conn->backend_idx);
-                conn->backend_idx = -1;
-            }
+            conn->skip_backend_bytes = 0;
             worker_start_backend_connect(worker, conn);
         } else {
             /* Client is idle in Keep-Alive waiting for the next request */
-            conn->state = CONN_STATE_FORWARDING;
-            worker_update_conn_epoll(worker, conn);
+            conn->skip_backend_bytes = 0;
+            worker_start_backend_connect(worker, conn);
         }
     }
 }

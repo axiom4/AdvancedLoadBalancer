@@ -313,6 +313,11 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
 
     int off = 0;
     setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off));
+
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
     return s;
 #else
     return -1;
