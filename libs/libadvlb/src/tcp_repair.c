@@ -196,36 +196,7 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         out_cp->mss_clamp = ti.tcpi_snd_mss;
     }
 
-    int on = 1;
-    if (setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &on, sizeof(on)) == 0) {
-        int q = TCP_SEND_QUEUE;
-        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
-        socklen_t slen = sizeof(out_cp->snd_seq);
-        getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->snd_seq, &slen);
-
-        q = TCP_RECV_QUEUE;
-        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
-        slen = sizeof(out_cp->rcv_seq);
-        getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->rcv_seq, &slen);
-
-        struct adlb_tcp_repair_window wnd;
-        socklen_t wlen = sizeof(wnd);
-        if (getsockopt(sock_fd, SOL_TCP, TCP_REPAIR_WINDOW, &wnd, &wlen) == 0) {
-            out_cp->snd_wl1 = wnd.snd_wl1;
-            out_cp->snd_wnd = wnd.snd_wnd;
-            out_cp->max_window = wnd.max_window;
-            out_cp->rcv_wnd = wnd.rcv_wnd;
-            out_cp->rcv_wup = wnd.rcv_wup;
-        }
-
-        int no_q = TCP_NO_QUEUE;
-        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
-
-        int off = 0;
-        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &off, sizeof(off));
-    }
-
-    /* Check kTLS state (supports both AES-128 and AES-256 GCM) */
+    /* 1. Query kTLS state while socket is in clean operational state (before TCP_REPAIR) */
     union {
         struct adlb_tls_crypto_info info;
         struct adlb_tls12_crypto_info_aes_gcm_128 gcm128;
@@ -266,8 +237,53 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
                 memcpy(out_cp->ktls.rx_salt, rx_u.gcm128.salt, 4);
                 memcpy(out_cp->ktls.rx_rec_seq, rx_u.gcm128.rec_seq, 8);
             }
+        } else {
+            add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m getsockopt SOL_TLS TLS_RX failed: %s (errno %d)",
+                    strerror(errno), errno);
+        }
+    } else {
+        if (errno != ENOPROTOOPT && errno != EOPNOTSUPP && errno != 0) {
+            add_log("\033[1;33m[HA CHECKPOINT]\033[0m getsockopt SOL_TLS TLS_TX: %s (errno %d)",
+                    strerror(errno), errno);
         }
     }
+
+    /* 2. Query TCP sequence numbers and sliding window in TCP_REPAIR mode */
+    int on = 1;
+    if (setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &on, sizeof(on)) == 0) {
+        int q = TCP_SEND_QUEUE;
+        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
+        socklen_t slen = sizeof(out_cp->snd_seq);
+        getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->snd_seq, &slen);
+
+        q = TCP_RECV_QUEUE;
+        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
+        slen = sizeof(out_cp->rcv_seq);
+        getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->rcv_seq, &slen);
+
+        struct adlb_tcp_repair_window wnd;
+        socklen_t wlen = sizeof(wnd);
+        if (getsockopt(sock_fd, SOL_TCP, TCP_REPAIR_WINDOW, &wnd, &wlen) == 0) {
+            out_cp->snd_wl1 = wnd.snd_wl1;
+            out_cp->snd_wnd = wnd.snd_wnd;
+            out_cp->max_window = wnd.max_window;
+            out_cp->rcv_wnd = wnd.rcv_wnd;
+            out_cp->rcv_wup = wnd.rcv_wup;
+        }
+
+        int no_q = TCP_NO_QUEUE;
+        setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
+
+        int off = 0;
+        if (setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
+            add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)",
+                    strerror(errno), errno);
+        }
+    } else {
+        add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m enable TCP_REPAIR failed: %s (errno %d)",
+                strerror(errno), errno);
+    }
+
     return true;
 #else
     return true;
@@ -288,35 +304,6 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     if (setsockopt(s, SOL_TCP, TCP_REPAIR, &on, sizeof(on)) < 0) {
         close(s);
         return -1;
-    }
-
-    /* Set TCP options in repair mode */
-    struct adlb_tcp_repair_opt opts[4];
-    int nopts = 0;
-    if (cp->mss_clamp > 0) {
-        opts[nopts].opt_code = 2; /* TCPOPT_MAXSEG */
-        opts[nopts].opt_val = cp->mss_clamp;
-        nopts++;
-    }
-    if (cp->snd_wscale > 0 || cp->rcv_wscale > 0) {
-        opts[nopts].opt_code = 3; /* TCPOPT_WINDOW */
-        /* Linux kernel tcp_repair_options_est:
-         * u16 snd_wscale = opt.opt_val & 0xFFFF;
-         * u16 rcv_wscale = opt.opt_val >> 16;
-         * Therefore lower 16 bits MUST be snd_wscale, upper 16 bits rcv_wscale */
-        opts[nopts].opt_val = ((uint32_t)cp->rcv_wscale << 16) | (uint32_t)cp->snd_wscale;
-        nopts++;
-    }
-    if (cp->has_timestamps) {
-        opts[nopts].opt_code = 8; /* TCPOPT_TIMESTAMP */
-        opts[nopts].opt_val = 0;
-        nopts++;
-    }
-    for (int i = 0; i < nopts; i++) {
-        if (setsockopt(s, SOL_TCP, TCP_REPAIR_OPTIONS, &opts[i], sizeof(opts[i])) < 0) {
-            add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_REPAIR_OPTIONS (%d) failed: %s (errno %d)",
-                    opts[i].opt_code, strerror(errno), errno);
-        }
     }
 
     int reuse = 1;
@@ -352,6 +339,35 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     socklen_t rem_len = (cp->remote_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
     if (connect(s, (const struct sockaddr *)&cp->remote_addr, rem_len) < 0 && errno != EINPROGRESS) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m connect failed: %s (errno %d)", strerror(errno), errno);
+    }
+
+    /* Set TCP options in repair mode (MUST be executed after connect, when socket is TCP_ESTABLISHED) */
+    struct adlb_tcp_repair_opt opts[4];
+    int nopts = 0;
+    if (cp->mss_clamp > 0) {
+        opts[nopts].opt_code = 2; /* TCPOPT_MAXSEG */
+        opts[nopts].opt_val = cp->mss_clamp;
+        nopts++;
+    }
+    if (cp->snd_wscale > 0 || cp->rcv_wscale > 0) {
+        opts[nopts].opt_code = 3; /* TCPOPT_WINDOW */
+        /* Linux kernel tcp_repair_options_est:
+         * u16 snd_wscale = opt.opt_val & 0xFFFF;
+         * u16 rcv_wscale = opt.opt_val >> 16;
+         * Therefore lower 16 bits MUST be snd_wscale, upper 16 bits rcv_wscale */
+        opts[nopts].opt_val = ((uint32_t)cp->rcv_wscale << 16) | (uint32_t)cp->snd_wscale;
+        nopts++;
+    }
+    if (cp->has_timestamps) {
+        opts[nopts].opt_code = 8; /* TCPOPT_TIMESTAMP */
+        opts[nopts].opt_val = 0;
+        nopts++;
+    }
+    for (int i = 0; i < nopts; i++) {
+        if (setsockopt(s, SOL_TCP, TCP_REPAIR_OPTIONS, &opts[i], sizeof(opts[i])) < 0) {
+            add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_REPAIR_OPTIONS (%d) failed: %s (errno %d)",
+                    opts[i].opt_code, strerror(errno), errno);
+        }
     }
 
     /* Restore TCP sliding window parameters */
