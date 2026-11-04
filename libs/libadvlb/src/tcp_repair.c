@@ -57,6 +57,18 @@
 #ifndef TLS_SET_RECORD_TYPE
 #define TLS_SET_RECORD_TYPE 1
 #endif
+#ifndef IP_FREEBIND
+#define IP_FREEBIND 15
+#endif
+#ifndef IPV6_FREEBIND
+#define IPV6_FREEBIND 78
+#endif
+#ifndef IP_TRANSPARENT
+#define IP_TRANSPARENT 19
+#endif
+#ifndef IPV6_TRANSPARENT
+#define IPV6_TRANSPARENT 75
+#endif
 
 struct adlb_tcp_repair_opt {
     uint32_t opt_code;
@@ -290,17 +302,10 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
 #endif
     int one = 1;
-    if (domain == AF_INET6) {
-#ifdef IPV6_TRANSPARENT
-        setsockopt(s, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one));
-#elif defined(IP_TRANSPARENT)
-        setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
-#endif
-    } else {
-#ifdef IP_TRANSPARENT
-        setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
-#endif
-    }
+    setsockopt(s, SOL_IP, IP_FREEBIND, &one, sizeof(one));
+    setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
+    setsockopt(s, SOL_IPV6, IPV6_FREEBIND, &one, sizeof(one));
+    setsockopt(s, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one));
 
     socklen_t loc_len = (cp->local_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
     if (bind(s, (const struct sockaddr *)&cp->local_addr, loc_len) < 0) {

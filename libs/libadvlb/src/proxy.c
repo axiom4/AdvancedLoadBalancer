@@ -468,6 +468,12 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         }
         if (!preserve_for_failover) {
             shutdown(conn->client_fd, SHUT_WR);
+        } else {
+#ifdef __linux__
+            /* Enable TCP_REPAIR before close so kernel frees 4-tuple immediately without RST/FIN or TIME_WAIT */
+            int repair_on = 1;
+            setsockopt(conn->client_fd, 6 /* SOL_TCP */, 19 /* TCP_REPAIR */, &repair_on, sizeof(repair_on));
+#endif
         }
         close(conn->client_fd);
         conn->client_fd = -1;
