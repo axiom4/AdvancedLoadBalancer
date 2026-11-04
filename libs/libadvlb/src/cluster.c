@@ -1081,6 +1081,7 @@ static void acquire_virtual_ip(void) {
 
             snprintf(cmd, sizeof(cmd),
                      "modprobe macvlan >/dev/null 2>&1 || true; "
+                     "ip rule del from %.45s blackhole >/dev/null 2>&1 || true; "
                      "ip rule del from %.45s lookup %d >/dev/null 2>&1 || true; "
                      "ip route flush table %d >/dev/null 2>&1 || true; "
                      "ip link del dev %.31s >/dev/null 2>&1 || true; "
@@ -1089,6 +1090,7 @@ static void acquire_virtual_ip(void) {
                      "ip link add link %.31s name %.31s %stype macvlan mode bridge >/dev/null 2>&1 && "
                      "ip link set dev %.31s up >/dev/null 2>&1 && "
                      "ip addr replace %.45s/32 dev %.31s >/dev/null 2>&1",
+                     clean_vip,
                      clean_vip, rtable,
                      rtable,
                      s_active_vip_iface,
@@ -1225,6 +1227,14 @@ static void release_virtual_ip(void) {
     if (!parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
         return;
     }
+
+#ifdef __linux__
+    /* Add blackhole rule so BACKUP node never egresses stray packets with VIP as source */
+    char bcmd[128];
+    snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
+    int brc = system(bcmd);
+    (void)brc;
+#endif
 
     if (s_vip_bound_kernel && is_safe_iface_name(g_config.vip_interface) && geteuid() == 0) {
         char cmd[512];
@@ -2043,6 +2053,16 @@ static void transition_to_backup(uint32_t new_master_id, uint8_t master_prio, ui
     s_master_effective_prio = master_prio;
 
     if (prev == VRRP_STATE_MASTER) {
+#ifdef __linux__
+        char clean_vip[64] = {0};
+        int prefix = 32;
+        if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+            char bcmd[128];
+            snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
+            int brc = system(bcmd);
+            (void)brc;
+        }
+#endif
         worker_pool_handover_active_conns();
         release_virtual_ip();
         add_log("\033[1;33m[VRRP ELECTION]\033[0m Node %08X stepped down MASTER -> BACKUP (new Master %08X, prio %u)",
@@ -2181,6 +2201,17 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
             s_manual_demoted = true;
             s_stepdown_until_ms = 0;
             s_last_master_advert_ms = now_ms;
+
+#ifdef __linux__
+            char clean_vip[64] = {0};
+            int prefix = 32;
+            if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+                char bcmd[128];
+                snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
+                int brc = system(bcmd);
+                (void)brc;
+            }
+#endif
 
             worker_pool_handover_active_conns();
             release_virtual_ip();
@@ -2615,6 +2646,10 @@ bool cluster_start(void) {
                 if (s_iface_primary_ip[0] != '\0' && s_saved_orig_mac[0] != '\0') {
                     send_vrrp_garp_on_iface(parent_iface, s_iface_primary_ip, s_saved_orig_mac);
                 }
+                char bcmd[128];
+                snprintf(bcmd, sizeof(bcmd), "ip rule del from %.45s blackhole >/dev/null 2>&1 || true; ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip, clean_vip);
+                int brc = system(bcmd);
+                (void)brc;
                 install_vip_rst_filter(parent_iface, clean_vip);
             }
 #endif
@@ -2741,6 +2776,12 @@ void cluster_stop(void) {
     char clean_vip[64] = {0};
     int prefix = 32;
     if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+#ifdef __linux__
+        char bcmd[128];
+        snprintf(bcmd, sizeof(bcmd), "ip rule del from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
+        int brc = system(bcmd);
+        (void)brc;
+#endif
         remove_vip_rst_filter(g_config.vip_interface, clean_vip);
     }
 
@@ -2794,6 +2835,17 @@ void cluster_trigger_stepdown(void) {
         s_manual_demoted = true;
         s_stepdown_until_ms = 0;
         s_last_master_advert_ms = now_ms;
+
+#ifdef __linux__
+        char clean_vip[64] = {0};
+        int prefix = 32;
+        if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+            char bcmd[128];
+            snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
+            int brc = system(bcmd);
+            (void)brc;
+        }
+#endif
 
         /* Hand over active connections cleanly FIRST while VIP is alive */
         worker_pool_handover_active_conns();
