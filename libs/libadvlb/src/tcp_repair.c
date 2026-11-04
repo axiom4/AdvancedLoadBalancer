@@ -194,9 +194,12 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         out_cp->snd_wscale = ti.tcpi_snd_wscale;
         out_cp->rcv_wscale = ti.tcpi_rcv_wscale;
         out_cp->mss_clamp = ti.tcpi_snd_mss;
-        if (ti.tcpi_options & 1 /* TCPI_OPT_TIMESTAMPS */) {
-            out_cp->has_timestamps = true;
-        }
+        /* Do NOT enable TCPOPT_TIMESTAMP (opt_code 8) on restored socket:
+         * Linux TCP_REPAIR API cannot restore the sender/receiver timestamp counters (tsval/tsecr).
+         * Restoring timestamps with uninitialized tsecr=0 triggers immediate PAWS (Protection Against Wrapped Sequence)
+         * failure on the client (e.g. macOS), which causes the client to send TCP RST (errno 104).
+         * Omitting timestamps allows standard sequence-number-based validation without PAWS rejection. */
+        out_cp->has_timestamps = false;
     }
 
     /* 1. Query kTLS state while socket is in clean operational state (before TCP_REPAIR) */
@@ -377,11 +380,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         opts[nopts].opt_val = ((uint32_t)cp->rcv_wscale << 16) | (uint32_t)cp->snd_wscale;
         nopts++;
     }
-    if (cp->has_timestamps) {
-        opts[nopts].opt_code = 8; /* TCPOPT_TIMESTAMP */
-        opts[nopts].opt_val = 0;
-        nopts++;
-    }
+    /* Note: TCPOPT_TIMESTAMP (8) intentionally omitted to avoid PAWS rejection on peer */
     for (int i = 0; i < nopts; i++) {
         if (setsockopt(s, SOL_TCP, TCP_REPAIR_OPTIONS, &opts[i], sizeof(opts[i])) < 0) {
             add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_REPAIR_OPTIONS (%d) failed: %s (errno %d)",
