@@ -202,8 +202,14 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         struct adlb_tls12_crypto_info_aes_gcm_128 gcm128;
         struct adlb_tls12_crypto_info_aes_gcm_256 gcm256;
     } tx_u;
-    socklen_t klen = sizeof(tx_u);
-    if (getsockopt(sock_fd, SOL_TLS, TLS_TX, &tx_u, &klen) == 0) {
+    memset(&tx_u, 0, sizeof(tx_u));
+    socklen_t klen = sizeof(struct adlb_tls12_crypto_info_aes_gcm_256);
+    int res = getsockopt(sock_fd, SOL_TLS, TLS_TX, &tx_u, &klen);
+    if (res < 0 && (errno == EINVAL || errno == EFAULT)) {
+        klen = sizeof(struct adlb_tls12_crypto_info_aes_gcm_128);
+        res = getsockopt(sock_fd, SOL_TLS, TLS_TX, &tx_u, &klen);
+    }
+    if (res == 0) {
         out_cp->is_ktls = true;
         out_cp->ktls.tls_version = tx_u.info.version;
         out_cp->ktls.cipher_type = tx_u.info.cipher_type;
@@ -224,8 +230,14 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
             struct adlb_tls12_crypto_info_aes_gcm_128 gcm128;
             struct adlb_tls12_crypto_info_aes_gcm_256 gcm256;
         } rx_u;
-        klen = sizeof(rx_u);
-        if (getsockopt(sock_fd, SOL_TLS, TLS_RX, &rx_u, &klen) == 0) {
+        memset(&rx_u, 0, sizeof(rx_u));
+        klen = sizeof(struct adlb_tls12_crypto_info_aes_gcm_256);
+        res = getsockopt(sock_fd, SOL_TLS, TLS_RX, &rx_u, &klen);
+        if (res < 0 && (errno == EINVAL || errno == EFAULT)) {
+            klen = sizeof(struct adlb_tls12_crypto_info_aes_gcm_128);
+            res = getsockopt(sock_fd, SOL_TLS, TLS_RX, &rx_u, &klen);
+        }
+        if (res == 0) {
             if (rx_u.info.cipher_type == KTLS_CIPHER_AES_GCM_256) {
                 memcpy(out_cp->ktls.rx_iv, rx_u.gcm256.iv, 8);
                 memcpy(out_cp->ktls.rx_key, rx_u.gcm256.key, 32);
@@ -237,15 +249,15 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
                 memcpy(out_cp->ktls.rx_salt, rx_u.gcm128.salt, 4);
                 memcpy(out_cp->ktls.rx_rec_seq, rx_u.gcm128.rec_seq, 8);
             }
+            add_log("\033[1;32m[HA CHECKPOINT OK]\033[0m Captured kTLS state (cipher=%u, ver=0x%04x, fd=%d)",
+                    tx_u.info.cipher_type, tx_u.info.version, sock_fd);
         } else {
-            add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m getsockopt SOL_TLS TLS_RX failed: %s (errno %d)",
-                    strerror(errno), errno);
+            add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m getsockopt SOL_TLS TLS_RX failed: %s (errno %d, fd=%d)",
+                    strerror(errno), errno, sock_fd);
         }
     } else {
-        if (errno != ENOPROTOOPT && errno != EOPNOTSUPP && errno != 0) {
-            add_log("\033[1;33m[HA CHECKPOINT]\033[0m getsockopt SOL_TLS TLS_TX: %s (errno %d)",
-                    strerror(errno), errno);
-        }
+        add_log("\033[1;33m[HA CHECKPOINT]\033[0m getsockopt SOL_TLS TLS_TX: %s (errno %d, fd=%d)",
+                strerror(errno), errno, sock_fd);
     }
 
     /* 2. Query TCP sequence numbers and sliding window in TCP_REPAIR mode */
@@ -387,7 +399,17 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_REPAIR_WINDOW failed: %s (errno %d)", strerror(errno), errno);
     }
 
-    /* kTLS restore */
+    /* Disable TCP_REPAIR mode now that TCP stack state is fully reconstructed */
+    int no_q = TCP_NO_QUEUE;
+    setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
+
+    int off = 0;
+    if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
+        int err = errno;
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
+    }
+
+    /* kTLS restore on healthy established TCP socket */
     if (cp->is_ktls) {
         if (setsockopt(s, SOL_TCP, 31 /* TCP_ULP */, "tls", sizeof("tls")) < 0) {
             add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_ULP tls failed: %s (errno %d)", strerror(errno), errno);
@@ -441,15 +463,6 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
                 add_log("\033[1;31m[HA RESTORE ERR]\033[0m TLS_RX failed: %s (errno %d)", strerror(errno), errno);
             }
         }
-    }
-
-    int no_q = TCP_NO_QUEUE;
-    setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
-
-    int off = 0;
-    if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
-        int err = errno;
-        add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
     }
 
     /* Enable TCP_NODELAY and TCP_QUICKACK to avoid Nagle and delayed ACK delays */
