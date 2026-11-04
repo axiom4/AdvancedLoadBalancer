@@ -1,5 +1,6 @@
 #include "advlb/tcp_repair.h"
 #include "advlb/net_utils.h"
+#include "advlb/log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -248,31 +249,47 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
 #ifdef SO_REUSEPORT
     setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
 #endif
-#ifdef IP_TRANSPARENT
     int one = 1;
-    setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
+    if (domain == AF_INET6) {
+#ifdef IPV6_TRANSPARENT
+        setsockopt(s, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one));
+#elif defined(IP_TRANSPARENT)
+        setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
 #endif
+    } else {
+#ifdef IP_TRANSPARENT
+        setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
+#endif
+    }
 
     socklen_t loc_len = (cp->local_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-    (void)bind(s, (const struct sockaddr *)&cp->local_addr, loc_len);
+    if (bind(s, (const struct sockaddr *)&cp->local_addr, loc_len) < 0) {
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m bind failed: %s (errno %d)", strerror(errno), errno);
+    }
 
     socklen_t rem_len = (cp->remote_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
     if (connect(s, (const struct sockaddr *)&cp->remote_addr, rem_len) < 0 && errno != EINPROGRESS) {
-        /* Repair connect marks peer */
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m connect failed: %s (errno %d)", strerror(errno), errno);
     }
 
     /* Set Sequence numbers */
     int q = TCP_SEND_QUEUE;
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
-    setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->snd_seq, sizeof(cp->snd_seq));
+    if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->snd_seq, sizeof(cp->snd_seq)) < 0) {
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m set snd_seq failed: %s (errno %d)", strerror(errno), errno);
+    }
 
     q = TCP_RECV_QUEUE;
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
-    setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->rcv_seq, sizeof(cp->rcv_seq));
+    if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->rcv_seq, sizeof(cp->rcv_seq)) < 0) {
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m set rcv_seq failed: %s (errno %d)", strerror(errno), errno);
+    }
 
     /* kTLS restore */
     if (cp->is_ktls) {
-        setsockopt(s, SOL_TCP, 31 /* TCP_ULP */, "tls", sizeof("tls"));
+        if (setsockopt(s, SOL_TCP, 31 /* TCP_ULP */, "tls", sizeof("tls")) < 0) {
+            add_log("\033[1;31m[HA RESTORE ERR]\033[0m TCP_ULP tls failed: %s (errno %d)", strerror(errno), errno);
+        }
         if (cp->ktls.cipher_type == KTLS_CIPHER_AES_GCM_256) {
             struct adlb_tls12_crypto_info_aes_gcm_256 tx;
             memset(&tx, 0, sizeof(tx));
@@ -282,7 +299,9 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(tx.key, cp->ktls.tx_key, 32);
             memcpy(tx.salt, cp->ktls.tx_salt, 4);
             memcpy(tx.rec_seq, cp->ktls.tx_rec_seq, 8);
-            setsockopt(s, SOL_TLS, TLS_TX, &tx, sizeof(tx));
+            if (setsockopt(s, SOL_TLS, TLS_TX, &tx, sizeof(tx)) < 0) {
+                add_log("\033[1;31m[HA RESTORE ERR]\033[0m TLS_TX failed: %s (errno %d)", strerror(errno), errno);
+            }
 
             struct adlb_tls12_crypto_info_aes_gcm_256 rx;
             memset(&rx, 0, sizeof(rx));
@@ -292,7 +311,9 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(rx.key, cp->ktls.rx_key, 32);
             memcpy(rx.salt, cp->ktls.rx_salt, 4);
             memcpy(rx.rec_seq, cp->ktls.rx_rec_seq, 8);
-            setsockopt(s, SOL_TLS, TLS_RX, &rx, sizeof(rx));
+            if (setsockopt(s, SOL_TLS, TLS_RX, &rx, sizeof(rx)) < 0) {
+                add_log("\033[1;31m[HA RESTORE ERR]\033[0m TLS_RX failed: %s (errno %d)", strerror(errno), errno);
+            }
         } else {
             struct adlb_tls12_crypto_info_aes_gcm_128 tx;
             memset(&tx, 0, sizeof(tx));
@@ -302,7 +323,9 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(tx.key, cp->ktls.tx_key, 16);
             memcpy(tx.salt, cp->ktls.tx_salt, 4);
             memcpy(tx.rec_seq, cp->ktls.tx_rec_seq, 8);
-            setsockopt(s, SOL_TLS, TLS_TX, &tx, sizeof(tx));
+            if (setsockopt(s, SOL_TLS, TLS_TX, &tx, sizeof(tx)) < 0) {
+                add_log("\033[1;31m[HA RESTORE ERR]\033[0m TLS_TX failed: %s (errno %d)", strerror(errno), errno);
+            }
 
             struct adlb_tls12_crypto_info_aes_gcm_128 rx;
             memset(&rx, 0, sizeof(rx));
@@ -312,7 +335,9 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(rx.key, cp->ktls.rx_key, 16);
             memcpy(rx.salt, cp->ktls.rx_salt, 4);
             memcpy(rx.rec_seq, cp->ktls.rx_rec_seq, 8);
-            setsockopt(s, SOL_TLS, TLS_RX, &rx, sizeof(rx));
+            if (setsockopt(s, SOL_TLS, TLS_RX, &rx, sizeof(rx)) < 0) {
+                add_log("\033[1;31m[HA RESTORE ERR]\033[0m TLS_RX failed: %s (errno %d)", strerror(errno), errno);
+            }
         }
     }
 
@@ -322,7 +347,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     int off = 0;
     if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
         int err = errno;
-        fprintf(stderr, "[TCP_REPAIR ERR] Failed to disable TCP_REPAIR: %s (errno %d)\n", strerror(err), err);
+        add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
     }
     set_nonblocking(s);
     return s;

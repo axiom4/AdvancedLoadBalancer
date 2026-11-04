@@ -1022,12 +1022,15 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
     // Events on CLIENT socket
     if (fd == conn->client_fd) {
         if (events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
+            add_log("\033[1;35m[HA DEBUG]\033[0m Event on client_fd=%d (ev=0x%x)", fd, events);
             size_t space;
             while (!conn->client_closed && (space = buffer_write_len(&conn->c2b)) > 0) {
                 bool want_io = false;
                 char *wptr = buffer_write_ptr(&conn->c2b);
                 ssize_t r = nonblocking_read(conn->client_fd, conn->client_ssl,
                                              wptr, space, &want_io);
+                add_log("\033[1;35m[HA DEBUG]\033[0m read client_fd=%d -> r=%zd (want_io=%d, err=%d)",
+                        fd, r, want_io, (r < 0 ? errno : 0));
                 if (r > 0) {
                     if (conn->c2b.tail == 0 && has_connection_close_header(wptr, (size_t)r)) {
                         conn->keep_alive_eligible = false;
