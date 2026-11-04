@@ -480,6 +480,12 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const
             }
             int no_q = 0; /* TCP_NO_QUEUE */
             setsockopt(conn->client_fd, 6 /* SOL_TCP */, 20 /* TCP_REPAIR_QUEUE */, &no_q, sizeof(no_q));
+
+            /* Disconnect socket cleanly to TCP_CLOSE state before closing descriptor */
+            struct sockaddr sa_unspec;
+            memset(&sa_unspec, 0, sizeof(sa_unspec));
+            sa_unspec.sa_family = AF_UNSPEC;
+            connect(conn->client_fd, &sa_unspec, sizeof(sa_unspec));
 #endif
         }
         close(conn->client_fd);
