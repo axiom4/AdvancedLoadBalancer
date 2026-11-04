@@ -37,6 +37,9 @@ typedef struct {
     unsigned long total_requests;
     int duration_sec;
     bool keep_alive;
+    bool mixed_mode;
+    int mixed_requests;
+    int mixed_ratio;
     bool use_udp;
     bool use_ssl;
     bool send_proxy_proto;
@@ -58,6 +61,9 @@ static atomic_ulong g_reqs_completed = 0;
 static atomic_ulong g_reqs_success = 0;
 static atomic_ulong g_reqs_failed = 0;
 static atomic_ulong g_bytes_received = 0;
+static atomic_ulong g_connections_opened = 0;
+static atomic_ulong g_reqs_keepalive = 0;
+static atomic_ulong g_reqs_new_conn = 0;
 
 // Diagnostics metrics
 static atomic_ulong g_fail_connect = 0;
@@ -469,11 +475,13 @@ static const useconds_t s_failover_backoffs[] = {
 
 static void *worker_client_thread(void *arg) {
     WorkerContext *ctx = (WorkerContext *)arg;
-    char req_buf[2048];
+    char req_buf_ka[2048];
+    char req_buf_close[2048];
     char resp_buf[BUFFER_SIZE];
 
-    // Build HTTP request payload
-    int req_len = 0;
+    // Build HTTP request payloads (precomputed for Keep-Alive and Close)
+    int req_len_ka = 0;
+    int req_len_close = 0;
     if (!g_cfg.use_udp) {
         char proxy_hdr[256] = "";
         if (g_cfg.send_proxy_proto) {
@@ -482,37 +490,63 @@ static void *worker_client_thread(void *arg) {
         }
 
         char sess_hdr[128] = "";
-        if (g_cfg.use_session || g_cfg.keep_alive) {
+        if (g_cfg.use_session || g_cfg.keep_alive || g_cfg.mixed_mode) {
             snprintf(sess_hdr, sizeof(sess_hdr), "X-Session-ID: adlb-sess-worker-%d\r\n", ctx->thread_id);
         }
 
         if (strlen(g_cfg.post_data) > 0) {
-            req_len = snprintf(req_buf, sizeof(req_buf),
+            req_len_ka = snprintf(req_buf_ka, sizeof(req_buf_ka),
                 "%sPOST %s HTTP/1.1\r\n"
                 "Host: %s:%d\r\n"
                 "User-Agent: adlb-test-client/1.0\r\n"
                 "%s"
                 "Content-Type: application/x-www-form-urlencoded\r\n"
                 "Content-Length: %zu\r\n"
-                "Connection: %s\r\n"
+                "Connection: keep-alive\r\n"
                 "\r\n"
                 "%s",
                 proxy_hdr, g_cfg.http_path, g_cfg.target_ip, g_cfg.target_port,
-                sess_hdr, strlen(g_cfg.post_data), g_cfg.keep_alive ? "keep-alive" : "close",
+                sess_hdr, strlen(g_cfg.post_data),
+                g_cfg.post_data);
+
+            req_len_close = snprintf(req_buf_close, sizeof(req_buf_close),
+                "%sPOST %s HTTP/1.1\r\n"
+                "Host: %s:%d\r\n"
+                "User-Agent: adlb-test-client/1.0\r\n"
+                "%s"
+                "Content-Type: application/x-www-form-urlencoded\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "%s",
+                proxy_hdr, g_cfg.http_path, g_cfg.target_ip, g_cfg.target_port,
+                sess_hdr, strlen(g_cfg.post_data),
                 g_cfg.post_data);
         } else {
-            req_len = snprintf(req_buf, sizeof(req_buf),
+            req_len_ka = snprintf(req_buf_ka, sizeof(req_buf_ka),
                 "%sGET %s HTTP/1.1\r\n"
                 "Host: %s:%d\r\n"
                 "User-Agent: adlb-test-client/1.0\r\n"
                 "%s"
-                "Connection: %s\r\n"
+                "Connection: keep-alive\r\n"
                 "\r\n",
                 proxy_hdr, g_cfg.http_path, g_cfg.target_ip, g_cfg.target_port,
-                sess_hdr, g_cfg.keep_alive ? "keep-alive" : "close");
+                sess_hdr);
+
+            req_len_close = snprintf(req_buf_close, sizeof(req_buf_close),
+                "%sGET %s HTTP/1.1\r\n"
+                "Host: %s:%d\r\n"
+                "User-Agent: adlb-test-client/1.0\r\n"
+                "%s"
+                "Connection: close\r\n"
+                "\r\n",
+                proxy_hdr, g_cfg.http_path, g_cfg.target_ip, g_cfg.target_port,
+                sess_hdr);
         }
     } else {
-        req_len = snprintf(req_buf, sizeof(req_buf), "PING adlb-load-test payload\r\n");
+        req_len_ka = snprintf(req_buf_ka, sizeof(req_buf_ka), "PING adlb-load-test payload\r\n");
+        req_len_close = req_len_ka;
+        memcpy(req_buf_close, req_buf_ka, (size_t)req_len_ka);
     }
 
     int active_fd = -1;
@@ -520,6 +554,17 @@ static void *worker_client_thread(void *arg) {
 #ifndef NO_SSL
     SSL *active_ssl = NULL;
 #endif
+
+    // Session / Burst state for realistic mixed traffic simulation
+    unsigned int seed = (unsigned int)(time(NULL) ^ ((uintptr_t)&seed) ^ ((unsigned int)ctx->thread_id << 16));
+    int burst_target = (g_cfg.mixed_requests > 0) ? g_cfg.mixed_requests : 10;
+    int current_conn_reqs = 0;
+    int current_burst_limit = burst_target;
+    if (g_cfg.mixed_mode && g_cfg.mixed_ratio == 0) {
+        int min_reqs = (burst_target > 2) ? (burst_target * 7 / 10) : 1;
+        int max_reqs = (burst_target * 13 / 10) + 1;
+        current_burst_limit = min_reqs + (rand_r(&seed) % (max_reqs - min_reqs + 1));
+    }
 
     while (g_running) {
         unsigned long req_idx = atomic_fetch_add_explicit(&g_reqs_dispatched, 1, memory_order_relaxed);
@@ -530,7 +575,27 @@ static void *worker_client_thread(void *arg) {
         double t_start = get_time_sec();
         bool success = false;
         bool had_retry = false;
+        bool is_new_conn = false;
         ssize_t received_bytes = 0;
+
+        // Determine whether this request is the last in the current connection burst
+        bool is_last_in_burst = false;
+        if (g_cfg.mixed_mode) {
+            if (g_cfg.mixed_ratio > 0) {
+                if (current_conn_reqs > 0 && (rand_r(&seed) % 100) >= g_cfg.mixed_ratio) {
+                    is_last_in_burst = true;
+                }
+            } else {
+                if (current_conn_reqs + 1 >= current_burst_limit) {
+                    is_last_in_burst = true;
+                }
+            }
+        } else if (!g_cfg.keep_alive) {
+            is_last_in_burst = true;
+        }
+
+        const char *cur_req_buf = is_last_in_burst ? req_buf_close : req_buf_ka;
+        int cur_req_len = is_last_in_burst ? req_len_close : req_len_ka;
 
         for (int attempt = 0; attempt < MAX_CONN_ATTEMPTS && !success && g_running; attempt++) {
             if (attempt > 0) {
@@ -580,6 +645,10 @@ static void *worker_client_thread(void *arg) {
                         SSL_free(active_ssl);
                         active_ssl = NULL;
                         harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
+#ifdef __APPLE__
+                        struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                        setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+#endif
                         close(active_fd);
                         active_fd = -1;
                         active_fd_prev_retrans = 0;
@@ -593,19 +662,21 @@ static void *worker_client_thread(void *arg) {
                     }
                 }
 #endif
+                atomic_fetch_add_explicit(&g_connections_opened, 1, memory_order_relaxed);
+                is_new_conn = true;
             }
 
             // Send request
             bool write_ok = false;
 #ifndef NO_SSL
             if (g_cfg.use_ssl && active_ssl) {
-                int ret = SSL_write(active_ssl, req_buf, req_len);
-                write_ok = (ret == req_len);
+                int ret = SSL_write(active_ssl, cur_req_buf, cur_req_len);
+                write_ok = (ret == cur_req_len);
             } else
 #endif
             {
-                ssize_t ret = send(active_fd, req_buf, (size_t)req_len, 0);
-                write_ok = (ret == req_len);
+                ssize_t ret = send(active_fd, cur_req_buf, (size_t)cur_req_len, 0);
+                write_ok = (ret == cur_req_len);
             }
 
             if (write_ok) {
@@ -671,7 +742,7 @@ static void *worker_client_thread(void *arg) {
                             } else if (strstr(resp_buf, "\r\n0\r\n\r\n") != NULL ||
                                        strstr(resp_buf, "\r\n0\r\n") != NULL) {
                                 break;
-                            } else if (g_cfg.keep_alive) {
+                            } else if (!is_last_in_burst && (g_cfg.keep_alive || g_cfg.mixed_mode)) {
                                 break;
                             }
                         }
@@ -704,6 +775,23 @@ static void *worker_client_thread(void *arg) {
                     }
                     if (detected_port > 0) {
                         record_backend_hit(detected_port);
+                    }
+
+                    // Check if server requested connection closure
+                    if (!is_last_in_burst && (g_cfg.keep_alive || g_cfg.mixed_mode)) {
+                        char *conn_hdr = strcasestr(resp_buf, "Connection:");
+                        if (conn_hdr) {
+                            char *line_end = strstr(conn_hdr, "\r\n");
+                            if (line_end && (size_t)(line_end - conn_hdr) < 64) {
+                                char hdr_val[64];
+                                size_t hlen = (size_t)(line_end - conn_hdr);
+                                memcpy(hdr_val, conn_hdr, hlen);
+                                hdr_val[hlen] = '\0';
+                                if (strcasestr(hdr_val, "close")) {
+                                    is_last_in_burst = true;
+                                }
+                            }
+                        }
                     }
                 } else {
                     if (attempt < MAX_CONN_ATTEMPTS - 1) continue;
@@ -738,6 +826,11 @@ static void *worker_client_thread(void *arg) {
         if (success) {
             atomic_fetch_add_explicit(&g_reqs_success, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_bytes_received, (unsigned long)received_bytes, memory_order_relaxed);
+            if (is_new_conn) {
+                atomic_fetch_add_explicit(&g_reqs_new_conn, 1, memory_order_relaxed);
+            } else {
+                atomic_fetch_add_explicit(&g_reqs_keepalive, 1, memory_order_relaxed);
+            }
 
             // Record latency
             if (ctx->latency_count < ctx->latency_cap) {
@@ -749,8 +842,21 @@ static void *worker_client_thread(void *arg) {
 
         atomic_fetch_add_explicit(&g_reqs_completed, 1, memory_order_relaxed);
 
-        // Keep-alive management
-        if (!g_cfg.keep_alive || !success) {
+        current_conn_reqs++;
+
+        // Connection reuse & termination management
+        bool should_close = false;
+        if (!success) {
+            should_close = true;
+        } else if (g_cfg.mixed_mode) {
+            if (is_last_in_burst) {
+                should_close = true;
+            }
+        } else if (!g_cfg.keep_alive) {
+            should_close = true;
+        }
+
+        if (should_close) {
 #ifndef NO_SSL
             if (active_ssl) {
                 SSL_set_quiet_shutdown(active_ssl, 1);
@@ -768,6 +874,12 @@ static void *worker_client_thread(void *arg) {
                 close(active_fd);
                 active_fd = -1;
                 active_fd_prev_retrans = 0;
+            }
+            current_conn_reqs = 0;
+            if (g_cfg.mixed_mode && g_cfg.mixed_ratio == 0) {
+                int min_reqs = (burst_target > 2) ? (burst_target * 7 / 10) : 1;
+                int max_reqs = (burst_target * 13 / 10) + 1;
+                current_burst_limit = min_reqs + (rand_r(&seed) % (max_reqs - min_reqs + 1));
             }
         }
     }
@@ -804,6 +916,9 @@ static void print_usage(const char *prog) {
     printf("  -p, --path PATH            HTTP request path (default: /)\n");
     printf("      --post DATA            Send HTTP POST request with DATA body\n");
     printf("  -k, --keep-alive           Enable HTTP Keep-Alive connection reuse\n");
+    printf("  -m, --mixed [NUM]          Mixed mode: realistic traffic with Keep-Alive bursts of NUM reqs/conn (default: 10)\n");
+    printf("      --mixed-requests NUM   Target number of requests per connection in mixed mode (default: 10)\n");
+    printf("      --mixed-ratio PCT      Mixed mode by probability: PCT%% Keep-Alive, (100-PCT)%% fresh connect\n");
     printf("  -s, --ssl                  Enable HTTPS / SSL/TLS mode\n");
     printf("  -u, --udp                  Enable Layer 4 UDP mode (default: TCP)\n");
     printf("  -P, --proxy-protocol       Prepend PROXY Protocol v1 header\n");
@@ -826,6 +941,8 @@ static void print_usage(const char *prog) {
     printf("     %s -t 127.0.0.1:8443 --ssl -c 10 -n 1000\n\n", prog);
     printf("  3) Run only 3 mock backends on 9001, 9002, 9003 for manual testing:\n");
     printf("     %s --mock-backends 3 --backends-only\n\n", prog);
+    printf("  4) Realistic mixed web traffic (~10 requests per connection over SSL):\n");
+    printf("     %s -t 127.0.0.1:8443 --ssl -m 10 -c 6 -n 10000\n\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -836,6 +953,9 @@ int main(int argc, char *argv[]) {
     g_cfg.total_requests = 1000;
     g_cfg.duration_sec = 0;
     g_cfg.keep_alive = false;
+    g_cfg.mixed_mode = false;
+    g_cfg.mixed_requests = 10;
+    g_cfg.mixed_ratio = 0;
     g_cfg.use_udp = false;
     g_cfg.use_ssl = false;
     g_cfg.send_proxy_proto = false;
@@ -868,6 +988,17 @@ int main(int argc, char *argv[]) {
             if (++i < argc) g_cfg.duration_sec = atoi(argv[i]);
         } else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--keep-alive") == 0) {
             g_cfg.keep_alive = true;
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mixed") == 0) {
+            g_cfg.mixed_mode = true;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                g_cfg.mixed_requests = atoi(argv[++i]);
+            }
+        } else if (strcmp(argv[i], "--mixed-requests") == 0) {
+            g_cfg.mixed_mode = true;
+            if (++i < argc) g_cfg.mixed_requests = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--mixed-ratio") == 0) {
+            g_cfg.mixed_mode = true;
+            if (++i < argc) g_cfg.mixed_ratio = atoi(argv[i]);
         } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--udp") == 0) {
             g_cfg.use_udp = true;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--ssl") == 0) {
@@ -948,12 +1079,30 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
+    char conn_info[128];
+    if (g_cfg.mixed_mode) {
+        if (g_cfg.mixed_ratio > 0) {
+            snprintf(conn_info, sizeof(conn_info), "Mixed (%d%% Keep-Alive / %d%% Fresh Connect)",
+                     g_cfg.mixed_ratio, 100 - g_cfg.mixed_ratio);
+        } else {
+            snprintf(conn_info, sizeof(conn_info), "Mixed (~%d reqs/conn, realistic sessions)",
+                     g_cfg.mixed_requests);
+        }
+    } else if (g_cfg.keep_alive) {
+        snprintf(conn_info, sizeof(conn_info), "Keep-Alive");
+    } else {
+        snprintf(conn_info, sizeof(conn_info), "Close");
+    }
+
     printf("\n\033[1;34m================================================================================\033[0m\n");
     printf("\033[1;37m        STARTING LOAD TEST ON %s://%s:%d%s\033[0m\n",
            g_cfg.use_udp ? "udp" : (g_cfg.use_ssl ? "https" : "http"),
            g_cfg.target_ip, g_cfg.target_port, g_cfg.http_path);
     printf("  Concurrency: %d workers | Target Requests: %lu | Connection: %s\n",
-           g_cfg.concurrency, g_cfg.total_requests, g_cfg.keep_alive ? "Keep-Alive" : "Close");
+           g_cfg.concurrency, g_cfg.total_requests, conn_info);
+    if (g_cfg.mixed_mode) {
+        printf("  Traffic Profile   : Realistic Web Session Churn (bursts with clean reconnects)\n");
+    }
     if (g_cfg.send_proxy_proto) printf("  PROXY Protocol v1: ENABLED\n");
     printf("\033[1;34m================================================================================\033[0m\n");
 
@@ -1079,6 +1228,19 @@ int main(int argc, char *argv[]) {
            g_cfg.use_udp ? "Layer 4 UDP" : "Layer 7 TCP / HTTP",
            g_cfg.use_ssl ? " (TLS/SSL Termination)" : "");
     printf("Concurrency Level     : %d client threads\n", g_cfg.concurrency);
+    printf("Connection Mode       : %s\n", conn_info);
+    if (!g_cfg.use_udp) {
+        unsigned long conns = atomic_load_explicit(&g_connections_opened, memory_order_relaxed);
+        unsigned long ka_reqs = atomic_load_explicit(&g_reqs_keepalive, memory_order_relaxed);
+        unsigned long new_reqs = atomic_load_explicit(&g_reqs_new_conn, memory_order_relaxed);
+        double avg_reqs = conns > 0 ? (double)total_completed / (double)conns : 0.0;
+        printf("TCP Connections       : %lu opened (avg %.2f reqs/conn)\n", conns, avg_reqs);
+        if (g_cfg.mixed_mode || g_cfg.keep_alive) {
+            printf("Traffic Breakdown     : %lu fresh connects (%.1f%%) | %lu keep-alive reuses (%.1f%%)\n",
+                   new_reqs, total_completed > 0 ? ((double)new_reqs / (double)total_completed) * 100.0 : 0.0,
+                   ka_reqs, total_completed > 0 ? ((double)ka_reqs / (double)total_completed) * 100.0 : 0.0);
+        }
+    }
     printf("Total Test Time       : %6.3f seconds\n", total_duration);
     printf("Completed Requests    : %lu\n", total_completed);
     printf("Successful Requests   : \033[1;32m%lu\033[0m (%5.2f%%)\n",
