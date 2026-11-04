@@ -44,6 +44,7 @@
 #define CLUSTER_PKT_SESSION_DELETE 3
 #define CLUSTER_PKT_SYNC_REQ       4
 #define CLUSTER_PKT_SYNC_CHUNK     5
+#define CLUSTER_PKT_SWITCHOVER     6
 
 #define CLUSTER_UNIX_FD_MAGIC        0x41444644u /* "ADFD" */
 #define CLUSTER_UNIX_OP_UPSERT_FDS   1
@@ -140,6 +141,7 @@ static _Atomic uint32_t s_current_master_id = 0;
 static uint64_t s_last_master_advert_ms = 0;
 static uint8_t s_master_effective_prio = 0;
 static uint64_t s_stepdown_until_ms = 0;
+static bool s_manual_demoted = false;
 static volatile bool s_bulk_sync_requested = false;
 
 static _Atomic uint64_t s_seq_counter = 1;
@@ -1014,6 +1016,22 @@ static uint8_t compute_effective_priority(void) {
         return 1;
     }
 
+    if (s_manual_demoted) {
+        bool peer_alive = false;
+        bool locked = (pthread_mutex_trylock(&s_cluster_mutex) == 0);
+        for (int i = 0; i < s_num_peers; i++) {
+            if (s_peers[i].is_reachable) {
+                peer_alive = true;
+                break;
+            }
+        }
+        if (locked) pthread_mutex_unlock(&s_cluster_mutex);
+
+        if (peer_alive || s_is_custom_socket) {
+            return 1;
+        }
+    }
+
     int num_b = g_num_backends;
     if (num_b > 0) {
         int alive = 0;
@@ -1823,6 +1841,41 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
                 worker_pool_resync_live_conns();
             }
         }
+    } else if (pkt->hdr.pkt_type == CLUSTER_PKT_SWITCHOVER) {
+        add_log("\033[1;35m[VRRP SWITCHOVER]\033[0m Received manual switchover signal from Node %08X", sender_id);
+        if (my_state == VRRP_STATE_MASTER) {
+            /* Peer requested to take over Master: step down and hold standby lock */
+            s_manual_demoted = true;
+            s_stepdown_until_ms = 0;
+            s_last_master_advert_ms = now_ms;
+
+            release_virtual_ip();
+            atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
+            atomic_store_explicit(&s_current_master_id, sender_id, memory_order_relaxed);
+
+            worker_pool_handover_active_conns();
+            if (s_alive_pipe[0] >= 0) close(s_alive_pipe[0]);
+            if (s_alive_pipe[1] >= 0) close(s_alive_pipe[1]);
+            if (pipe(s_alive_pipe) == 0) {
+                net_set_nonblocking(s_alive_pipe[0]);
+                net_set_nonblocking(s_alive_pipe[1]);
+            } else {
+                s_alive_pipe[0] = s_alive_pipe[1] = -1;
+            }
+
+            ClusterWirePacket rel_pkt;
+            size_t len = prepare_packet(&rel_pkt, CLUSTER_PKT_VRRP_ADVERT, 0, true, NULL, 0);
+            broadcast_cluster_packet(&rel_pkt, len);
+            add_log("\033[1;33m[VRRP SWITCHOVER]\033[0m Yielded MASTER to Node %08X (holding BACKUP standby lock)", sender_id);
+        } else {
+            /* We are BACKUP and Master has yielded leadership to us */
+            s_manual_demoted = false;
+            s_stepdown_until_ms = 0;
+            transition_to_master(now_ms);
+            add_log("\033[1;32m[VRRP SWITCHOVER]\033[0m Assumed MASTER role from Node %08X upon switch request", sender_id);
+        }
+        wakeup_cluster_thread();
+        return;
     }
 }
 
@@ -2166,6 +2219,7 @@ bool cluster_start_with_socket(int custom_dgram_fd) {
     atomic_store(&s_vip_active, false);
     atomic_store(&s_current_master_id, 0);
     s_stepdown_until_ms = 0;
+    s_manual_demoted = false;
     s_cluster_running = true;
 
     if (pthread_create(&s_cluster_thread, NULL, cluster_worker_thread, NULL) != 0) {
@@ -2297,6 +2351,7 @@ bool cluster_start(void) {
     atomic_store(&s_vip_active, false);
     atomic_store(&s_current_master_id, 0);
     s_stepdown_until_ms = 0;
+    s_manual_demoted = false;
     s_cluster_running = true;
 
     if (pthread_create(&s_cluster_thread, NULL, cluster_worker_thread, NULL) != 0) {
@@ -2331,6 +2386,7 @@ void cluster_stop(void) {
     }
 
     s_cluster_running = false;
+    s_manual_demoted = false;
     wakeup_cluster_thread();
     pthread_join(s_cluster_thread, NULL);
 
@@ -2391,11 +2447,14 @@ uint32_t cluster_get_current_master_id(void) {
 void cluster_trigger_stepdown(void) {
     if (!s_cluster_running) return;
     uint64_t now_ms = now_monotonic_ms();
-    uint64_t adv_ms = (uint64_t)(g_config.vrrp_advert_interval_ms > 0 ? g_config.vrrp_advert_interval_ms : 200);
-    s_stepdown_until_ms = now_ms + (adv_ms * 8ULL) + 1500ULL;
-    s_last_master_advert_ms = now_ms;
+    VrrpState my_state = (VrrpState)atomic_load_explicit(&s_vrrp_state, memory_order_relaxed);
 
-    if (atomic_load_explicit(&s_vrrp_state, memory_order_relaxed) == VRRP_STATE_MASTER) {
+    if (my_state == VRRP_STATE_MASTER) {
+        /* We are currently MASTER: step down and hand over to BACKUP */
+        s_manual_demoted = true;
+        s_stepdown_until_ms = 0;
+        s_last_master_advert_ms = now_ms;
+
         release_virtual_ip();
         atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
         atomic_store_explicit(&s_current_master_id, 0, memory_order_relaxed);
@@ -2411,11 +2470,33 @@ void cluster_trigger_stepdown(void) {
             s_alive_pipe[0] = s_alive_pipe[1] = -1;
         }
 
-        /* Broadcast priority-0 packet so best Backup immediately takes over */
+        /* Broadcast switchover packet + priority-0 advert so Backup immediately takes over */
+        ClusterWirePacket sw_pkt;
+        size_t sw_len = prepare_packet(&sw_pkt, CLUSTER_PKT_SWITCHOVER, 0, true, NULL, 0);
+        for (int b = 0; b < 2; b++) {
+            broadcast_cluster_packet(&sw_pkt, sw_len);
+        }
+
         ClusterWirePacket rel_pkt;
         size_t len = prepare_packet(&rel_pkt, CLUSTER_PKT_VRRP_ADVERT, 0, true, NULL, 0);
         broadcast_cluster_packet(&rel_pkt, len);
-        add_log("\033[1;33m[VRRP STEPDOWN]\033[0m Manual failover triggered: Node %08X stepped down to BACKUP and handed over active streams", s_node_id);
+
+        add_log("\033[1;33m[VRRP SWITCHOVER]\033[0m Manual failover triggered: Node %08X stepped down to BACKUP (holding standby lock while peer is alive)", s_node_id);
+    } else {
+        /* We are currently BACKUP: user wants to promote this node to MASTER */
+        s_manual_demoted = false;
+        s_stepdown_until_ms = 0;
+
+        /* Broadcast switchover packet instructing peer Master to step down */
+        ClusterWirePacket sw_pkt;
+        size_t sw_len = prepare_packet(&sw_pkt, CLUSTER_PKT_SWITCHOVER, 0, false, NULL, 0);
+        for (int b = 0; b < 2; b++) {
+            broadcast_cluster_packet(&sw_pkt, sw_len);
+        }
+
+        /* Immediately transition this node to MASTER */
+        transition_to_master(now_ms);
+        add_log("\033[1;32m[VRRP SWITCHOVER]\033[0m Node %08X promoted to MASTER upon manual switch request", s_node_id);
     }
     wakeup_cluster_thread();
 }

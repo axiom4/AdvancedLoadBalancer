@@ -543,7 +543,7 @@ void render_tui(void) {
     if (g_confirming_exit) {
         snprintf(foot_text, sizeof(foot_text), " [<- / -> / Tab] Select  |  [Enter / Space] Confirm Choice  |  [ESC] Cancel");
     } else if (g_config.enable_cluster) {
-        snprintf(foot_text, sizeof(foot_text), " [Q] Exit | [R] Reset | [A] Algo | [H] Health | [P] PPv1 | [C] VRRP Failover");
+        snprintf(foot_text, sizeof(foot_text), " [Q] Exit | [R] Reset | [A] Algo | [H] Health | [P] PPv1 | [C] VRRP Switch");
     } else {
         snprintf(foot_text, sizeof(foot_text), " [Q / Ctrl+C] Exit  |  [R] Reset  |  [A] Algorithm  |  [H] Health Check  |  [P] PROXY v1");
     }

@@ -926,6 +926,18 @@ static void test_cluster_vrrp_and_session_sync(void) {
     TEST_ASSERT(cluster_get_active_vmac()[0] == '\0',
                 "VRRP Virtual MAC released immediately upon stepdown to BACKUP");
 
+    /* Test toggling back (TUI '[C]' promotion trigger from BACKUP) */
+    cluster_trigger_stepdown();
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_MASTER,
+                "cluster_trigger_stepdown() toggled node BACKUP -> MASTER on second press");
+    TEST_ASSERT(cluster_is_vip_active(),
+                "Virtual IP re-acquired immediately upon manual toggle to MASTER");
+
+    /* Re-stepdown before stopping */
+    cluster_trigger_stepdown();
+    TEST_ASSERT(cluster_get_state() == VRRP_STATE_BACKUP,
+                "cluster_trigger_stepdown() toggled node MASTER -> BACKUP cleanly");
+
     cluster_stop();
     TEST_ASSERT(cluster_get_state() == VRRP_STATE_DISABLED,
                 "cluster_stop() cleanly shut down VRRP engine");
