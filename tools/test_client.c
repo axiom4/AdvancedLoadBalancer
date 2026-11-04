@@ -412,6 +412,9 @@ static int connect_to_target(const char *ip, int port, bool use_udp) {
         int opt = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
         int flags = fcntl(fd, F_GETFL, 0);
         if (flags >= 0) {
@@ -541,6 +544,10 @@ static void *worker_client_thread(void *arg) {
 #endif
                 if (active_fd >= 0) {
                     harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
+#ifdef __APPLE__
+                    struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                    setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+#endif
                     close(active_fd);
                     active_fd = -1;
                     active_fd_prev_retrans = 0;
@@ -754,6 +761,10 @@ static void *worker_client_thread(void *arg) {
 #endif
             if (active_fd >= 0) {
                 harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
+#ifdef __APPLE__
+                struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+                setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+#endif
                 close(active_fd);
                 active_fd = -1;
                 active_fd_prev_retrans = 0;
@@ -770,6 +781,10 @@ static void *worker_client_thread(void *arg) {
 #endif
     if (active_fd >= 0) {
         harvest_socket_retransmits(active_fd, &active_fd_prev_retrans);
+#ifdef __APPLE__
+        struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+        setsockopt(active_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+#endif
         close(active_fd);
     }
 

@@ -456,9 +456,6 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         }
 
         if (!pooled) {
-            if (!preserve_for_failover && conn->fds_replicated && g_config.enable_cluster) {
-                shutdown(conn->backend_fd, SHUT_RDWR);
-            }
             close(conn->backend_fd);
         }
         conn->backend_fd = -1;
@@ -475,12 +472,11 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
         worker_clear_fd(worker, conn->client_fd);
         if (conn->client_ssl) {
             if (!preserve_for_failover) {
+                SSL_set_quiet_shutdown(conn->client_ssl, 1);
                 SSL_shutdown(conn->client_ssl);
             }
             SSL_free(conn->client_ssl);
             conn->client_ssl = NULL;
-        } else if (!preserve_for_failover && conn->fds_replicated && g_config.enable_cluster) {
-            shutdown(conn->client_fd, SHUT_RDWR);
         }
         close(conn->client_fd);
         conn->client_fd = -1;
@@ -2381,6 +2377,7 @@ void *client_handler_thread(void *arg) {
     }
 
     if (client_ssl) {
+        SSL_set_quiet_shutdown(client_ssl, 1);
         SSL_shutdown(client_ssl);
         SSL_free(client_ssl);
     }
