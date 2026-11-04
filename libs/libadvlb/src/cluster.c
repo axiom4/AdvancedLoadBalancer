@@ -636,6 +636,249 @@ static void broadcast_active_vip_garp(void) {
     }
 }
 
+#ifdef __linux__
+#include <linux/netfilter_ipv4/ip_tables.h>
+#include <linux/netfilter/xt_tcpudp.h>
+
+#ifndef XT_ALIGN
+#define XT_ALIGN(s) (((s) + (__alignof__(struct xt_entry_match) - 1)) & ~(__alignof__(struct xt_entry_match) - 1))
+#endif
+#ifndef NF_INET_LOCAL_OUT
+#define NF_INET_LOCAL_OUT 3
+#endif
+#ifndef IPT_SO_SET_REPLACE
+#define IPT_SO_SET_REPLACE 64
+#endif
+#ifndef IPT_SO_GET_INFO
+#define IPT_SO_GET_INFO 64
+#endif
+#ifndef IPT_SO_GET_ENTRIES
+#define IPT_SO_GET_ENTRIES 65
+#endif
+
+typedef struct {
+    struct ipt_entry entry;
+    struct xt_entry_match match;
+    struct xt_tcp tcp;
+    struct xt_standard_target target;
+} VrrpRstDropRule;
+
+static void build_vrrp_rst_drop_rule(VrrpRstDropRule *r, const char *parent_iface, const char *vip) {
+    memset(r, 0, sizeof(*r));
+
+    r->entry.ip.proto = IPPROTO_TCP;
+    inet_pton(AF_INET, vip, &r->entry.ip.src);
+    r->entry.ip.smsk.s_addr = 0xFFFFFFFFu;
+    snprintf(r->entry.ip.outiface, IFNAMSIZ, "%s", parent_iface);
+    memset(r->entry.ip.outiface_mask, 0xFF, strlen(r->entry.ip.outiface) + 1);
+
+    uint16_t match_size = (uint16_t)XT_ALIGN(sizeof(struct xt_entry_match) + sizeof(struct xt_tcp));
+    uint16_t target_size = (uint16_t)XT_ALIGN(sizeof(struct xt_standard_target));
+
+    r->entry.target_offset = (uint16_t)sizeof(struct ipt_entry) + match_size;
+    r->entry.next_offset = r->entry.target_offset + target_size;
+
+    r->match.u.user.match_size = match_size;
+    snprintf(r->match.u.user.name, XT_EXTENSION_MAXNAMELEN, "tcp");
+    r->tcp.flg_mask = 0x04; /* TH_RST */
+    r->tcp.flg_cmp  = 0x04; /* TH_RST */
+
+    r->target.target.u.user.target_size = target_size;
+    snprintf(r->target.target.u.user.name, XT_EXTENSION_MAXNAMELEN, "%s", "");
+    r->target.verdict = -1; /* -NF_DROP - 1 */
+}
+
+static bool is_matching_rst_drop_rule(const struct ipt_entry *e, const char *parent_iface, const char *vip) {
+    if (e->ip.proto != IPPROTO_TCP) return false;
+    struct in_addr vip_in;
+    if (inet_pton(AF_INET, vip, &vip_in) != 1) return false;
+    if (e->ip.src.s_addr != vip_in.s_addr) return false;
+    if (strncmp(e->ip.outiface, parent_iface, IFNAMSIZ) != 0) return false;
+    return true;
+}
+
+static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
+    if (geteuid() != 0 || !parent_iface || !vip || parent_iface[0] == '\0' || vip[0] == '\0') return;
+
+    int s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (s < 0) return;
+
+    struct ipt_getinfo info;
+    memset(&info, 0, sizeof(info));
+    snprintf(info.name, sizeof(info.name), "filter");
+    socklen_t in_len = sizeof(info);
+    if (getsockopt(s, IPPROTO_IP, IPT_SO_GET_INFO, &info, &in_len) < 0) {
+        close(s);
+        return;
+    }
+
+    size_t get_size = sizeof(struct ipt_get_entries) + info.size;
+    struct ipt_get_entries *entries = malloc(get_size);
+    if (!entries) {
+        close(s);
+        return;
+    }
+    memset(entries, 0, get_size);
+    snprintf(entries->name, sizeof(entries->name), "filter");
+    entries->size = info.size;
+    socklen_t ent_len = (socklen_t)get_size;
+    if (getsockopt(s, IPPROTO_IP, IPT_SO_GET_ENTRIES, entries, &ent_len) < 0) {
+        free(entries);
+        close(s);
+        return;
+    }
+
+    size_t offset = 0;
+    while (offset < info.size) {
+        struct ipt_entry *e = (struct ipt_entry *)((char *)entries->entrytable + offset);
+        if (is_matching_rst_drop_rule(e, parent_iface, vip)) {
+            free(entries);
+            close(s);
+            return;
+        }
+        if (e->next_offset == 0) break;
+        offset += e->next_offset;
+    }
+
+    VrrpRstDropRule rule;
+    build_vrrp_rst_drop_rule(&rule, parent_iface, vip);
+    size_t rule_size = sizeof(rule);
+
+    unsigned int ins_off = info.hook_entry[NF_INET_LOCAL_OUT];
+    if (ins_off > info.size) ins_off = info.size;
+
+    size_t new_size = info.size + rule_size;
+    struct ipt_replace *repl = calloc(1, sizeof(struct ipt_replace) + new_size);
+    if (!repl) {
+        free(entries);
+        close(s);
+        return;
+    }
+
+    snprintf(repl->name, sizeof(repl->name), "filter");
+    repl->valid_hooks = info.valid_hooks;
+    repl->num_entries = info.num_entries + 1;
+    repl->size = (unsigned int)new_size;
+
+    for (int h = 0; h < NF_INET_NUMHOOKS; h++) {
+        repl->hook_entry[h] = info.hook_entry[h];
+        repl->underflow[h] = info.underflow[h];
+        if (h > NF_INET_LOCAL_OUT && repl->hook_entry[h] >= ins_off) {
+            repl->hook_entry[h] += (unsigned int)rule_size;
+        }
+        if (h >= NF_INET_LOCAL_OUT && repl->underflow[h] >= ins_off) {
+            repl->underflow[h] += (unsigned int)rule_size;
+        }
+    }
+
+    char *dst = (char *)repl->entries;
+    memcpy(dst, entries->entrytable, ins_off);
+    memcpy(dst + ins_off, &rule, rule_size);
+    memcpy(dst + ins_off + rule_size, (char *)entries->entrytable + ins_off, info.size - ins_off);
+
+    setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size));
+
+    free(repl);
+    free(entries);
+    close(s);
+}
+
+static void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
+    if (geteuid() != 0 || !parent_iface || !vip || parent_iface[0] == '\0' || vip[0] == '\0') return;
+
+    int s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (s < 0) return;
+
+    struct ipt_getinfo info;
+    memset(&info, 0, sizeof(info));
+    snprintf(info.name, sizeof(info.name), "filter");
+    socklen_t in_len = sizeof(info);
+    if (getsockopt(s, IPPROTO_IP, IPT_SO_GET_INFO, &info, &in_len) < 0) {
+        close(s);
+        return;
+    }
+
+    size_t get_size = sizeof(struct ipt_get_entries) + info.size;
+    struct ipt_get_entries *entries = malloc(get_size);
+    if (!entries) {
+        close(s);
+        return;
+    }
+    memset(entries, 0, get_size);
+    snprintf(entries->name, sizeof(entries->name), "filter");
+    entries->size = info.size;
+    socklen_t ent_len = (socklen_t)get_size;
+    if (getsockopt(s, IPPROTO_IP, IPT_SO_GET_ENTRIES, entries, &ent_len) < 0) {
+        free(entries);
+        close(s);
+        return;
+    }
+
+    size_t offset = 0;
+    size_t rem_off = 0;
+    size_t rem_size = 0;
+    bool found = false;
+    while (offset < info.size) {
+        struct ipt_entry *e = (struct ipt_entry *)((char *)entries->entrytable + offset);
+        if (!found && is_matching_rst_drop_rule(e, parent_iface, vip)) {
+            found = true;
+            rem_off = offset;
+            rem_size = e->next_offset;
+        }
+        if (e->next_offset == 0) break;
+        offset += e->next_offset;
+    }
+
+    if (!found || rem_size == 0) {
+        free(entries);
+        close(s);
+        return;
+    }
+
+    size_t new_size = info.size - rem_size;
+    struct ipt_replace *repl = calloc(1, sizeof(struct ipt_replace) + new_size);
+    if (!repl) {
+        free(entries);
+        close(s);
+        return;
+    }
+
+    snprintf(repl->name, sizeof(repl->name), "filter");
+    repl->valid_hooks = info.valid_hooks;
+    repl->num_entries = info.num_entries - 1;
+    repl->size = (unsigned int)new_size;
+
+    for (int h = 0; h < NF_INET_NUMHOOKS; h++) {
+        repl->hook_entry[h] = info.hook_entry[h];
+        repl->underflow[h] = info.underflow[h];
+        if (h > NF_INET_LOCAL_OUT && repl->hook_entry[h] > rem_off) {
+            repl->hook_entry[h] -= (unsigned int)rem_size;
+        }
+        if (h >= NF_INET_LOCAL_OUT && repl->underflow[h] > rem_off) {
+            repl->underflow[h] -= (unsigned int)rem_size;
+        }
+    }
+
+    char *dst = (char *)repl->entries;
+    memcpy(dst, entries->entrytable, rem_off);
+    memcpy(dst + rem_off, (char *)entries->entrytable + rem_off + rem_size, info.size - (rem_off + rem_size));
+
+    setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size));
+
+    free(repl);
+    free(entries);
+    close(s);
+}
+#else
+static __attribute__((unused)) void install_vip_rst_filter(const char *parent_iface, const char *vip) {
+    (void)parent_iface;
+    (void)vip;
+}
+static __attribute__((unused)) void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
+    (void)parent_iface;
+    (void)vip;
+}
+#endif
 
 static void disarm_vip_cleanup_guard(void) {
     if (s_vip_guard_pipe[1] >= 0) {
@@ -912,6 +1155,7 @@ static void acquire_virtual_ip(void) {
             (void)arc;
             s_last_garp_sent_ms = now_monotonic_ms();
             s_garp_burst_remaining = 3;
+            install_vip_rst_filter(iface, clean_vip);
         }
 #endif
 
@@ -986,11 +1230,13 @@ static void release_virtual_ip(void) {
 #else
         if (s_vmac_iface_created && is_safe_iface_name(prev_active_iface)) {
             snprintf(cmd, sizeof(cmd),
+                     "ip link set dev %.31s promisc off >/dev/null 2>&1 || true; "
                      "ip rule del from %.45s lookup %d >/dev/null 2>&1 || true; "
                      "ip route flush table %d >/dev/null 2>&1 || true; "
                      "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
                      "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
                      "ip link del dev %.31s >/dev/null 2>&1 || true",
+                     g_config.vip_interface,
                      clean_vip, rtable, rtable,
                      clean_vip, prev_active_iface,
                      clean_vip, prefix, prev_active_iface,
@@ -1000,13 +1246,16 @@ static void release_virtual_ip(void) {
             s_vmac_iface_created = false;
         } else {
             snprintf(cmd, sizeof(cmd),
+                     "ip link set dev %.31s promisc off >/dev/null 2>&1 || true; "
                      "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
                      "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true",
+                     g_config.vip_interface,
                      clean_vip, g_config.vip_interface,
                      clean_vip, prefix, g_config.vip_interface);
             int rc = system(cmd);
             (void)rc;
         }
+        install_vip_rst_filter(g_config.vip_interface, clean_vip);
 #endif
         s_vip_bound_kernel = false;
     }
@@ -2356,6 +2605,7 @@ bool cluster_start(void) {
                 if (s_iface_primary_ip[0] != '\0' && s_saved_orig_mac[0] != '\0') {
                     send_vrrp_garp_on_iface(parent_iface, s_iface_primary_ip, s_saved_orig_mac);
                 }
+                install_vip_rst_filter(parent_iface, clean_vip);
             }
 #endif
         }
@@ -2476,6 +2726,12 @@ void cluster_stop(void) {
     if (s_wakeup_pipe[1] >= 0) {
         close(s_wakeup_pipe[1]);
         s_wakeup_pipe[1] = -1;
+    }
+
+    char clean_vip[64] = {0};
+    int prefix = 32;
+    if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+        remove_vip_rst_filter(g_config.vip_interface, clean_vip);
     }
 
     atomic_store(&s_vrrp_state, VRRP_STATE_DISABLED);
