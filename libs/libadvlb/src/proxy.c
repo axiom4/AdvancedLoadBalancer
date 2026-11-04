@@ -1282,6 +1282,32 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
         return;
     }
 
+    // If backend closed while connection is idle in Keep-Alive, release backend socket
+    // and hold client connection open for future requests (HTTP keep-alive decoupling)
+    if (conn->backend_closed && !conn->client_closed &&
+        buffer_available(&conn->c2b) == 0 && buffer_available(&conn->b2c) == 0 &&
+        conn->keep_alive_eligible) {
+        if (conn->backend_fd >= 0) {
+            epoll_ctl(worker->epfd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
+            worker_clear_fd(worker, conn->backend_fd);
+            close(conn->backend_fd);
+            conn->backend_fd = -1;
+            conn->last_backend_ev = 0;
+        }
+        if (conn->backend_idx >= 0) {
+            release_backend(conn->backend_idx);
+            conn->backend_idx = -1;
+        }
+        conn->backend_closed = false;
+        conn->backend_shut_wr = false;
+        conn->bytes_to_backend = 0;
+        conn->bytes_from_backend = 0;
+        conn->l7_session_checked = false;
+        add_log("\033[1;36m[CONN POOL]\033[0m Backend closed idle keep-alive socket; holding client socket open for next request");
+        worker_update_conn_epoll(worker, conn);
+        return;
+    }
+
     // Check half-close completion (send FIN exactly once per direction)
     if (conn->client_closed && buffer_available(&conn->c2b) == 0 && !conn->backend_shut_wr) {
         if (conn->backend_fd >= 0) shutdown(conn->backend_fd, SHUT_WR);
@@ -1292,6 +1318,9 @@ static void worker_handle_forwarding_io(WorkerThread *worker, ProxyConnection *c
         if (conn->client_ssl) {
             SSL_shutdown(conn->client_ssl);
         } else if (conn->client_fd >= 0) {
+            if (g_config.enable_ssl_offloading) {
+                ktls_send_close_notify(conn->client_fd);
+            }
             shutdown(conn->client_fd, SHUT_WR);
         }
         conn->client_shut_wr = true;

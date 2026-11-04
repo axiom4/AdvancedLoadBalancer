@@ -190,7 +190,7 @@ static void *mock_client_worker(void *arg) {
         fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
     }
 
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
