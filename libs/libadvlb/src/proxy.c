@@ -474,7 +474,12 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const
 #ifdef __linux__
             /* Enable TCP_REPAIR before close so kernel frees 4-tuple immediately without RST/FIN or TIME_WAIT */
             int repair_on = 1;
-            setsockopt(conn->client_fd, 6 /* SOL_TCP */, 19 /* TCP_REPAIR */, &repair_on, sizeof(repair_on));
+            if (setsockopt(conn->client_fd, 6 /* SOL_TCP */, 19 /* TCP_REPAIR */, &repair_on, sizeof(repair_on)) < 0) {
+                add_log("\033[1;33m[HA CLOSE]\033[0m setsockopt TCP_REPAIR before close: %s (errno %d, fd=%d)",
+                        strerror(errno), errno, conn->client_fd);
+            }
+            int no_q = 0; /* TCP_NO_QUEUE */
+            setsockopt(conn->client_fd, 6 /* SOL_TCP */, 20 /* TCP_REPAIR_QUEUE */, &no_q, sizeof(no_q));
 #endif
         }
         close(conn->client_fd);

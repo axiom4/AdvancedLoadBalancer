@@ -1858,6 +1858,9 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
                 s_master_effective_prio = 0;
                 atomic_store_explicit(&s_current_master_id, 0, memory_order_relaxed);
             }
+            if (my_state != VRRP_STATE_MASTER && !s_manual_demoted) {
+                transition_to_master(now_ms);
+            }
         } else if (sender_state == VRRP_STATE_MASTER) {
             if (my_state == VRRP_STATE_MASTER) {
                 /* Split-brain / simultaneous Master tie-break */
@@ -2555,16 +2558,21 @@ void cluster_trigger_stepdown(void) {
         s_manual_demoted = false;
         s_stepdown_until_ms = 0;
 
-        /* Broadcast switchover packet instructing peer Master to step down */
-        ClusterWirePacket sw_pkt;
-        size_t sw_len = prepare_packet(&sw_pkt, CLUSTER_PKT_SWITCHOVER, 0, false, NULL, 0);
-        for (int b = 0; b < 2; b++) {
-            broadcast_cluster_packet(&sw_pkt, sw_len);
+        uint32_t master_id = atomic_load_explicit(&s_current_master_id, memory_order_relaxed);
+        if (master_id != 0 && master_id != s_node_id) {
+            /* Broadcast switchover packet instructing peer Master to step down and handover active conns */
+            ClusterWirePacket sw_pkt;
+            size_t sw_len = prepare_packet(&sw_pkt, CLUSTER_PKT_SWITCHOVER, 0, false, NULL, 0);
+            for (int b = 0; b < 2; b++) {
+                broadcast_cluster_packet(&sw_pkt, sw_len);
+            }
+            add_log("\033[1;35m[VRRP SWITCHOVER]\033[0m Sent takeover request to Master Node %08X (awaiting connection handover)...", master_id);
+            s_last_master_advert_ms = now_ms;
+        } else {
+            /* No remote Master active: promote immediately */
+            transition_to_master(now_ms);
+            add_log("\033[1;32m[VRRP SWITCHOVER]\033[0m Node %08X promoted to MASTER upon manual switch request", s_node_id);
         }
-
-        /* Immediately transition this node to MASTER */
-        transition_to_master(now_ms);
-        add_log("\033[1;32m[VRRP SWITCHOVER]\033[0m Node %08X promoted to MASTER upon manual switch request", s_node_id);
     }
     wakeup_cluster_thread();
 }
