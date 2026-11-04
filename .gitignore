@@ -7,6 +7,7 @@ test_suite
 # Directory e oggetti di build
 build/
 *.o
+*.d
 
 # Librerie generate
 lib/

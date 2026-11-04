@@ -44,9 +44,9 @@ typedef struct {
     uint8_t  snd_wscale;
     uint8_t  rcv_wscale;
     bool     has_timestamps;
+    bool     is_ktls;
     uint32_t ts_val;
     uint32_t ts_ecr;
-    bool     is_ktls;
     KtlsCryptoCheckpoint ktls;
 } TcpSocketCheckpoint;
 

@@ -2,7 +2,7 @@ CC ?= gcc
 AR ?= ar
 ARFLAGS = rcs
 
-CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11 -Iinclude
+CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11 -Iinclude -MMD -MP
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
@@ -51,6 +51,8 @@ export: static shared
 
 clean:
 	rm -rf $(BUILD_DIR) $(LIB_DIR)
+
+-include $(OBJS:.o=.d)
 
 .PHONY: all directories static shared dynamic export clean
 

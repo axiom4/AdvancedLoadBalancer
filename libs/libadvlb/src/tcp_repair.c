@@ -252,10 +252,12 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
             add_log("\033[1;32m[HA CHECKPOINT OK]\033[0m Captured kTLS state (cipher=%u, ver=0x%04x, fd=%d)",
                     tx_u.info.cipher_type, tx_u.info.version, sock_fd);
         } else {
+            out_cp->is_ktls = false;
             add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m getsockopt SOL_TLS TLS_RX failed: %s (errno %d, fd=%d)",
                     strerror(errno), errno, sock_fd);
         }
     } else {
+        out_cp->is_ktls = false;
         add_log("\033[1;33m[HA CHECKPOINT]\033[0m getsockopt SOL_TLS TLS_TX: %s (errno %d, fd=%d)",
                 strerror(errno), errno, sock_fd);
     }
@@ -296,6 +298,8 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
                 strerror(errno), errno);
     }
 
+    add_log("\033[1;32m[HA CHECKPOINT DONE]\033[0m fd=%d is_ktls=%s snd_seq=%u",
+            sock_fd, out_cp->is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", out_cp->snd_seq);
     return true;
 #else
     return true;

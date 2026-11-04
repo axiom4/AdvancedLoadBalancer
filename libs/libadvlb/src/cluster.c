@@ -1332,8 +1332,9 @@ void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
             char cip[INET6_ADDRSTRLEN];
             int cport = 0;
             get_client_ip_port(client_addr, cip, sizeof(cip), &cport);
-            add_log("\033[1;34m[HA SYNC]\033[0m Replicated TCP stream for %s:%d (kTLS=%s, snd_seq=%u)",
-                    cip, cport, cp.is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", cp.snd_seq);
+            add_log("\033[1;34m[HA SYNC]\033[0m Replicated TCP stream for %s:%d (kTLS=%s, wire_flags=0x%02x, snd_seq=%u)",
+                    cip, cport, cp.is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m",
+                    (unsigned int)pkt.tcp_cp.flags, cp.snd_seq);
         }
     }
 
@@ -1579,7 +1580,7 @@ static size_t prepare_tcp_checkpoint_packet(ClusterWirePacket *pkt,
     snprintf(pkt->hdr.virtual_ip, sizeof(pkt->hdr.virtual_ip), "%.45s", g_config.virtual_ip);
     pkt->hdr.session_count = htons(1);
 
-    if (cp_wire) {
+    if (cp_wire && cp_wire != &pkt->tcp_cp) {
         pkt->tcp_cp = *cp_wire;
     }
 

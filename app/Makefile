@@ -1,7 +1,7 @@
 CC ?= gcc
 
 CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11
-override CFLAGS += -I../include -I../libs/libadvlb/include -I../libs/libadvnet/include
+override CFLAGS += -I../include -I../libs/libadvlb/include -I../libs/libadvnet/include -MMD -MP
 UNAME_S := $(shell uname -s)
 
 NET_LIB_DIR ?= ../libs/libadvnet/lib
@@ -47,6 +47,8 @@ dynamic: $(OBJ)
 	$(CC) $(CFLAGS) $(OBJ) -L$(LB_LIB_DIR) -L$(NET_LIB_DIR) -ladvlb -ladvnet $(RPATH_BIN) -o $(TARGET) $(LDFLAGS) $(LDLIBS)
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(OBJ:.o=.d) $(TARGET)
+
+-include $(OBJ:.o=.d)
 
 .PHONY: all static dynamic clean

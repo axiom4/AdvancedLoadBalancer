@@ -3,7 +3,7 @@ AR ?= ar
 ARFLAGS = rcs
 
 CFLAGS ?= -Wall -Wextra -pthread -O2 -std=gnu11
-override CFLAGS += -Iinclude -I../libadvnet/include
+override CFLAGS += -Iinclude -I../libadvnet/include -MMD -MP
 UNAME_S := $(shell uname -s)
 
 NET_LIB_DIR ?= ../libadvnet/lib
@@ -82,5 +82,7 @@ export: static shared
 
 clean:
 	rm -rf $(BUILD_DIR) $(LIB_DIR)
+
+-include $(OBJS:.o=.d)
 
 .PHONY: all directories static shared dynamic export clean
