@@ -312,10 +312,54 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
 #endif
 }
 
+#ifdef __linux__
+/* Format sockaddr as plain IP string; IPv4-mapped IPv6 (::ffff:a.b.c.d) is unwrapped to IPv4,
+ * which is how netfilter conntrack tracks dual-stack flows. */
+static bool sockaddr_to_ct_ip(const struct sockaddr_storage *ss, char *out, size_t out_sz, int *out_port) {
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)ss;
+        *out_port = ntohs(s4->sin_port);
+        return inet_ntop(AF_INET, &s4->sin_addr, out, (socklen_t)out_sz) != NULL;
+    }
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)ss;
+        *out_port = ntohs(s6->sin6_port);
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+            return inet_ntop(AF_INET, &s6->sin6_addr.s6_addr[12], out, (socklen_t)out_sz) != NULL;
+        }
+        return inet_ntop(AF_INET6, &s6->sin6_addr, out, (socklen_t)out_sz) != NULL;
+    }
+    return false;
+}
+
+/* Drop any stale netfilter conntrack entry for this 4-tuple left over from a previous
+ * ownership period of this node. The stale entry has outdated seq/ack windows: packets of the
+ * restored stream would be classified INVALID (and dropped/rejected by typical firewall rules). */
+static void flush_stale_conntrack_entry(const TcpSocketCheckpoint *cp) {
+    if (geteuid() != 0) return;
+    char cip[INET6_ADDRSTRLEN] = {0};
+    char lip[INET6_ADDRSTRLEN] = {0};
+    int cport = 0, lport = 0;
+    if (!sockaddr_to_ct_ip(&cp->remote_addr, cip, sizeof(cip), &cport)) return;
+    if (!sockaddr_to_ct_ip(&cp->local_addr, lip, sizeof(lip), &lport)) return;
+    if (cport <= 0 || lport <= 0) return;
+
+    char cmd[384];
+    snprintf(cmd, sizeof(cmd),
+             "command -v conntrack >/dev/null 2>&1 && "
+             "conntrack -D -p tcp -s %s --sport %d -d %s --dport %d >/dev/null 2>&1; true",
+             cip, cport, lip, lport);
+    int rc = system(cmd);
+    (void)rc;
+}
+#endif
+
 int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     if (!cp) return -1;
 
 #ifdef __linux__
+    flush_stale_conntrack_entry(cp);
+
     int domain = cp->remote_addr.ss_family;
     if (domain != AF_INET && domain != AF_INET6) domain = AF_INET;
 

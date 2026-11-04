@@ -854,7 +854,8 @@ static void acquire_virtual_ip(void) {
                          "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 >/dev/null 2>&1 || true; "
                          "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_filter=0 "
                          "net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 "
-                         "net.ipv4.conf.%.31s.accept_local=1 >/dev/null 2>&1 || true",
+                         "net.ipv4.conf.%.31s.accept_local=1 >/dev/null 2>&1 || true; "
+                         "sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true",
                          iface,
                          iface, iface, iface,
                          s_active_vip_iface, s_active_vip_iface,
