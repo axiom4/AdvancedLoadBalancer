@@ -99,6 +99,9 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
 /* Recreate and restore an established socket on the destination machine */
 int tcp_repair_restore(const TcpSocketCheckpoint *cp);
 
+/* Send TLS close_notify alert over kTLS socket */
+bool ktls_send_close_notify(int fd);
+
 /* Encode/Decode wire format */
 void tcp_checkpoint_to_wire(const TcpSocketCheckpoint *cp,
                             int backend_idx,

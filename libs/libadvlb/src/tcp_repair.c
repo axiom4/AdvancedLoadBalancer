@@ -54,6 +54,9 @@
 #ifndef TLS_RX
 #define TLS_RX 2
 #endif
+#ifndef TLS_SET_RECORD_TYPE
+#define TLS_SET_RECORD_TYPE 1
+#endif
 
 struct adlb_tcp_repair_opt {
     uint32_t opt_code;
@@ -109,6 +112,41 @@ bool ktls_is_supported(void) {
     close(s);
     return (res == 0 || errno == EEXIST || errno == ENOPROTOOPT);
 #else
+    return false;
+#endif
+}
+
+bool ktls_send_close_notify(int fd) {
+#ifdef __linux__
+    if (fd < 0) return false;
+    unsigned char alert[2] = { 1, 0 }; /* Warning (1), close_notify (0) */
+    unsigned char record_type = 21;    /* TLS Alert record */
+
+    char cbuf[CMSG_SPACE(sizeof(record_type))];
+    memset(cbuf, 0, sizeof(cbuf));
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg) return false;
+    cmsg->cmsg_level = SOL_TLS;
+    cmsg->cmsg_type = TLS_SET_RECORD_TYPE;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(record_type));
+    memcpy(CMSG_DATA(cmsg), &record_type, sizeof(record_type));
+
+    struct iovec iov;
+    iov.iov_base = alert;
+    iov.iov_len = sizeof(alert);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    return sent > 0;
+#else
+    (void)fd;
     return false;
 #endif
 }
