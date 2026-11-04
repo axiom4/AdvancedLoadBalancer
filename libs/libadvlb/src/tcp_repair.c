@@ -144,6 +144,8 @@ bool ktls_send_close_notify(int fd) {
     msg.msg_iovlen = 1;
 
     ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
+    add_log("\033[1;33m[HA CLOSE]\033[0m ktls_send_close_notify fd=%d sent=%zd (errno=%d: %s)",
+            fd, sent, (sent < 0 ? errno : 0), strerror(sent < 0 ? errno : 0));
     return sent > 0;
 #else
     (void)fd;

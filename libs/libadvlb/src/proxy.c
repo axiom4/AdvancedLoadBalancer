@@ -466,6 +466,9 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn) {
             /* Send TLS close_notify alert over kTLS socket so peer terminates cleanly */
             ktls_send_close_notify(conn->client_fd);
         }
+        if (!preserve_for_failover) {
+            shutdown(conn->client_fd, SHUT_WR);
+        }
         close(conn->client_fd);
         conn->client_fd = -1;
     }
