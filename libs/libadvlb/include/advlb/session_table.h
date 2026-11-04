@@ -6,6 +6,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "advlb/tcp_repair.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,6 +94,9 @@ bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
                                     const char *initial_req,
                                     uint16_t req_len,
                                     uint64_t bytes_to_client);
+
+/* Store TCP_REPAIR + kTLS checkpoint received over cluster UDP */
+bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire);
 
 /* Promote all passive shadow sockets into the active worker pool upon becoming VRRP MASTER */
 int session_table_promote_shadow_conns(void);

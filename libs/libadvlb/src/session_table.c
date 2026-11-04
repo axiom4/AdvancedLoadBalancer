@@ -39,6 +39,8 @@ typedef struct SessionNode {
     uint64_t version;
     int shadow_client_fd;
     int shadow_backend_fd;
+    bool has_tcp_checkpoint;
+    TcpSocketCheckpoint checkpoint;
     uint64_t bytes_to_client;
     uint16_t req_len;
     char initial_req[512];
@@ -744,6 +746,68 @@ bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
     return true;
 }
 
+bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire) {
+    if (!s_initialized) session_table_init();
+    if (!wire) return false;
+
+    TcpSocketCheckpoint cp;
+    int b_idx = -1;
+    char b_ip[46];
+    uint16_t b_port = 0;
+    uint64_t bytes_to_client = 0;
+    char initial_req[512];
+    uint16_t req_len = 0;
+
+    tcp_checkpoint_from_wire(wire, &cp, &b_idx, b_ip, &b_port, &bytes_to_client, initial_req, &req_len);
+
+    uint8_t family = (wire->family == AF_INET6) ? WIRE_FAMILY_IPV6 : WIRE_FAMILY_IPV4;
+    uint8_t proto = SESSION_PROTO_TCP;
+    uint16_t port = wire->client_port;
+
+    uint32_t h = compute_key_hash(family, proto, wire->client_ip, port);
+    uint32_t shard_idx = h % SESSION_SHARDS;
+    uint32_t bucket_idx = (h / SESSION_SHARDS) % SESSION_BUCKETS_PER_SHARD;
+
+    SessionShard *shard = &s_shards[shard_idx];
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&shard->mutex);
+    SessionNode *node = shard_find_locked(shard, bucket_idx, family, proto, wire->client_ip, port);
+    if (!node) {
+        node = shard_alloc_slot_locked(shard, now);
+        memset(node, 0, sizeof(*node));
+        node->shadow_client_fd = -1;
+        node->shadow_backend_fd = -1;
+        node->in_use = true;
+        node->family = family;
+        node->proto = proto;
+        node->client_port = port;
+        memcpy(node->client_ip, wire->client_ip, 16);
+        node->hash_next = shard->buckets[bucket_idx];
+        shard->buckets[bucket_idx] = node;
+        shard->active_count++;
+        atomic_fetch_add_explicit(&s_total_sessions, 1, memory_order_relaxed);
+    }
+
+    int resolved_idx = resolve_backend_index(b_ip, b_port, b_idx);
+    node->backend_idx = resolved_idx;
+    strncpy(node->backend_ip, b_ip, sizeof(node->backend_ip) - 1);
+    node->backend_port = b_port;
+    node->has_tcp_checkpoint = true;
+    node->checkpoint = cp;
+    node->bytes_to_client = bytes_to_client;
+    if (req_len > 0) {
+        if (req_len > sizeof(node->initial_req)) req_len = sizeof(node->initial_req);
+        memcpy(node->initial_req, initial_req, req_len);
+        node->req_len = req_len;
+    }
+    node->last_seen = now;
+    node->ttl_sec = (g_config.session_ttl_sec > 0) ? (uint32_t)g_config.session_ttl_sec : DEFAULT_SESSION_TTL_SEC;
+
+    pthread_mutex_unlock(&shard->mutex);
+    return true;
+}
+
 int session_table_promote_shadow_conns(void) {
     if (!s_initialized) return 0;
     int promoted = 0;
@@ -761,35 +825,43 @@ int session_table_promote_shadow_conns(void) {
 
             pthread_mutex_lock(&shard->mutex);
             SessionNode *node = &shard->nodes[i];
-            if (node->in_use && node->shadow_client_fd >= 0) {
-                cfd = node->shadow_client_fd;
-                bfd = node->shadow_backend_fd;
-                node->shadow_client_fd = -1;
-                node->shadow_backend_fd = -1;
-
-                b_idx = node->backend_idx;
-                if (b_idx < 0 || b_idx >= g_num_backends) {
-                    b_idx = resolve_backend_index(node->backend_ip, node->backend_port, b_idx);
-                    node->backend_idx = b_idx;
-                }
-                bytes_sent = node->bytes_to_client;
-                req_len = node->req_len;
-                if (req_len > sizeof(req_copy)) req_len = sizeof(req_copy);
-                if (req_len > 0) {
-                    memcpy(req_copy, node->initial_req, req_len);
+            if (node->in_use) {
+                if (node->shadow_client_fd >= 0) {
+                    cfd = node->shadow_client_fd;
+                    bfd = node->shadow_backend_fd;
+                    node->shadow_client_fd = -1;
+                    node->shadow_backend_fd = -1;
+                } else if (node->has_tcp_checkpoint) {
+                    cfd = tcp_repair_restore(&node->checkpoint);
+                    bfd = -1;
+                    node->has_tcp_checkpoint = false;
                 }
 
-                memset(&client_addr, 0, sizeof(client_addr));
-                if (node->family == WIRE_FAMILY_IPV6) {
-                    struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&client_addr;
-                    s6->sin6_family = AF_INET6;
-                    s6->sin6_port = node->client_port;
-                    memcpy(&s6->sin6_addr, node->client_ip, 16);
-                } else {
-                    struct sockaddr_in *s4 = (struct sockaddr_in *)&client_addr;
-                    s4->sin_family = AF_INET;
-                    s4->sin_port = node->client_port;
-                    memcpy(&s4->sin_addr.s_addr, node->client_ip, 4);
+                if (cfd >= 0) {
+                    b_idx = node->backend_idx;
+                    if (b_idx < 0 || b_idx >= g_num_backends) {
+                        b_idx = resolve_backend_index(node->backend_ip, node->backend_port, b_idx);
+                        node->backend_idx = b_idx;
+                    }
+                    bytes_sent = node->bytes_to_client;
+                    req_len = node->req_len;
+                    if (req_len > sizeof(req_copy)) req_len = sizeof(req_copy);
+                    if (req_len > 0) {
+                        memcpy(req_copy, node->initial_req, req_len);
+                    }
+
+                    memset(&client_addr, 0, sizeof(client_addr));
+                    if (node->family == WIRE_FAMILY_IPV6) {
+                        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&client_addr;
+                        s6->sin6_family = AF_INET6;
+                        s6->sin6_port = node->client_port;
+                        memcpy(&s6->sin6_addr, node->client_ip, 16);
+                    } else {
+                        struct sockaddr_in *s4 = (struct sockaddr_in *)&client_addr;
+                        s4->sin_family = AF_INET;
+                        s4->sin_port = node->client_port;
+                        memcpy(&s4->sin_addr.s_addr, node->client_ip, 4);
+                    }
                 }
             }
             pthread_mutex_unlock(&shard->mutex);

@@ -33,6 +33,9 @@ static SSL_CTX *create_and_configure_ssl_ctx(const char *cert_path, const char *
     // - SSL_OP_NO_RENEGOTIATION: Prevent client-initiated TLS renegotiation DoS attacks
     // - SSL_OP_SINGLE_ECDH_USE / SSL_OP_SINGLE_DH_USE: Ensure Perfect Forward Secrecy (PFS)
     long ssl_opts = SSL_OP_NO_COMPRESSION | SSL_OP_CIPHER_SERVER_PREFERENCE;
+#ifdef SSL_OP_ENABLE_KTLS
+    ssl_opts |= SSL_OP_ENABLE_KTLS;
+#endif
 #ifdef SSL_OP_NO_RENEGOTIATION
     ssl_opts |= SSL_OP_NO_RENEGOTIATION;
 #endif

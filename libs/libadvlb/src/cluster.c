@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "advlb/cluster.h"
 #include "advlb/session_table.h"
+#include "advlb/tcp_repair.h"
 #include "advlb/balancer.h"
 #include "advlb/config.h"
 #include "advlb/log.h"
@@ -45,6 +46,7 @@
 #define CLUSTER_PKT_SYNC_REQ       4
 #define CLUSTER_PKT_SYNC_CHUNK     5
 #define CLUSTER_PKT_SWITCHOVER     6
+#define CLUSTER_PKT_TCP_CHECKPOINT 7
 
 #define CLUSTER_UNIX_FD_MAGIC        0x41444644u /* "ADFD" */
 #define CLUSTER_UNIX_OP_UPSERT_FDS   1
@@ -92,7 +94,10 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     ClusterPacketHeader hdr;
-    ClusterSessionWire  sessions[CLUSTER_MAX_BATCH_SESSIONS];
+    union {
+        ClusterSessionWire       sessions[CLUSTER_MAX_BATCH_SESSIONS];
+        ClusterTcpCheckpointWire tcp_cp;
+    };
 } ClusterWirePacket;
 
 typedef struct {
@@ -113,6 +118,8 @@ static pthread_mutex_t s_sq_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int s_cluster_fd = -1;
 static bool s_is_custom_socket = false;
 static bool s_custom_socket_hup = false;
+static void broadcast_cluster_packet(const ClusterWirePacket *pkt, size_t total_len);
+static size_t prepare_tcp_checkpoint_packet(ClusterWirePacket *pkt, const ClusterTcpCheckpointWire *cp_wire);
 static int s_unix_fd = -1;
 static char s_unix_path[108] = {0};
 static int s_alive_pipe[2] = {-1, -1};
@@ -1309,42 +1316,58 @@ void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
                                  uint16_t req_len,
                                  uint64_t bytes_to_client) {
     if (!s_cluster_running || !client_addr || client_fd < 0) return;
-    if (s_unix_fd < 0 && !(s_is_custom_socket && s_cluster_fd >= 0)) return;
 
-    ClusterUnixFdMsg m;
-    memset(&m, 0, sizeof(m));
-    m.magic = htonl(CLUSTER_UNIX_FD_MAGIC);
-    m.op = CLUSTER_UNIX_OP_UPSERT_FDS;
-    m.vrid = (uint8_t)(g_config.vrrp_router_id > 0 ? g_config.vrrp_router_id : 51);
-    m.sender_node_id = htonl(s_node_id);
-    m.backend_idx = backend_idx;
-    if (backend_idx >= 0 && backend_idx < g_num_backends) {
-        strncpy(m.backend_ip, g_backends[backend_idx].ip, sizeof(m.backend_ip) - 1);
-        m.backend_port = (uint16_t)g_backends[backend_idx].port;
-    }
-    m.client_addr = *client_addr;
-    m.bytes_to_client = bytes_to_client;
-    if (initial_req && req_len > 0) {
-        if (req_len > sizeof(m.initial_req)) req_len = sizeof(m.initial_req);
-        memcpy(m.initial_req, initial_req, req_len);
-        m.req_len = req_len;
+    /* 1. Broadcast network TCP_REPAIR + kTLS Checkpoint over cluster UDP */
+    if (s_cluster_fd >= 0) {
+        TcpSocketCheckpoint cp;
+        if (tcp_repair_checkpoint(client_fd, NULL, &cp)) {
+            ClusterWirePacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            const char *b_ip = (backend_idx >= 0 && backend_idx < g_num_backends) ? g_backends[backend_idx].ip : "";
+            uint16_t b_port = (backend_idx >= 0 && backend_idx < g_num_backends) ? (uint16_t)g_backends[backend_idx].port : 0;
+            tcp_checkpoint_to_wire(&cp, backend_idx, b_ip, b_port, bytes_to_client, initial_req, req_len, &pkt.tcp_cp);
+            size_t total_len = prepare_tcp_checkpoint_packet(&pkt, &pkt.tcp_cp);
+            broadcast_cluster_packet(&pkt, total_len);
+        }
     }
 
-    int fds[3];
-    int nfds = 0;
-    fds[nfds++] = client_fd;
-    m.has_client_fd = 1;
+    /* 2. Local UNIX domain socket replication (for single-host tests / child processes) */
+    if (s_unix_fd >= 0 || (s_is_custom_socket && s_cluster_fd >= 0)) {
+        ClusterUnixFdMsg m;
+        memset(&m, 0, sizeof(m));
+        m.magic = htonl(CLUSTER_UNIX_FD_MAGIC);
+        m.op = CLUSTER_UNIX_OP_UPSERT_FDS;
+        m.vrid = (uint8_t)(g_config.vrrp_router_id > 0 ? g_config.vrrp_router_id : 51);
+        m.sender_node_id = htonl(s_node_id);
+        m.backend_idx = backend_idx;
+        if (backend_idx >= 0 && backend_idx < g_num_backends) {
+            strncpy(m.backend_ip, g_backends[backend_idx].ip, sizeof(m.backend_ip) - 1);
+            m.backend_port = (uint16_t)g_backends[backend_idx].port;
+        }
+        m.client_addr = *client_addr;
+        m.bytes_to_client = bytes_to_client;
+        if (initial_req && req_len > 0) {
+            if (req_len > sizeof(m.initial_req)) req_len = sizeof(m.initial_req);
+            memcpy(m.initial_req, initial_req, req_len);
+            m.req_len = req_len;
+        }
 
-    if (backend_fd >= 0) {
-        fds[nfds++] = backend_fd;
-        m.has_backend_fd = 1;
-    }
-    if (s_alive_pipe[0] >= 0) {
-        fds[nfds++] = s_alive_pipe[0];
-        m.has_alive_fd = 1;
-    }
+        int fds[3];
+        int nfds = 0;
+        fds[nfds++] = client_fd;
+        m.has_client_fd = 1;
 
-    broadcast_unix_fd_msg(&m, fds, nfds);
+        if (backend_fd >= 0) {
+            fds[nfds++] = backend_fd;
+            m.has_backend_fd = 1;
+        }
+        if (s_alive_pipe[0] >= 0) {
+            fds[nfds++] = s_alive_pipe[0];
+            m.has_alive_fd = 1;
+        }
+
+        broadcast_unix_fd_msg(&m, fds, nfds);
+    }
 }
 
 void cluster_notify_conn_closed(const struct sockaddr_storage *client_addr, int backend_idx) {
@@ -1526,6 +1549,35 @@ static size_t prepare_packet(ClusterWirePacket *pkt,
     }
 
     size_t total_len = sizeof(ClusterPacketHeader) + (size_t)session_count * sizeof(ClusterSessionWire);
+    compute_packet_hmac(pkt, total_len, pkt->hdr.hmac);
+    return total_len;
+}
+
+static size_t prepare_tcp_checkpoint_packet(ClusterWirePacket *pkt,
+                                            const ClusterTcpCheckpointWire *cp_wire) {
+    memset(pkt, 0, sizeof(ClusterPacketHeader));
+    pkt->hdr.magic = htonl(CLUSTER_MAGIC);
+    pkt->hdr.version = CLUSTER_PROTO_VERSION;
+    pkt->hdr.pkt_type = CLUSTER_PKT_TCP_CHECKPOINT;
+    pkt->hdr.vrrp_router_id = (uint8_t)(g_config.vrrp_router_id > 0 ? g_config.vrrp_router_id : 51);
+    pkt->hdr.sender_state = (uint8_t)atomic_load_explicit(&s_vrrp_state, memory_order_relaxed);
+    pkt->hdr.base_priority = (uint8_t)(g_config.vrrp_priority > 0 ? g_config.vrrp_priority : 100);
+    pkt->hdr.effective_priority = compute_effective_priority();
+    uint16_t adv_ms = (uint16_t)(g_config.vrrp_advert_interval_ms > 0 ? g_config.vrrp_advert_interval_ms : 200);
+    pkt->hdr.advert_interval_ms = htons(adv_ms);
+    pkt->hdr.sender_node_id = htonl(s_node_id);
+
+    uint64_t seq = atomic_fetch_add_explicit(&s_seq_counter, 1, memory_order_relaxed);
+    pkt->hdr.seq_num = u64_to_net(seq);
+    pkt->hdr.timestamp_ms = u64_to_net(now_wallclock_ms());
+    snprintf(pkt->hdr.virtual_ip, sizeof(pkt->hdr.virtual_ip), "%.45s", g_config.virtual_ip);
+    pkt->hdr.session_count = htons(1);
+
+    if (cp_wire) {
+        pkt->tcp_cp = *cp_wire;
+    }
+
+    size_t total_len = sizeof(ClusterPacketHeader) + sizeof(ClusterTcpCheckpointWire);
     compute_packet_hmac(pkt, total_len, pkt->hdr.hmac);
     return total_len;
 }
@@ -1748,8 +1800,13 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
     }
 
     uint16_t sess_count = ntohs(pkt->hdr.session_count);
-    if (sess_count > CLUSTER_MAX_BATCH_SESSIONS) return;
-    size_t expected_len = sizeof(ClusterPacketHeader) + (size_t)sess_count * sizeof(ClusterSessionWire);
+    size_t expected_len;
+    if (pkt->hdr.pkt_type == CLUSTER_PKT_TCP_CHECKPOINT) {
+        expected_len = sizeof(ClusterPacketHeader) + sizeof(ClusterTcpCheckpointWire);
+    } else {
+        if (sess_count > CLUSTER_MAX_BATCH_SESSIONS) return;
+        expected_len = sizeof(ClusterPacketHeader) + (size_t)sess_count * sizeof(ClusterSessionWire);
+    }
     if (bytes_read < expected_len) return;
 
     /* Wall-clock anti-replay check */
@@ -1831,6 +1888,10 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
     } else if (pkt->hdr.pkt_type == CLUSTER_PKT_SESSION_DELETE) {
         for (uint16_t i = 0; i < sess_count; i++) {
             session_table_delete_remote(&pkt->sessions[i]);
+        }
+    } else if (pkt->hdr.pkt_type == CLUSTER_PKT_TCP_CHECKPOINT) {
+        if (session_table_store_tcp_checkpoint(&pkt->tcp_cp)) {
+            atomic_fetch_add_explicit(&s_synced_sessions, 1, memory_order_relaxed);
         }
     } else if (pkt->hdr.pkt_type == CLUSTER_PKT_SYNC_REQ) {
         /* If we are MASTER (or have active sessions), send snapshot + live FDs back to requester */

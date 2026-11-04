@@ -855,6 +855,10 @@ static void worker_handle_backend_connecting(WorkerThread *worker, ProxyConnecti
             if (!conn->l7_session_checked && buffer_available(&conn->c2b) > 0) {
                 (void)worker_apply_l7_session_affinity(worker, conn);
             }
+            if (conn->backend_fd < 0 && buffer_available(&conn->c2b) > 0) {
+                worker_start_backend_connect(worker, conn);
+                return;
+            }
         }
         return;
     }
@@ -1294,7 +1298,7 @@ static void worker_check_timeouts(WorkerThread *worker) {
     ProxyConnection *curr = worker->conn_list_head;
     while (curr) {
         ProxyConnection *next = curr->next;
-        if (g_config.enable_cluster && ! curr->client_ssl &&
+        if (g_config.enable_cluster &&
             curr->state == CONN_STATE_FORWARDING && curr->backend_fd >= 0 && !curr->fds_replicated) {
             curr->fds_replicated = true;
             curr->last_replicated_bytes = curr->bytes_to_client;
@@ -1468,12 +1472,16 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
             memcpy(buffer_write_ptr(&conn->c2b), conn->initial_req, conn->initial_req_len);
             buffer_produce(&conn->c2b, conn->initial_req_len);
             conn->skip_backend_bytes = conn->bytes_to_client;
+            if (conn->backend_idx >= 0) {
+                release_backend(conn->backend_idx);
+                conn->backend_idx = -1;
+            }
+            worker_start_backend_connect(worker, conn);
+        } else {
+            /* Client is idle in Keep-Alive waiting for the next request */
+            conn->state = CONN_STATE_FORWARDING;
+            worker_update_conn_epoll(worker, conn);
         }
-        if (conn->backend_idx >= 0) {
-            release_backend(conn->backend_idx);
-            conn->backend_idx = -1;
-        }
-        worker_start_backend_connect(worker, conn);
     }
 }
 
@@ -1484,7 +1492,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
     if (atomic_exchange_explicit(&worker->resync_requested, false, memory_order_acq_rel)) {
         ProxyConnection *c = worker->conn_list_head;
         while (c) {
-            if (c->state == CONN_STATE_FORWARDING && !c->client_ssl &&
+            if (c->state == CONN_STATE_FORWARDING &&
                 c->client_fd >= 0 && c->backend_fd >= 0) {
                 c->fds_replicated = true;
                 cluster_replicate_live_conn(&c->client_addr, c->backend_idx,
@@ -1500,7 +1508,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
         ProxyConnection *c = worker->conn_list_head;
         while (c) {
             ProxyConnection *next = c->next;
-            if (!c->client_ssl && c->client_fd >= 0) {
+            if (c->client_fd >= 0) {
                 c->fds_replicated = true;
                 cluster_replicate_live_conn(&c->client_addr, c->backend_idx,
                                             c->client_fd, c->backend_fd,

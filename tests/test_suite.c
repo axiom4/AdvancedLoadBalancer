@@ -23,6 +23,7 @@
 #include "advlb/proxy.h"
 #include "advlb/session_table.h"
 #include "advlb/cluster.h"
+#include "advlb/tcp_repair.h"
 #include "advnet/advnet.h"
 
 static int g_tests_run = 0;
@@ -1149,6 +1150,80 @@ static void test_cluster_active_download_master_crash_failover(void) {
     cluster_clear_peers();
 }
 
+static void test_tcp_repair_and_ktls_wire_sync(void) {
+    printf("\n=== Running Test Suite: Live TCP_REPAIR & kTLS State Wire Sync ===\n");
+
+    /* 1. Wire serialization test for TCP & kTLS parameters */
+    TcpSocketCheckpoint cp;
+    memset(&cp, 0, sizeof(cp));
+
+    struct sockaddr_in *loc = (struct sockaddr_in *)&cp.local_addr;
+    loc->sin_family = AF_INET;
+    loc->sin_port = htons(8443);
+    inet_pton(AF_INET, "10.211.55.200", &loc->sin_addr);
+
+    struct sockaddr_in *rem = (struct sockaddr_in *)&cp.remote_addr;
+    rem->sin_family = AF_INET;
+    rem->sin_port = htons(54321);
+    inet_pton(AF_INET, "10.211.55.2", &rem->sin_addr);
+
+    cp.snd_seq = 10002000;
+    cp.rcv_seq = 50006000;
+    cp.snd_wnd = 65535;
+    cp.rcv_wnd = 32768;
+    cp.mss_clamp = 1460;
+    cp.snd_wscale = 7;
+    cp.rcv_wscale = 7;
+    cp.has_timestamps = true;
+    cp.ts_val = 1234567;
+    cp.ts_ecr = 7654321;
+    cp.is_ktls = true;
+    cp.ktls.tls_version = KTLS_VERSION_1_3;
+    cp.ktls.cipher_type = KTLS_CIPHER_AES_GCM_256;
+    memset(cp.ktls.tx_key, 0xAA, 32);
+    memset(cp.ktls.rx_key, 0xBB, 32);
+    memset(cp.ktls.tx_iv, 0x11, 8);
+    memset(cp.ktls.rx_iv, 0x22, 8);
+    memset(cp.ktls.tx_rec_seq, 0x05, 8);
+    memset(cp.ktls.rx_rec_seq, 0x07, 8);
+
+    ClusterTcpCheckpointWire wire;
+    const char *test_req = "GET / HTTP/1.1\r\nHost: vip.example.com\r\n\r\n";
+    tcp_checkpoint_to_wire(&cp, 1, "10.211.55.10", 9001, 1048576, test_req, strlen(test_req), &wire);
+
+    TEST_ASSERT(wire.family == AF_INET, "Wire family AF_INET correctly encoded");
+    TEST_ASSERT(ntohs(wire.client_port) == 54321, "Client port preserved in network byte order");
+    TEST_ASSERT(ntohl(wire.snd_seq) == 10002000, "TCP snd_seq matches original 10002000");
+    TEST_ASSERT(ntohl(wire.rcv_seq) == 50006000, "TCP rcv_seq matches original 50006000");
+    TEST_ASSERT((wire.flags & 0x02) != 0, "Wire flags indicate kTLS active");
+
+    TcpSocketCheckpoint restored_cp;
+    int b_idx = -1;
+    char b_ip[46] = {0};
+    uint16_t b_port = 0;
+    uint64_t bytes = 0;
+    char req[512] = {0};
+    uint16_t req_len = 0;
+
+    tcp_checkpoint_from_wire(&wire, &restored_cp, &b_idx, b_ip, &b_port, &bytes, req, &req_len);
+
+    TEST_ASSERT(b_idx == 1, "Restored backend_idx matches 1");
+    TEST_ASSERT(b_port == 9001, "Restored backend_port matches 9001");
+    TEST_ASSERT(strcmp(b_ip, "10.211.55.10") == 0, "Restored backend_ip matches 10.211.55.10");
+    TEST_ASSERT(bytes == 1048576, "Stream bytes to client preserved across wire");
+    TEST_ASSERT(req_len == strlen(test_req) && strcmp(req, test_req) == 0, "Initial HTTP request preserved");
+    TEST_ASSERT(restored_cp.snd_seq == 10002000 && restored_cp.rcv_seq == 50006000, "TCP sequence numbers match byte-for-byte");
+    TEST_ASSERT(restored_cp.is_ktls == true, "Restored socket checkpoint retains is_ktls = true");
+    TEST_ASSERT(restored_cp.ktls.tls_version == KTLS_VERSION_1_3, "kTLS version TLS 1.3 preserved");
+    TEST_ASSERT(restored_cp.ktls.cipher_type == KTLS_CIPHER_AES_GCM_256, "kTLS cipher AES-GCM-256 preserved");
+    TEST_ASSERT(restored_cp.ktls.tx_key[0] == 0xAA && restored_cp.ktls.rx_key[0] == 0xBB, "Cryptographic symmetric keys preserved intact");
+    TEST_ASSERT(restored_cp.ktls.tx_rec_seq[0] == 0x05, "Cryptographic record sequence counter preserved");
+
+    /* 2. Test session table storage of TCP checkpoint */
+    bool stored = session_table_store_tcp_checkpoint(&wire);
+    TEST_ASSERT(stored == true, "session_table_store_tcp_checkpoint successfully stored remote checkpoint");
+}
+
 /* -------------------------------------------------------------------------- */
 /* Main Test Runner                                                           */
 /* -------------------------------------------------------------------------- */
@@ -1179,6 +1254,7 @@ int main(void) {
     test_session_table_stickiness_and_failover();
     test_cluster_vrrp_and_session_sync();
     test_cluster_active_download_master_crash_failover();
+    test_tcp_repair_and_ktls_wire_sync();
 
     printf("\n====================================================================\n");
     printf("TEST RESULTS: %d Run | \033[1;32m%d Passed\033[0m | \033[1;%sm%d Failed\033[0m\n",
