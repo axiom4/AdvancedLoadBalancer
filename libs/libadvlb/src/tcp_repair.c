@@ -52,26 +52,26 @@
 #define TLS_RX 2
 #endif
 
-struct tcp_repair_opt {
+struct adlb_tcp_repair_opt {
     uint32_t opt_code;
     uint32_t opt_val;
 };
 
-struct tls_crypto_info {
+struct adlb_tls_crypto_info {
     uint16_t version;
     uint16_t cipher_type;
 };
 
-struct tls12_crypto_info_aes_gcm_128 {
-    struct tls_crypto_info info;
+struct adlb_tls12_crypto_info_aes_gcm_128 {
+    struct adlb_tls_crypto_info info;
     unsigned char iv[8];
     unsigned char key[16];
     unsigned char salt[4];
     unsigned char rec_seq[8];
 };
 
-struct tls12_crypto_info_aes_gcm_256 {
-    struct tls_crypto_info info;
+struct adlb_tls12_crypto_info_aes_gcm_256 {
+    struct adlb_tls_crypto_info info;
     unsigned char iv[8];
     unsigned char key[32];
     unsigned char salt[4];
@@ -152,7 +152,7 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
     }
 
     /* Check kTLS state */
-    struct tls12_crypto_info_aes_gcm_128 tx128;
+    struct adlb_tls12_crypto_info_aes_gcm_128 tx128;
     socklen_t klen = sizeof(tx128);
     if (getsockopt(sock_fd, SOL_TLS, TLS_TX, &tx128, &klen) == 0) {
         out_cp->is_ktls = true;
@@ -163,7 +163,7 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         memcpy(out_cp->ktls.tx_salt, tx128.salt, 4);
         memcpy(out_cp->ktls.tx_rec_seq, tx128.rec_seq, 8);
 
-        struct tls12_crypto_info_aes_gcm_128 rx128;
+        struct adlb_tls12_crypto_info_aes_gcm_128 rx128;
         klen = sizeof(rx128);
         if (getsockopt(sock_fd, SOL_TLS, TLS_RX, &rx128, &klen) == 0) {
             memcpy(out_cp->ktls.rx_iv, rx128.iv, 8);
@@ -195,7 +195,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     }
 
     /* Set TCP options in repair mode */
-    struct tcp_repair_opt opts[4];
+    struct adlb_tcp_repair_opt opts[4];
     int nopts = 0;
     if (cp->mss_clamp > 0) {
         opts[nopts].opt_code = 2; /* TCPOPT_MAXSEG */
@@ -247,7 +247,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     if (cp->is_ktls) {
         setsockopt(s, SOL_TCP, 31 /* TCP_ULP */, "tls", sizeof("tls"));
         if (cp->ktls.cipher_type == KTLS_CIPHER_AES_GCM_256) {
-            struct tls12_crypto_info_aes_gcm_256 tx;
+            struct adlb_tls12_crypto_info_aes_gcm_256 tx;
             memset(&tx, 0, sizeof(tx));
             tx.info.version = cp->ktls.tls_version;
             tx.info.cipher_type = cp->ktls.cipher_type;
@@ -257,7 +257,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(tx.rec_seq, cp->ktls.tx_rec_seq, 8);
             setsockopt(s, SOL_TLS, TLS_TX, &tx, sizeof(tx));
 
-            struct tls12_crypto_info_aes_gcm_256 rx;
+            struct adlb_tls12_crypto_info_aes_gcm_256 rx;
             memset(&rx, 0, sizeof(rx));
             rx.info.version = cp->ktls.tls_version;
             rx.info.cipher_type = cp->ktls.cipher_type;
@@ -267,7 +267,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(rx.rec_seq, cp->ktls.rx_rec_seq, 8);
             setsockopt(s, SOL_TLS, TLS_RX, &rx, sizeof(rx));
         } else {
-            struct tls12_crypto_info_aes_gcm_128 tx;
+            struct adlb_tls12_crypto_info_aes_gcm_128 tx;
             memset(&tx, 0, sizeof(tx));
             tx.info.version = cp->ktls.tls_version;
             tx.info.cipher_type = cp->ktls.cipher_type ? cp->ktls.cipher_type : KTLS_CIPHER_AES_GCM_128;
@@ -277,7 +277,7 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
             memcpy(tx.rec_seq, cp->ktls.tx_rec_seq, 8);
             setsockopt(s, SOL_TLS, TLS_TX, &tx, sizeof(tx));
 
-            struct tls12_crypto_info_aes_gcm_128 rx;
+            struct adlb_tls12_crypto_info_aes_gcm_128 rx;
             memset(&rx, 0, sizeof(rx));
             rx.info.version = cp->ktls.tls_version;
             rx.info.cipher_type = cp->ktls.cipher_type ? cp->ktls.cipher_type : KTLS_CIPHER_AES_GCM_128;

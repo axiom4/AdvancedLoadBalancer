@@ -791,7 +791,7 @@ bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire) {
 
     int resolved_idx = resolve_backend_index(b_ip, b_port, b_idx);
     node->backend_idx = resolved_idx;
-    strncpy(node->backend_ip, b_ip, sizeof(node->backend_ip) - 1);
+    snprintf(node->backend_ip, sizeof(node->backend_ip), "%s", b_ip);
     node->backend_port = b_port;
     node->has_tcp_checkpoint = true;
     node->checkpoint = cp;
