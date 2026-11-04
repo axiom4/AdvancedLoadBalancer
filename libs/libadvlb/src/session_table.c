@@ -805,6 +805,14 @@ bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire) {
     node->ttl_sec = (g_config.session_ttl_sec > 0) ? (uint32_t)g_config.session_ttl_sec : DEFAULT_SESSION_TTL_SEC;
 
     pthread_mutex_unlock(&shard->mutex);
+
+    char cip[INET6_ADDRSTRLEN] = {0};
+    int af = (wire->family == AF_INET6) ? AF_INET6 : AF_INET;
+    inet_ntop(af, wire->client_ip, cip, sizeof(cip));
+    uint16_t cport = ntohs(wire->client_port);
+    add_log("\033[1;36m[HA CHECKPOINT RX]\033[0m Stored TCP checkpoint for %s:%u (kTLS=%s, snd_seq=%u)",
+            cip, (unsigned int)cport, cp.is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", cp.snd_seq);
+
     return true;
 }
 

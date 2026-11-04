@@ -194,6 +194,9 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         out_cp->snd_wscale = ti.tcpi_snd_wscale;
         out_cp->rcv_wscale = ti.tcpi_rcv_wscale;
         out_cp->mss_clamp = ti.tcpi_snd_mss;
+        if (ti.tcpi_options & 1 /* TCPI_OPT_TIMESTAMPS */) {
+            out_cp->has_timestamps = true;
+        }
     }
 
     /* 1. Query kTLS state while socket is in clean operational state (before TCP_REPAIR) */

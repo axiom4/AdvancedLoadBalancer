@@ -1782,6 +1782,7 @@ static void transition_to_backup(uint32_t new_master_id, uint8_t master_prio, ui
     s_master_effective_prio = master_prio;
 
     if (prev == VRRP_STATE_MASTER) {
+        worker_pool_handover_active_conns();
         release_virtual_ip();
         add_log("\033[1;33m[VRRP ELECTION]\033[0m Node %08X stepped down MASTER -> BACKUP (new Master %08X, prio %u)",
                 s_node_id, new_master_id, (unsigned int)master_prio);
@@ -1920,11 +1921,10 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
             s_stepdown_until_ms = 0;
             s_last_master_advert_ms = now_ms;
 
+            worker_pool_handover_active_conns();
             release_virtual_ip();
             atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
             atomic_store_explicit(&s_current_master_id, sender_id, memory_order_relaxed);
-
-            worker_pool_handover_active_conns();
             if (s_alive_pipe[0] >= 0) close(s_alive_pipe[0]);
             if (s_alive_pipe[1] >= 0) close(s_alive_pipe[1]);
             if (pipe(s_alive_pipe) == 0) {
@@ -2526,12 +2526,13 @@ void cluster_trigger_stepdown(void) {
         s_stepdown_until_ms = 0;
         s_last_master_advert_ms = now_ms;
 
+        /* Hand over active connections cleanly FIRST while VIP is alive */
+        worker_pool_handover_active_conns();
+
         release_virtual_ip();
         atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
         atomic_store_explicit(&s_current_master_id, 0, memory_order_relaxed);
 
-        /* Hand over active connections cleanly and close alive pipe so Backup takes over in <1ms */
-        worker_pool_handover_active_conns();
         if (s_alive_pipe[0] >= 0) close(s_alive_pipe[0]);
         if (s_alive_pipe[1] >= 0) close(s_alive_pipe[1]);
         if (pipe(s_alive_pipe) == 0) {
