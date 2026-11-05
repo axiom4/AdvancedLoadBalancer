@@ -2054,7 +2054,7 @@ static bool send_stream_migration(const TcpSocketCheckpoint *client_cp,
 
     size_t bcl = 0;
     TcpSocketCheckpoint bcp;
-    if (backend_fd >= 0 && cluster_fd_is_vip_sourced(backend_fd) && tcp_repair_checkpoint(backend_fd, NULL, &bcp)) {
+    if (backend_fd >= 0 && cluster_fd_is_vip_sourced(backend_fd) && tcp_repair_checkpoint(backend_fd, NULL, &bcp, true)) {
         tcp_checkpoint_to_wire(&bcp, backend_idx, b_ip, b_port, 0, NULL, 0, bw);
         bcl = tcp_checkpoint_wire_len(bw);
         tcp_checkpoint_release(&bcp);
@@ -2127,7 +2127,8 @@ void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
                                  const char *initial_req,
                                  uint16_t req_len,
                                  uint64_t bytes_to_client,
-                                 const ClusterConnState *state) {
+                                 const ClusterConnState *state,
+                                 bool final) {
     if (!s_cluster_running || !client_addr || client_fd < 0) return;
 
     /* 1. Broadcast network TCP_REPAIR + kTLS Checkpoint: full stream over TCP, else client-only UDP */
@@ -2135,7 +2136,7 @@ void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
         TcpSocketCheckpoint cp;
         /* ~60 KB packet: heap, not the 512 KB worker stack */
         ClusterWirePacket *pkt = malloc(sizeof(*pkt));
-        bool have_cp = pkt && tcp_repair_checkpoint(client_fd, NULL, &cp);
+        bool have_cp = pkt && tcp_repair_checkpoint(client_fd, NULL, &cp, final);
         if (have_cp && state &&
             send_stream_migration(&cp, backend_idx, backend_fd, initial_req, req_len, bytes_to_client, state)) {
             tcp_checkpoint_release(&cp);

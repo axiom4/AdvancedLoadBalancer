@@ -142,7 +142,9 @@ bool tcp_repair_is_supported(void);
 bool ktls_is_supported(void);
 
 /* Capture in-flight TCP (and optional kTLS) state from an active established socket */
-bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_cp);
+/* A kTLS socket is only captured when final (handover): toggling TCP_REPAIR on a live kTLS socket
+ * desynchronises its RX record parser (EMSGSIZE / "packet length too long"). */
+bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_cp, bool final);
 
 /* Recreate and restore an established socket on the destination machine */
 int tcp_repair_restore(const TcpSocketCheckpoint *cp);

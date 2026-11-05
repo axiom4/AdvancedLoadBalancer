@@ -102,7 +102,8 @@ typedef struct {
 
 /* Replicate live active TCP connection descriptors and stream offset to cluster peers.
  * state != NULL and a VIP-sourced backend_fd: client + backend sockets and proxy buffers are
- * sent over the reliable TCP checkpoint channel; otherwise only the client socket (UDP). */
+ * sent over the reliable TCP checkpoint channel; otherwise only the client socket (UDP).
+ * final: handover in progress (kTLS sockets are skipped otherwise, see tcp_repair_checkpoint). */
 void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
                                  int backend_idx,
                                  int client_fd,
@@ -110,7 +111,8 @@ void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
                                  const char *initial_req,
                                  uint16_t req_len,
                                  uint64_t bytes_to_client,
-                                 const ClusterConnState *state);
+                                 const ClusterConnState *state,
+                                 bool final);
 
 /* True if fd is locally bound to the VIP (its 4-tuple can move to the next VIP owner) */
 bool cluster_fd_is_vip_sourced(int fd);

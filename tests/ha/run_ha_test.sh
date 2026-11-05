@@ -6,6 +6,10 @@ set -u
 cd "$(dirname "$0")/../.."
 LB=./advanced_load_balancer
 EXTRA=("$@")
+if [ -n "${TLS:-}" ]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /var/tmp/ha.key -out /var/tmp/ha.crt -days 1 -subj /CN=vip >/dev/null 2>&1
+    EXTRA+=(--ssl --cert /var/tmp/ha.crt --key /var/tmp/ha.key)
+fi
 VIP=10.50.0.100
 cleanup() {
     pkill -f advanced_load_balancer 2>/dev/null; pkill -f backend.py 2>/dev/null

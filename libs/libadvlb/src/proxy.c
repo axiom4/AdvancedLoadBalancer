@@ -452,7 +452,7 @@ static void ring_copy_in(StreamBuffer *sb, const uint8_t *in, size_t n) {
 }
 
 /* Replicate a stream; with a VIP-sourced backend socket the proxy buffers travel with it */
-static void worker_replicate_conn(ProxyConnection *conn) {
+static void worker_replicate_conn(ProxyConnection *conn, bool final) {
     ClusterConnState st;
     memset(&st, 0, sizeof(st));
     uint8_t *c2b = NULL, *b2c = NULL;
@@ -480,7 +480,7 @@ static void worker_replicate_conn(ProxyConnection *conn) {
     cluster_replicate_live_conn(&conn->client_addr, conn->backend_idx,
                                 conn->client_fd, with_state ? conn->backend_fd : -1,
                                 conn->initial_req, conn->initial_req_len,
-                                (uint64_t)conn->bytes_to_client, with_state ? &st : NULL);
+                                (uint64_t)conn->bytes_to_client, with_state ? &st : NULL, final);
     free(c2b);
     free(b2c);
 }
@@ -1092,7 +1092,7 @@ static bool worker_pump_cluster_b2c(WorkerThread *worker, ProxyConnection *conn,
                 if (!conn->fds_replicated && conn->bytes_to_client >= 4096) {
                     conn->fds_replicated = true;
                     conn->last_replicated_bytes = conn->bytes_to_client;
-                    worker_replicate_conn(conn);
+                    worker_replicate_conn(conn, false);
                 }
                 if (conn->client_want_write) {
                     break;
@@ -1470,7 +1470,7 @@ static void worker_check_timeouts(WorkerThread *worker) {
             curr->state == CONN_STATE_FORWARDING && curr->backend_fd >= 0 && !curr->fds_replicated) {
             curr->fds_replicated = true;
             curr->last_replicated_bytes = curr->bytes_to_client;
-            worker_replicate_conn(curr);
+            worker_replicate_conn(curr, false);
         }
         if (now - curr->last_activity >= timeout_sec) {
             add_log("\033[1;33m[TIMEOUT]\033[0m Connection closed due to inactivity (>%ds) Slowloris protection",
@@ -1657,7 +1657,7 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
 
         if (g_config.enable_cluster) {
             conn->fds_replicated = true;
-            worker_replicate_conn(conn);
+            worker_replicate_conn(conn, false);
         }
 
         worker_update_conn_epoll(worker, conn);
@@ -1698,7 +1698,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
             if (c->state == CONN_STATE_FORWARDING &&
                 c->client_fd >= 0 && c->backend_fd >= 0) {
                 c->fds_replicated = true;
-                worker_replicate_conn(c);
+                worker_replicate_conn(c, false);
             }
             c = c->next;
         }
@@ -1710,7 +1710,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
             ProxyConnection *next = c->next;
             if (c->client_fd >= 0) {
                 c->fds_replicated = true;
-                worker_replicate_conn(c);
+                worker_replicate_conn(c, true);
                 c->handed_over = true;
             }
             worker_close_conn(worker, c, "failover_handover");

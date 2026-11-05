@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Keep-alive HA client: verifies every response byte-for-byte; counts failures and reconnects."""
-import socket, sys, threading, time
+import os, socket, ssl, sys, threading, time
 
 HOST, PORT = sys.argv[1], int(sys.argv[2])
 CONC, DURATION = int(sys.argv[3]), float(sys.argv[4])
@@ -39,6 +39,11 @@ def worker(i):
         try:
             if s is None:
                 s = socket.create_connection((HOST, PORT), timeout=5)
+                if os.environ.get("TLS"):
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    s = ctx.wrap_socket(s, server_hostname="vip")
                 s.settimeout(5)
             s.sendall(b"GET /x HTTP/1.1\r\nHost: vip\r\n\r\n")
             read_response(s)

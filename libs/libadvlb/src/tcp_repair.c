@@ -21,6 +21,9 @@
 #include <linux/sockios.h>
 #include "advlb/sysnet.h"
 
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
 #ifndef TCP_REPAIR
 #define TCP_REPAIR 19
 #endif
@@ -232,9 +235,10 @@ static void capture_tcp_queues(int sock_fd, TcpSocketCheckpoint *cp) {
 }
 #endif
 
-bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_cp) {
+bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_cp, bool final) {
     if (sock_fd < 0 || !out_cp) return false;
     (void)ssl_ptr;
+    (void)final;
     memset(out_cp, 0, sizeof(*out_cp));
 
     socklen_t loc_len = sizeof(out_cp->local_addr);
@@ -247,6 +251,11 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
     }
 
 #ifdef __linux__
+    if (!final) {
+        char ulp[16] = {0};
+        socklen_t ulp_len = sizeof(ulp) - 1;
+        if (getsockopt(sock_fd, SOL_TCP, TCP_ULP, ulp, &ulp_len) == 0 && strcmp(ulp, "tls") == 0) return false;
+    }
     struct tcp_info ti;
     socklen_t ti_len = sizeof(ti);
     if (getsockopt(sock_fd, IPPROTO_TCP, TCP_INFO, &ti, &ti_len) == 0) {
