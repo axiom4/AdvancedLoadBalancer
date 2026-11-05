@@ -135,6 +135,26 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
             *out_want_io = true;
             return 0;
         }
+#ifndef NO_SSL
+        unsigned long qerr = ERR_peek_error();
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        /* Peer closed the TCP connection without close_notify: a plain EOF, not a failure.
+         * OpenSSL 1.1 reports it as SYSCALL with errno 0, OpenSSL 3 as SSL_R_UNEXPECTED_EOF_WHILE_READING. */
+        if (err == SSL_ERROR_SYSCALL && qerr == 0 && errno == 0) return 0;
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+        if (err == SSL_ERROR_SSL && ERR_GET_REASON(qerr) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+            ERR_clear_error();
+            return 0;
+        }
+#endif
+        if (qerr != 0) {
+            char ebuf[160];
+            ERR_error_string_n(qerr, ebuf, sizeof(ebuf));
+            add_log("\033[1;31m[HA ERR]\033[0m TLS read failure: %s", ebuf);
+            ERR_clear_error();
+        }
+        if (errno == 0) errno = EPROTO;
+#endif
         return -1; // Fatal SSL error
     }
 
