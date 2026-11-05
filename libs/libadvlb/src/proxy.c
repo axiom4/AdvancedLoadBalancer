@@ -268,6 +268,7 @@ typedef struct NewConnNode {
     uint16_t req_len;
     char initial_req[512];
     struct sockaddr_storage client_addr;
+    MigratedStreamState *migrated;   /* backend socket state + proxy buffers, owned */
     struct NewConnNode *next;
 } NewConnNode;
 
@@ -410,6 +411,85 @@ static void worker_remove_conn(WorkerThread *worker, ProxyConnection *conn) {
     worker->active_conn_count--;
 }
 
+/* Copy ring buffer contents out (linear) / in, without consuming */
+static void ring_copy_out(const StreamBuffer *sb, uint8_t *out, size_t n) {
+    size_t first = buffer_read_len(sb);
+    if (first > n) first = n;
+    memcpy(out, buffer_read_ptr(sb), first);
+    if (n > first) memcpy(out + first, sb->data, n - first);
+}
+
+static void ring_copy_in(StreamBuffer *sb, const uint8_t *in, size_t n) {
+    while (n > 0) {
+        size_t chunk = buffer_write_len(sb);
+        if (chunk == 0) break;
+        if (chunk > n) chunk = n;
+        memcpy(buffer_write_ptr(sb), in, chunk);
+        buffer_produce(sb, chunk);
+        in += chunk;
+        n -= chunk;
+    }
+}
+
+/* Replicate a stream; with a VIP-sourced backend socket the proxy buffers travel with it */
+static void worker_replicate_conn(ProxyConnection *conn) {
+    ClusterConnState st;
+    memset(&st, 0, sizeof(st));
+    uint8_t *c2b = NULL, *b2c = NULL;
+    bool with_state = true;
+    if (conn->backend_fd >= 0 && cluster_fd_is_vip_sourced(conn->backend_fd)) {
+        size_t c2l = buffer_available(&conn->c2b);
+        size_t b2l = buffer_available(&conn->b2c);
+        if (c2l > 0 && (c2b = malloc(c2l)) != NULL) ring_copy_out(&conn->c2b, c2b, c2l);
+        if (b2l > 0 && (b2c = malloc(b2l)) != NULL) ring_copy_out(&conn->b2c, b2c, b2l);
+        /* A buffer we failed to copy would be silently lost: degrade to client-only migration */
+        with_state = (c2l == 0 || c2b) && (b2l == 0 || b2c);
+        st.c2b = c2b;
+        st.c2b_len = (uint32_t)c2l;
+        st.b2c = b2c;
+        st.b2c_len = (uint32_t)b2l;
+    }
+    st.bytes_to_backend = conn->bytes_to_backend;
+    st.bytes_from_backend = conn->bytes_from_backend;
+    st.skip_backend_bytes = conn->skip_backend_bytes;
+    st.flags = (uint8_t)((conn->keep_alive_eligible ? MIGRATED_F_KEEPALIVE : 0) |
+                         (conn->client_shut_wr ? MIGRATED_F_CLIENT_SHUT_WR : 0) |
+                         (conn->backend_shut_wr ? MIGRATED_F_BACKEND_SHUT_WR : 0) |
+                         (conn->client_closed ? MIGRATED_F_CLIENT_CLOSED : 0) |
+                         (conn->backend_closed ? MIGRATED_F_BACKEND_CLOSED : 0));
+    cluster_replicate_live_conn(&conn->client_addr, conn->backend_idx,
+                                conn->client_fd, with_state ? conn->backend_fd : -1,
+                                conn->initial_req, conn->initial_req_len,
+                                (uint64_t)conn->bytes_to_client, with_state ? &st : NULL);
+    free(c2b);
+    free(b2c);
+}
+
+/* Release a socket whose state now lives on another node: no FIN/RST may reach the peer */
+static void close_silently_for_failover(int fd) {
+#ifdef __linux__
+    /* Clear any pending socket error before TCP_REPAIR so sk->sk_err is 0 */
+    int so_err = 0;
+    socklen_t so_err_len = sizeof(so_err);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
+
+    /* Enable TCP_REPAIR mode with TCP_NO_QUEUE: Linux tcp_close() checks sk->sk_repair
+     * and cleanly runs sk_prot->disconnect(sk, 0), freeing descriptor with ZERO RST/FIN emitted */
+    int repair_on = 1;
+    if (setsockopt(fd, 6 /* SOL_TCP */, 19 /* TCP_REPAIR */, &repair_on, sizeof(repair_on)) < 0) {
+        add_log("\033[1;33m[HA CLOSE]\033[0m setsockopt TCP_REPAIR before close: %s (errno %d, fd=%d)",
+                strerror(errno), errno, fd);
+    }
+    int no_q = 0; /* TCP_NO_QUEUE */
+    setsockopt(fd, 6 /* SOL_TCP */, 20 /* TCP_REPAIR_QUEUE */, &no_q, sizeof(no_q));
+
+    /* Clear SO_ERROR again to guarantee clean closure without abort */
+    so_err = 0;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
+#endif
+    close(fd);
+}
+
 static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const char *reason) {
     char client_ip[INET6_ADDRSTRLEN];
     int client_port = 0;
@@ -441,7 +521,12 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const
         }
 
         if (!pooled) {
-            close(conn->backend_fd);
+            if (conn->handed_over && cluster_fd_is_vip_sourced(conn->backend_fd)) {
+                /* Backend socket migrated with the stream: a FIN would kill it on the new node */
+                close_silently_for_failover(conn->backend_fd);
+            } else {
+                close(conn->backend_fd);
+            }
         }
         conn->backend_fd = -1;
     }
@@ -470,33 +555,16 @@ static void worker_close_conn(WorkerThread *worker, ProxyConnection *conn, const
         }
         if (!preserve_for_failover) {
             shutdown(conn->client_fd, SHUT_WR);
+            close(conn->client_fd);
         } else {
 #ifdef __linux__
-            /* Drain any pending bytes from receive queue so data_was_unread == 0 in tcp_close() */
+            /* Drain any pending bytes from receive queue so data_was_unread == 0 in tcp_close()
+             * (they were captured by the checkpoint) */
             char drain_buf[2048];
             while (recv(conn->client_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0);
-
-            /* Clear any pending socket error before TCP_REPAIR so sk->sk_err is 0 */
-            int so_err = 0;
-            socklen_t so_err_len = sizeof(so_err);
-            getsockopt(conn->client_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
-
-            /* Enable TCP_REPAIR mode with TCP_NO_QUEUE: Linux tcp_close() checks sk->sk_repair
-             * and cleanly runs sk_prot->disconnect(sk, 0), freeing descriptor with ZERO RST/FIN emitted */
-            int repair_on = 1;
-            if (setsockopt(conn->client_fd, 6 /* SOL_TCP */, 19 /* TCP_REPAIR */, &repair_on, sizeof(repair_on)) < 0) {
-                add_log("\033[1;33m[HA CLOSE]\033[0m setsockopt TCP_REPAIR before close: %s (errno %d, fd=%d)",
-                        strerror(errno), errno, conn->client_fd);
-            }
-            int no_q = 0; /* TCP_NO_QUEUE */
-            setsockopt(conn->client_fd, 6 /* SOL_TCP */, 20 /* TCP_REPAIR_QUEUE */, &no_q, sizeof(no_q));
-
-            /* Clear SO_ERROR again to guarantee clean closure without abort */
-            so_err = 0;
-            getsockopt(conn->client_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_err_len);
 #endif
+            close_silently_for_failover(conn->client_fd);
         }
-        close(conn->client_fd);
         conn->client_fd = -1;
     }
 
@@ -1004,10 +1072,7 @@ static bool worker_pump_cluster_b2c(WorkerThread *worker, ProxyConnection *conn,
                 if (!conn->fds_replicated && conn->bytes_to_client >= 4096) {
                     conn->fds_replicated = true;
                     conn->last_replicated_bytes = conn->bytes_to_client;
-                    cluster_replicate_live_conn(&conn->client_addr, conn->backend_idx,
-                                                conn->client_fd, conn->backend_fd,
-                                                conn->initial_req, conn->initial_req_len,
-                                                (uint64_t)conn->bytes_to_client);
+                    worker_replicate_conn(conn);
                 }
                 if (conn->client_want_write) {
                     break;
@@ -1385,10 +1450,7 @@ static void worker_check_timeouts(WorkerThread *worker) {
             curr->state == CONN_STATE_FORWARDING && curr->backend_fd >= 0 && !curr->fds_replicated) {
             curr->fds_replicated = true;
             curr->last_replicated_bytes = curr->bytes_to_client;
-            cluster_replicate_live_conn(&curr->client_addr, curr->backend_idx,
-                                        curr->client_fd, curr->backend_fd,
-                                        curr->initial_req, curr->initial_req_len,
-                                        (uint64_t)curr->bytes_to_client);
+            worker_replicate_conn(curr);
         }
         if (now - curr->last_activity >= timeout_sec) {
             add_log("\033[1;33m[TIMEOUT]\033[0m Connection closed due to inactivity (>%ds) Slowloris protection",
@@ -1509,6 +1571,8 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
         if (node->backend_fd >= 0) close(node->backend_fd);
         if (node->backend_idx >= 0) release_backend(node->backend_idx);
         close(node->client_fd);
+        migrated_stream_release(node->migrated);
+        node->migrated = NULL;
         atomic_fetch_sub_explicit(&g_active_clients, 1, memory_order_relaxed);
         return;
     }
@@ -1548,20 +1612,39 @@ static void worker_adopt_migrated_connection(WorkerThread *worker, NewConnNode *
         worker_set_fd(worker, conn->backend_fd, conn);
         conn->state = CONN_STATE_FORWARDING;
 
-        add_log("\033[1;32m[HA MIGRATED]\033[0m Adopted active TCP stream %s:%d -> Backend [%d] on Worker %d",
-                client_ip, client_port, conn->backend_idx, worker->id);
+        MigratedStreamState *st = node->migrated;
+        bool full_migration = (st != NULL);
+        if (st) {
+            /* Backend socket came over TCP_REPAIR: resume exactly where the old node stopped */
+            ring_copy_in(&conn->c2b, st->c2b, st->c2b_len);
+            ring_copy_in(&conn->b2c, st->b2c, st->b2c_len);
+            conn->bytes_to_backend = (size_t)st->bytes_to_backend;
+            conn->bytes_from_backend = (size_t)st->bytes_from_backend;
+            conn->skip_backend_bytes = (size_t)st->skip_backend_bytes;
+            conn->keep_alive_eligible = (st->flags & MIGRATED_F_KEEPALIVE) != 0;
+            conn->client_shut_wr = (st->flags & MIGRATED_F_CLIENT_SHUT_WR) != 0;
+            conn->backend_shut_wr = (st->flags & MIGRATED_F_BACKEND_SHUT_WR) != 0;
+            conn->client_closed = (st->flags & MIGRATED_F_CLIENT_CLOSED) != 0;
+            conn->backend_closed = (st->flags & MIGRATED_F_BACKEND_CLOSED) != 0;
+            conn->client_want_write = buffer_available(&conn->b2c) > 0;
+            migrated_stream_release(st);
+            node->migrated = NULL;
+        }
+
+        add_log("\033[1;32m[HA MIGRATED]\033[0m Adopted active TCP stream %s:%d -> Backend [%d] on Worker %d%s",
+                client_ip, client_port, conn->backend_idx, worker->id,
+                full_migration ? " (backend socket + buffers migrated)" : "");
 
         if (g_config.enable_cluster) {
             conn->fds_replicated = true;
-            cluster_replicate_live_conn(&conn->client_addr, conn->backend_idx,
-                                        conn->client_fd, conn->backend_fd,
-                                        conn->initial_req, conn->initial_req_len,
-                                        (uint64_t)conn->bytes_to_client);
+            worker_replicate_conn(conn);
         }
 
         worker_update_conn_epoll(worker, conn);
         worker_handle_forwarding_io(worker, conn, conn->backend_fd, EPOLLIN);
     } else {
+        migrated_stream_release(node->migrated);
+        node->migrated = NULL;
         conn->fds_replicated = false;
         if (conn->backend_idx >= 0) {
             release_backend(conn->backend_idx);
@@ -1595,10 +1678,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
             if (c->state == CONN_STATE_FORWARDING &&
                 c->client_fd >= 0 && c->backend_fd >= 0) {
                 c->fds_replicated = true;
-                cluster_replicate_live_conn(&c->client_addr, c->backend_idx,
-                                            c->client_fd, c->backend_fd,
-                                            c->initial_req, c->initial_req_len,
-                                            (uint64_t)c->bytes_to_client);
+                worker_replicate_conn(c);
             }
             c = c->next;
         }
@@ -1610,10 +1690,7 @@ static void worker_process_new_conns(WorkerThread *worker) {
             ProxyConnection *next = c->next;
             if (c->client_fd >= 0) {
                 c->fds_replicated = true;
-                cluster_replicate_live_conn(&c->client_addr, c->backend_idx,
-                                            c->client_fd, c->backend_fd,
-                                            c->initial_req, c->initial_req_len,
-                                            (uint64_t)c->bytes_to_client);
+                worker_replicate_conn(c);
                 c->handed_over = true;
             }
             worker_close_conn(worker, c, "failover_handover");
@@ -1956,10 +2033,12 @@ void worker_pool_adopt_migrated_conn(int client_fd,
                                      const struct sockaddr_storage *client_addr,
                                      const char *initial_req,
                                      uint16_t req_len,
-                                     uint64_t bytes_to_client) {
+                                     uint64_t bytes_to_client,
+                                     MigratedStreamState *migrated) {
     if (s_num_workers <= 0 || !s_workers || client_fd < 0 || !client_addr) {
         if (backend_fd >= 0) close(backend_fd);
         if (client_fd >= 0) close(client_fd);
+        migrated_stream_release(migrated);
         return;
     }
 
@@ -1967,8 +2046,11 @@ void worker_pool_adopt_migrated_conn(int client_fd,
     if (!node) {
         if (backend_fd >= 0) close(backend_fd);
         close(client_fd);
+        migrated_stream_release(migrated);
         return;
     }
+    node->migrated = (backend_fd >= 0) ? migrated : NULL;
+    if (backend_fd < 0) migrated_stream_release(migrated);
 
     node->client_fd = client_fd;
     node->backend_fd = backend_fd;
@@ -2018,7 +2100,8 @@ void worker_pool_handover_active_conns(void) {
         (void)w_ign2;
     }
 
-    for (int wait_ms = 0; wait_ms < 100; wait_ms++) {
+    /* VIP release must wait for every checkpoint: a stream not yet checkpointed is lost */
+    for (int wait_ms = 0; wait_ms < 1000; wait_ms++) {
         bool all_done = true;
         for (int i = 0; i < s_num_workers; i++) {
             if (!atomic_load_explicit(&s_workers[i].handover_done, memory_order_acquire)) {
@@ -2083,6 +2166,7 @@ void worker_pool_shutdown(void) {
         while (n) {
             NewConnNode *tmp = n->next;
             close(n->client_fd);
+            migrated_stream_release(n->migrated);
             free(n);
             n = tmp;
         }

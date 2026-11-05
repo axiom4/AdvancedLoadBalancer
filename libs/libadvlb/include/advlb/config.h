@@ -41,6 +41,7 @@ typedef struct {
     bool cluster_enable_multicast;
     char cluster_secret[128];
     uint32_t cluster_node_id;
+    bool backend_source_vip;   /* Backend connections sourced from the VIP so they migrate on failover */
     bool enable_session_stickiness;
     int session_ttl_sec;
 

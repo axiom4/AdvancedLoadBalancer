@@ -67,6 +67,7 @@ void config_init_defaults(LbConfig *cfg) {
     cfg->cluster_enable_multicast = true;
     strncpy(cfg->cluster_secret, "adlb-cluster-default-hmac-key", sizeof(cfg->cluster_secret) - 1);
     cfg->cluster_node_id = 0;
+    cfg->backend_source_vip = false;
     cfg->enable_session_stickiness = false;
     cfg->session_ttl_sec = DEFAULT_SESSION_TTL_SEC;
 }
@@ -254,6 +255,8 @@ bool config_load_file(const char *filepath, LbConfig *cfg) {
             cfg->cluster_enable_multicast = parse_bool_val(val);
         } else if (strcasecmp(key, "cluster_secret") == 0 || strcasecmp(key, "vrrp_secret") == 0) {
             strncpy(cfg->cluster_secret, val, sizeof(cfg->cluster_secret) - 1);
+        } else if (strcasecmp(key, "backend_source_vip") == 0 || strcasecmp(key, "cluster_backend_source_vip") == 0) {
+            cfg->backend_source_vip = parse_bool_val(val);
         } else if (strcasecmp(key, "cluster_node_id") == 0 || strcasecmp(key, "node_id") == 0) {
             cfg->cluster_node_id = (uint32_t)strtoul(val, NULL, 0);
         } else if (strcasecmp(key, "session_stickiness") == 0 || strcasecmp(key, "sticky_sessions") == 0) {

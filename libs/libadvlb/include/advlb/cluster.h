@@ -82,17 +82,38 @@ void cluster_trigger_stepdown(void);
 void cluster_queue_session_upsert(const ClusterSessionWire *wire);
 void cluster_queue_session_delete(const ClusterSessionWire *wire);
 
+/* Async-signal-safe manual switchover request (SIGUSR1): executed by the cluster thread */
+void cluster_request_stepdown_async(void);
+
 /* Request an immediate bulk session synchronization from current cluster peers */
 void cluster_request_bulk_sync(void);
 
-/* Replicate live active TCP connection descriptors and stream offset to cluster peers */
+/* Proxy buffers and counters replicated with a stream so its backend socket can migrate too */
+typedef struct {
+    const uint8_t *c2b;
+    uint32_t c2b_len;
+    const uint8_t *b2c;
+    uint32_t b2c_len;
+    uint64_t bytes_to_backend;
+    uint64_t bytes_from_backend;
+    uint64_t skip_backend_bytes;
+    uint8_t  flags;              /* MIGRATED_F_* (tcp_repair.h) */
+} ClusterConnState;
+
+/* Replicate live active TCP connection descriptors and stream offset to cluster peers.
+ * state != NULL and a VIP-sourced backend_fd: client + backend sockets and proxy buffers are
+ * sent over the reliable TCP checkpoint channel; otherwise only the client socket (UDP). */
 void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
                                  int backend_idx,
                                  int client_fd,
                                  int backend_fd,
                                  const char *initial_req,
                                  uint16_t req_len,
-                                 uint64_t bytes_to_client);
+                                 uint64_t bytes_to_client,
+                                 const ClusterConnState *state);
+
+/* True if fd is locally bound to the VIP (its 4-tuple can move to the next VIP owner) */
+bool cluster_fd_is_vip_sourced(int fd);
 
 /* Notify cluster peers that an active TCP connection closed normally */
 void cluster_notify_conn_closed(const struct sockaddr_storage *client_addr, int backend_idx);

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -1014,7 +1015,7 @@ static void test_cluster_active_download_master_crash_failover(void) {
 
         const char *req = "GET /largefile.bin HTTP/1.1\r\nHost: vip\r\n\r\n";
         worker_pool_adopt_migrated_conn(client_pair[1], backend_pair[1], 0, &c_addr,
-                                        req, (uint16_t)strlen(req), 0);
+                                        req, (uint16_t)strlen(req), 0, NULL);
 
         /* Stay alive serving the download until killed with SIGKILL by test harness */
         while (1) {
@@ -1225,9 +1226,36 @@ static void test_tcp_repair_and_ktls_wire_sync(void) {
     TEST_ASSERT(restored_cp.ktls.tx_key[0] == 0xAA && restored_cp.ktls.rx_key[0] == 0xBB, "Cryptographic symmetric keys preserved intact");
     TEST_ASSERT(restored_cp.ktls.tx_rec_seq[0] == 0x05, "Cryptographic record sequence counter preserved");
 
+    TEST_ASSERT(tcp_checkpoint_wire_len(&wire) == offsetof(ClusterTcpCheckpointWire, queue_data),
+                "Checkpoint without queues uses fixed-size wire part only");
+
     /* 2. Test session table storage of TCP checkpoint */
     bool stored = session_table_store_tcp_checkpoint(&wire);
     TEST_ASSERT(stored == true, "session_table_store_tcp_checkpoint successfully stored remote checkpoint");
+
+    /* 3. Kernel send/receive queue bytes survive the wire (unACKed response + unread request) */
+    uint8_t qbuf[12];
+    memcpy(qbuf, "RESPONSE", 8);  /* 8 send-queue bytes, last 3 never transmitted */
+    memcpy(qbuf + 8, "GET ", 4);   /* 4 receive-queue bytes */
+    cp.is_ktls = false;
+    cp.queue_data = qbuf;
+    cp.snd_queue_len = 8;
+    cp.snd_unsent_len = 3;
+    cp.rcv_queue_len = 4;
+    tcp_checkpoint_to_wire(&cp, 1, "10.211.55.10", 9001, 1048576, test_req, strlen(test_req), &wire);
+    TEST_ASSERT(tcp_checkpoint_wire_len(&wire) == offsetof(ClusterTcpCheckpointWire, queue_data) + 12,
+                "Wire length covers exactly the queued bytes");
+
+    TcpSocketCheckpoint q_cp;
+    tcp_checkpoint_from_wire(&wire, &q_cp, NULL, NULL, NULL, NULL, NULL, NULL);
+    TEST_ASSERT(q_cp.queue_data != NULL && q_cp.snd_queue_len == 8 && q_cp.snd_unsent_len == 3 &&
+                q_cp.rcv_queue_len == 4 && memcmp(q_cp.queue_data, qbuf, 12) == 0,
+                "Send/receive queue bytes and lengths preserved across wire");
+    tcp_checkpoint_release(&q_cp);
+    TEST_ASSERT(q_cp.queue_data == NULL && q_cp.snd_queue_len == 0, "tcp_checkpoint_release frees queue data");
+
+    stored = session_table_store_tcp_checkpoint(&wire);
+    TEST_ASSERT(stored == true, "Checkpoint with queues replaces previous one in session table");
 }
 
 /* -------------------------------------------------------------------------- */

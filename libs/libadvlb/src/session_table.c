@@ -41,6 +41,7 @@ typedef struct SessionNode {
     int shadow_backend_fd;
     bool has_tcp_checkpoint;
     TcpSocketCheckpoint checkpoint;
+    MigratedStreamState *migrated;   /* backend socket + proxy buffers (TCP channel only) */
     uint64_t bytes_to_client;
     uint16_t req_len;
     char initial_req[512];
@@ -191,6 +192,10 @@ static int resolve_backend_index(const char *backend_ip, uint16_t backend_port, 
 
 static void close_node_shadow_fds(SessionNode *node) {
     if (!node) return;
+    tcp_checkpoint_release(&node->checkpoint);
+    node->has_tcp_checkpoint = false;
+    migrated_stream_release(node->migrated);
+    node->migrated = NULL;
     if (node->shadow_client_fd >= 0) {
         close(node->shadow_client_fd);
         node->shadow_client_fd = -1;
@@ -677,7 +682,7 @@ bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
 
     if (cluster_get_state() == VRRP_STATE_MASTER && shadow_client_fd >= 0) {
         worker_pool_adopt_migrated_conn(shadow_client_fd, shadow_backend_fd, backend_idx,
-                                        client_addr, initial_req, req_len, bytes_to_client);
+                                        client_addr, initial_req, req_len, bytes_to_client, NULL);
         return true;
     }
 
@@ -747,8 +752,15 @@ bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
 }
 
 bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire) {
+    return session_table_store_stream_migration(wire, NULL);
+}
+
+bool session_table_store_stream_migration(const ClusterTcpCheckpointWire *wire, MigratedStreamState *state) {
     if (!s_initialized) session_table_init();
-    if (!wire) return false;
+    if (!wire) {
+        migrated_stream_release(state);
+        return false;
+    }
 
     TcpSocketCheckpoint cp;
     int b_idx = -1;
@@ -793,8 +805,12 @@ bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire) {
     node->backend_idx = resolved_idx;
     snprintf(node->backend_ip, sizeof(node->backend_ip), "%s", b_ip);
     node->backend_port = b_port;
+    tcp_checkpoint_release(&node->checkpoint);
     node->has_tcp_checkpoint = true;
-    node->checkpoint = cp;
+    node->checkpoint = cp; /* node now owns cp.queue_data */
+    /* Newest checkpoint wins: a client-only one invalidates older backend/buffer state */
+    migrated_stream_release(node->migrated);
+    node->migrated = state;
     node->bytes_to_client = bytes_to_client;
     if (req_len > 0) {
         if (req_len > sizeof(node->initial_req)) req_len = sizeof(node->initial_req);
@@ -830,6 +846,7 @@ int session_table_promote_shadow_conns(void) {
             uint16_t req_len = 0;
             char req_copy[512];
             struct sockaddr_storage client_addr;
+            MigratedStreamState *migrated = NULL;
 
             pthread_mutex_lock(&shard->mutex);
             SessionNode *node = &shard->nodes[i];
@@ -844,8 +861,19 @@ int session_table_promote_shadow_conns(void) {
                     cfd = tcp_repair_restore(&node->checkpoint);
                     bfd = -1;
                     node->has_tcp_checkpoint = false;
-                    add_log("\033[1;34m[HA RESTORE]\033[0m Restored live stream (fd=%d, kTLS=%s)",
-                            cfd, was_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m");
+                    tcp_checkpoint_release(&node->checkpoint);
+                    migrated = node->migrated;
+                    node->migrated = NULL;
+                    if (cfd >= 0 && migrated && migrated->has_backend) {
+                        bfd = tcp_repair_restore(&migrated->backend);
+                    }
+                    if (bfd < 0) {
+                        /* Backend socket not restorable: proxy buffers are useless without it */
+                        migrated_stream_release(migrated);
+                        migrated = NULL;
+                    }
+                    add_log("\033[1;34m[HA RESTORE]\033[0m Restored live stream (fd=%d, backend fd=%d, kTLS=%s)",
+                            cfd, bfd, was_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m");
                 }
 
                 if (cfd >= 0) {
@@ -881,11 +909,14 @@ int session_table_promote_shadow_conns(void) {
                 if (is_shadow_fd_closed(cfd)) {
                     close(cfd);
                     if (bfd >= 0) close(bfd);
+                    migrated_stream_release(migrated);
                 } else {
                     worker_pool_adopt_migrated_conn(cfd, bfd, b_idx, &client_addr,
-                                                    req_copy, req_len, bytes_sent);
+                                                    req_copy, req_len, bytes_sent, migrated);
                     promoted++;
                 }
+            } else {
+                migrated_stream_release(migrated);
             }
         }
     }

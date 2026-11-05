@@ -62,6 +62,8 @@ void print_help(const char *prog_name) {
     printf("      --vip-iface IFACE     Network interface for VIP binding (e.g. en0, eth0)\n");
     printf("      --vmac MAC            Custom VRRP Virtual MAC (default: RFC 5798 00:00:5e:00:01:<VRID>)\n");
     printf("      --no-vmac             Disable VRRP Virtual MAC address switch\n");
+    printf("      --backend-source-vip  Source backend connections from the VIP so they survive failover\n");
+    printf("                            (backends must route replies for the VIP to the VRRP Master)\n");
     printf("      --vrrp-id ID          VRRP Virtual Router ID 1-255 (default: 51)\n");
     printf("      --vrrp-priority PRIO  Node VRRP election priority 1-254 (default: 100)\n");
     printf("      --vrrp-interval MS    VRRP heartbeat interval in ms (default: 200)\n");
@@ -287,6 +289,7 @@ int parse_cli_args(int argc, char *argv[]) {
         {"session-ttl", required_argument, 0, 1036},
         {"vmac",        required_argument, 0, 1037},
         {"no-vmac",     no_argument,       0, 1038},
+        {"backend-source-vip", no_argument, 0, 1039},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -516,6 +519,9 @@ int parse_cli_args(int argc, char *argv[]) {
             }
             case 1038: // --no-vmac
                 g_config.vrrp_use_vmac = false;
+                break;
+            case 1039: // --backend-source-vip
+                g_config.backend_source_vip = true;
                 break;
             case 'h':
                 print_help(argv[0]);

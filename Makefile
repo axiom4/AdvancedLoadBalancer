@@ -22,6 +22,10 @@ all: directories net-lib lb-lib app-target client
 test test-suite: directories net-lib lb-lib
 	@$(MAKE) -C $(TESTS_DIR) run
 
+# Two-node HA switchover test in network namespaces (Linux, root): verifies every response byte
+ha-test: all
+	@tests/ha/run_ha_test.sh --backend-source-vip
+
 build-tests: directories net-lib lb-lib
 	@$(MAKE) -C $(TESTS_DIR) all
 
@@ -72,4 +76,4 @@ clean:
 	@$(MAKE) -C $(TESTS_DIR) clean || true
 	rm -rf $(LIB_DIR) build $(TARGET) $(CLIENT_TARGET) $(TEST_TARGET)
 
-.PHONY: all directories net net-lib lb lb-lib app app-target client test-client dynamic dynamic-bin nossl debug test test-suite build-tests clean
+.PHONY: all directories net net-lib lb lb-lib app app-target client test-client dynamic dynamic-bin nossl debug test test-suite build-tests ha-test clean

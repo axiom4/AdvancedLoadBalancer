@@ -48,7 +48,15 @@ typedef struct {
     uint32_t ts_val;
     uint32_t ts_ecr;
     KtlsCryptoCheckpoint ktls;
+    /* Kernel queues: without them, ACKed-but-unread client bytes and unACKed response bytes are lost */
+    uint32_t snd_queue_len;   /* write_seq - snd_una: bytes the peer has not ACKed yet */
+    uint32_t snd_unsent_len;  /* tail of the send queue never transmitted */
+    uint32_t rcv_queue_len;   /* received and ACKed, not yet read by the proxy */
+    uint8_t *queue_data;      /* heap: send queue bytes then receive queue bytes */
 } TcpSocketCheckpoint;
+
+/* Max queue payload carried by one checkpoint datagram (fits a 64 KB UDP datagram with headers) */
+#define TCP_CHECKPOINT_QUEUE_MAX 60000
 
 /* Wire format for cross-node replication over UDP cluster mesh */
 typedef struct __attribute__((packed)) {
@@ -93,7 +101,41 @@ typedef struct __attribute__((packed)) {
     uint8_t  rx_key[32];
     uint8_t  rx_salt[4];
     uint8_t  rx_rec_seq[8];
+
+    uint32_t snd_queue_len;   /* Network byte order */
+    uint32_t snd_unsent_len;  /* Network byte order */
+    uint32_t rcv_queue_len;   /* Network byte order */
+    uint8_t  queue_data[TCP_CHECKPOINT_QUEUE_MAX]; /* Only snd_queue_len + rcv_queue_len bytes are sent */
 } ClusterTcpCheckpointWire;
+
+/* Bytes of the wire struct actually used (variable-length queue tail) */
+size_t tcp_checkpoint_wire_len(const ClusterTcpCheckpointWire *wire);
+
+/* Free heap queue data owned by a checkpoint */
+void tcp_checkpoint_release(TcpSocketCheckpoint *cp);
+
+/* Proxy-level state of a stream migrated together with its backend socket (heap, single owner) */
+#define MIGRATED_F_KEEPALIVE      0x01
+#define MIGRATED_F_CLIENT_SHUT_WR 0x02
+#define MIGRATED_F_BACKEND_SHUT_WR 0x04
+#define MIGRATED_F_CLIENT_CLOSED  0x08
+#define MIGRATED_F_BACKEND_CLOSED 0x10
+
+typedef struct {
+    bool     has_backend;
+    TcpSocketCheckpoint backend;  /* owns backend.queue_data */
+    uint8_t *c2b;                 /* client bytes read by the proxy, not yet written to the backend */
+    uint32_t c2b_len;
+    uint8_t *b2c;                 /* backend bytes read by the proxy, not yet written to the client */
+    uint32_t b2c_len;
+    uint64_t bytes_to_backend;
+    uint64_t bytes_from_backend;
+    uint64_t skip_backend_bytes;
+    uint8_t  flags;               /* MIGRATED_F_* */
+} MigratedStreamState;
+
+/* Free a MigratedStreamState and everything it owns (NULL-safe) */
+void migrated_stream_release(MigratedStreamState *st);
 
 /* Check if TCP_REPAIR and/or kTLS are supported by current kernel */
 bool tcp_repair_is_supported(void);

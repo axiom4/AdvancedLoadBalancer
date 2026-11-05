@@ -7,8 +7,11 @@
 #include "advlb/log.h"
 #include "advlb/net_utils.h"
 #include "advlb/proxy.h"
+#include "advlb/sysnet.h"
+#include "advlb/types.h"
 #include "advnet/net_core.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +20,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <pthread.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -38,7 +42,7 @@
 #endif
 
 #define CLUSTER_MAGIC 0x41444C42u /* "ADLB" */
-#define CLUSTER_PROTO_VERSION 3
+#define CLUSTER_PROTO_VERSION 4 /* v4: variable-length TCP checkpoint with kernel queues */
 
 #define CLUSTER_PKT_VRRP_ADVERT    1
 #define CLUSTER_PKT_SESSION_UPSERT 2
@@ -150,6 +154,8 @@ static uint8_t s_master_effective_prio = 0;
 static uint64_t s_stepdown_until_ms = 0;
 static bool s_manual_demoted = false;
 static volatile bool s_bulk_sync_requested = false;
+static volatile sig_atomic_t s_stepdown_requested = 0;
+static volatile bool s_cluster_stopping = false;
 
 static _Atomic uint64_t s_seq_counter = 1;
 static _Atomic uint64_t s_tx_packets = 0;
@@ -563,26 +569,16 @@ static void save_original_iface_mac_and_ip(const char *iface, const char *clean_
         }
     }
 
-    /* Try reading permanent hardware MAC via ip -d link show */
+    /* Permanent hardware MAC via ethtool ETHTOOL_GPERMADDR */
     if (s_saved_orig_mac[0] == '\0') {
-        char pcmd[128];
-        snprintf(pcmd, sizeof(pcmd), "ip -d link show dev %.31s 2>/dev/null", iface);
-        FILE *pp = popen(pcmd, "r");
-        if (pp) {
-            char buf[512];
-            while (fgets(buf, sizeof(buf), pp)) {
-                char *pm = strstr(buf, "permaddr ");
-                if (pm) {
-                    char cand[32] = {0};
-                    if (sscanf(pm + 9, "%17s", cand) == 1 &&
-                        cluster_parse_mac_bytes(cand, parsed) &&
-                        strncasecmp(cand, "00:00:5e:00:", 12) != 0) {
-                        snprintf(s_saved_orig_mac, sizeof(s_saved_orig_mac), "%.31s", cand);
-                        break;
-                    }
-                }
+        uint8_t perm[6];
+        char cand[32];
+        if (sysnet_link_get_perm_mac(iface, perm)) {
+            snprintf(cand, sizeof(cand), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     perm[0], perm[1], perm[2], perm[3], perm[4], perm[5]);
+            if (strncasecmp(cand, "00:00:5e:00:", 12) != 0) {
+                snprintf(s_saved_orig_mac, sizeof(s_saved_orig_mac), "%.31s", cand);
             }
-            pclose(pp);
         }
     }
 
@@ -602,12 +598,10 @@ static void save_original_iface_mac_and_ip(const char *iface, const char *clean_
     /* Self-heal parent physical interface if it was stuck on a VRRP MAC */
     if (geteuid() == 0 && s_saved_orig_mac[0] != '\0' &&
         strncasecmp(cur_mac, "00:00:5e:00:", 12) == 0) {
-        char fix_cmd[256];
-        snprintf(fix_cmd, sizeof(fix_cmd),
-                 "ip link set dev %.31s address %.31s >/dev/null 2>&1 || true",
-                 iface, s_saved_orig_mac);
-        int frc = system(fix_cmd);
-        (void)frc;
+        uint8_t orig[6];
+        if (cluster_parse_mac_bytes(s_saved_orig_mac, orig)) {
+            sysnet_link_set_mac(iface, orig);
+        }
         if (s_iface_primary_ip[0] != '\0') {
             send_vrrp_garp_on_iface(iface, s_iface_primary_ip, s_saved_orig_mac);
         }
@@ -663,14 +657,14 @@ typedef struct {
     struct xt_standard_target target;
 } VrrpRstDropRule;
 
-static void build_vrrp_rst_drop_rule(VrrpRstDropRule *r, const char *parent_iface, const char *vip) {
+/* Matches any output interface: with macvlan the VIP egresses via vrrp<VRID>, not the parent NIC,
+ * so an outiface-bound rule let the kernel RSTs of not-yet-restored streams escape. */
+static void build_vrrp_rst_drop_rule(VrrpRstDropRule *r, const char *vip) {
     memset(r, 0, sizeof(*r));
 
     r->entry.ip.proto = IPPROTO_TCP;
     inet_pton(AF_INET, vip, &r->entry.ip.src);
     r->entry.ip.smsk.s_addr = 0xFFFFFFFFu;
-    snprintf(r->entry.ip.outiface, IFNAMSIZ, "%s", parent_iface);
-    memset(r->entry.ip.outiface_mask, 0xFF, strlen(r->entry.ip.outiface) + 1);
 
     uint16_t match_size = (uint16_t)XT_ALIGN(sizeof(struct xt_entry_match) + sizeof(struct xt_tcp));
     uint16_t target_size = (uint16_t)XT_ALIGN(sizeof(struct xt_standard_target));
@@ -680,6 +674,11 @@ static void build_vrrp_rst_drop_rule(VrrpRstDropRule *r, const char *parent_ifac
 
     r->match.u.user.match_size = match_size;
     snprintf(r->match.u.user.name, XT_EXTENSION_MAXNAMELEN, "tcp");
+    /* Port ranges are inclusive [min, max]: left at 0 the rule would only match port 0 */
+    r->tcp.spts[0] = 0;
+    r->tcp.spts[1] = 0xFFFF;
+    r->tcp.dpts[0] = 0;
+    r->tcp.dpts[1] = 0xFFFF;
     r->tcp.flg_mask = 0x04; /* TH_RST */
     r->tcp.flg_cmp  = 0x04; /* TH_RST */
 
@@ -688,13 +687,12 @@ static void build_vrrp_rst_drop_rule(VrrpRstDropRule *r, const char *parent_ifac
     r->target.verdict = -1; /* -NF_DROP - 1 */
 }
 
-static bool is_matching_rst_drop_rule(const struct ipt_entry *e, const char *parent_iface, const char *vip) {
+static bool is_matching_rst_drop_rule(const struct ipt_entry *e, const char *vip) {
     if (e->ip.proto != IPPROTO_TCP) return false;
     struct in_addr vip_in;
     if (inet_pton(AF_INET, vip, &vip_in) != 1) return false;
     if (e->ip.src.s_addr != vip_in.s_addr) return false;
-    if (strncmp(e->ip.outiface, parent_iface, IFNAMSIZ) != 0) return false;
-    return true;
+    return e->ip.outiface[0] == '\0';
 }
 
 static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
@@ -732,7 +730,7 @@ static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
     size_t offset = 0;
     while (offset < info.size) {
         struct ipt_entry *e = (struct ipt_entry *)((char *)entries->entrytable + offset);
-        if (is_matching_rst_drop_rule(e, parent_iface, vip)) {
+        if (is_matching_rst_drop_rule(e, vip)) {
             free(entries);
             close(s);
             return;
@@ -742,7 +740,7 @@ static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
     }
 
     VrrpRstDropRule rule;
-    build_vrrp_rst_drop_rule(&rule, parent_iface, vip);
+    build_vrrp_rst_drop_rule(&rule, vip);
     size_t rule_size = sizeof(rule);
 
     unsigned int ins_off = info.hook_entry[NF_INET_LOCAL_OUT];
@@ -777,12 +775,18 @@ static void install_vip_rst_filter(const char *parent_iface, const char *vip) {
     memcpy(dst + ins_off, &rule, rule_size);
     memcpy(dst + ins_off + rule_size, (char *)entries->entrytable + ins_off, info.size - ins_off);
 
-    if (setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size)) < 0) {
+    /* The kernel returns the old table counters here and rejects num_counters == 0 with EINVAL */
+    struct xt_counters *old_counters = calloc(info.num_entries ? info.num_entries : 1, sizeof(struct xt_counters));
+    repl->num_counters = info.num_entries;
+    repl->counters = old_counters;
+    if (!old_counters ||
+        setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size)) < 0) {
         add_log("\033[1;33m[HA RST FILTER]\033[0m IPT_SO_SET_REPLACE error: %s (errno %d)", strerror(errno), errno);
     } else {
-        add_log("\033[1;32m[HA RST FILTER]\033[0m Injected kernel Netfilter RST drop rule on %s for %s", parent_iface, vip);
+        add_log("\033[1;32m[HA RST FILTER]\033[0m Injected kernel Netfilter RST drop rule (any iface, parent %s) for %s", parent_iface, vip);
     }
 
+    free(old_counters);
     free(repl);
     free(entries);
     close(s);
@@ -826,7 +830,7 @@ static void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
     bool found = false;
     while (offset < info.size) {
         struct ipt_entry *e = (struct ipt_entry *)((char *)entries->entrytable + offset);
-        if (!found && is_matching_rst_drop_rule(e, parent_iface, vip)) {
+        if (!found && is_matching_rst_drop_rule(e, vip)) {
             found = true;
             rem_off = offset;
             rem_size = e->next_offset;
@@ -869,12 +873,18 @@ static void remove_vip_rst_filter(const char *parent_iface, const char *vip) {
     memcpy(dst, entries->entrytable, rem_off);
     memcpy(dst + rem_off, (char *)entries->entrytable + rem_off + rem_size, info.size - (rem_off + rem_size));
 
-    if (setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size)) < 0) {
+    /* The kernel returns the old table counters here and rejects num_counters == 0 with EINVAL */
+    struct xt_counters *old_counters = calloc(info.num_entries ? info.num_entries : 1, sizeof(struct xt_counters));
+    repl->num_counters = info.num_entries;
+    repl->counters = old_counters;
+    if (!old_counters ||
+        setsockopt(s, IPPROTO_IP, IPT_SO_SET_REPLACE, repl, (socklen_t)(sizeof(struct ipt_replace) + new_size)) < 0) {
         add_log("\033[1;33m[HA RST FILTER]\033[0m IPT_SO_SET_REPLACE error: %s (errno %d)", strerror(errno), errno);
     } else {
-        add_log("\033[1;32m[HA RST FILTER]\033[0m Injected kernel Netfilter RST drop rule on %s for %s", parent_iface, vip);
+        add_log("\033[1;32m[HA RST FILTER]\033[0m Removed kernel Netfilter RST drop rule (%s) for %s", parent_iface, vip);
     }
 
+    free(old_counters);
     free(repl);
     free(entries);
     close(s);
@@ -889,6 +899,35 @@ static __attribute__((unused)) void remove_vip_rst_filter(const char *parent_ifa
     (void)vip;
 }
 #endif
+
+/* RST suppression only covers the takeover window (restore + late checkpoints). Afterwards a
+ * stream we could not restore must get its RST, so the client reconnects at once instead of
+ * hanging until its own timeout. Outside MASTER the blackhole rule already stops VIP egress. */
+#define CLUSTER_RST_FILTER_GRACE_MS 3000ULL
+static atomic_bool s_rst_filter_active = false;
+static _Atomic uint64_t s_rst_filter_until_ms = 0;
+
+static __attribute__((unused)) void rst_filter_arm(const char *iface, const char *vip) {
+    atomic_store(&s_rst_filter_until_ms, now_monotonic_ms() + CLUSTER_RST_FILTER_GRACE_MS);
+    if (!atomic_exchange(&s_rst_filter_active, true)) {
+        install_vip_rst_filter(iface, vip);
+    }
+}
+
+static void rst_filter_extend(void) {
+    if (atomic_load(&s_rst_filter_active)) {
+        atomic_store(&s_rst_filter_until_ms, now_monotonic_ms() + CLUSTER_RST_FILTER_GRACE_MS);
+    }
+}
+
+static void rst_filter_disarm(void) {
+    if (!atomic_exchange(&s_rst_filter_active, false)) return;
+    char clean_vip[64] = {0};
+    int prefix = 32;
+    if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+        remove_vip_rst_filter(g_config.vip_interface, clean_vip);
+    }
+}
 
 static void disarm_vip_cleanup_guard(void) {
     if (s_vip_guard_pipe[1] >= 0) {
@@ -976,45 +1015,26 @@ static void spawn_vip_cleanup_guard(const char *clean_vip,
         }
         unlink(pid_path);
 
-        char cleanup_cmd[1024];
+        /* Native calls only: the guard runs no external tools */
+        (void)mac_switched;
+        (void)orig_mac;
+        (void)primary_ip;
+        int host_pfx = strchr(clean_vip, ':') ? 128 : 32;
 #ifdef __APPLE__
-        (void)prefix;
         (void)active_iface;
         (void)vmac_iface_created;
-        (void)mac_switched;
-        (void)orig_mac;
-        (void)primary_ip;
         (void)rtable;
-        snprintf(cleanup_cmd, sizeof(cleanup_cmd),
-                 "ifconfig %.31s inet %.45s -alias >/dev/null 2>&1 || true; "
-                 "arp -d %.45s >/dev/null 2>&1 || true",
-                 parent_iface, clean_vip, clean_vip);
-        int rc = system(cleanup_cmd);
-        (void)rc;
+        (void)prefix;
+        sysnet_addr_del(parent_iface, clean_vip, host_pfx);
+        sysnet_arp_delete(clean_vip);
 #else
-        (void)mac_switched;
-        (void)orig_mac;
-        (void)primary_ip;
         if (vmac_iface_created && active_iface && active_iface[0] != '\0') {
-            snprintf(cleanup_cmd, sizeof(cleanup_cmd),
-                     "ip rule del from %.45s lookup %d >/dev/null 2>&1 || true; "
-                     "ip route flush table %d >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
-                     "ip link del dev %.31s >/dev/null 2>&1 || true",
-                     clean_vip, rtable, rtable,
-                     clean_vip, active_iface,
-                     clean_vip, prefix, active_iface,
-                     active_iface);
-            int rc = system(cleanup_cmd);
-            (void)rc;
+            /* Deleting the link also drops its addresses and every table route through it */
+            sysnet_rule_del(clean_vip, rtable);
+            sysnet_link_del(active_iface);
         } else {
-            snprintf(cleanup_cmd, sizeof(cleanup_cmd),
-                     "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true",
-                     clean_vip, parent_iface, clean_vip, prefix, parent_iface);
-            int rc = system(cleanup_cmd);
-            (void)rc;
+            sysnet_addr_del(parent_iface, clean_vip, host_pfx);
+            sysnet_addr_del(parent_iface, clean_vip, prefix);
         }
 #endif
         _exit(0);
@@ -1025,6 +1045,39 @@ static void spawn_vip_cleanup_guard(const char *clean_vip,
     s_vip_guard_pipe[0] = -1;
     int status = 0;
     waitpid(pid1, &status, 0);
+}
+
+#ifdef __linux__
+static void set_iface_sysctl(const char *iface, const char *key, const char *val) {
+    char path[128];
+    snprintf(path, sizeof(path), "net/ipv4/conf/%.31s/%s", iface, key);
+    sysnet_sysctl_set(path, val);
+}
+
+/* Loose RPF + strict ARP so only the vrrp interface answers for the VIP */
+static void set_vip_sysctls(const char *parent_iface, const char *vip_iface) {
+    const char *ifaces[] = { "all", parent_iface, vip_iface };
+    for (size_t i = 0; i < sizeof(ifaces) / sizeof(ifaces[0]); i++) {
+        set_iface_sysctl(ifaces[i], "rp_filter", "0");
+        set_iface_sysctl(ifaces[i], "arp_ignore", "1");
+        set_iface_sysctl(ifaces[i], "arp_announce", "2");
+    }
+    set_iface_sysctl(vip_iface, "arp_filter", "0");
+    set_iface_sysctl(vip_iface, "accept_local", "1");
+    sysnet_sysctl_set("net/netfilter/nf_conntrack_tcp_be_liberal", "1");
+}
+#endif
+
+/* Policy blackhole so a non-owner node never egresses VIP-sourced packets (also freezes the
+ * TCP state of streams being checkpointed: their ACKs cannot leave the old node) */
+static void add_vip_blackhole_rule(void) {
+#ifdef __linux__
+    char clean_vip[64] = {0};
+    int prefix = 32;
+    if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
+        sysnet_rule_add(clean_vip, 50, 0);
+    }
+#endif
 }
 
 static void acquire_virtual_ip(void) {
@@ -1051,123 +1104,76 @@ static void acquire_virtual_ip(void) {
         save_original_iface_mac_and_ip(iface, clean_vip);
         snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "%.63s", iface);
 
-        char cmd[1024];
+        int host_pfx = strchr(clean_vip, ':') ? 128 : 32;
 #ifdef __APPLE__
         (void)s_iface_subnet_cidr;
         (void)s_iface_default_gw;
-        snprintf(cmd, sizeof(cmd),
-                 "ifconfig %.31s inet %.45s/32 alias >/dev/null 2>&1",
-                 iface, clean_vip);
-        int rc = system(cmd);
-        s_vip_bound_kernel = (rc == 0);
-        if (s_vip_bound_kernel && g_config.vrrp_use_vmac) {
-            snprintf(cmd, sizeof(cmd),
-                     "arp -S %.45s %.31s pub >/dev/null 2>&1 || true",
-                     clean_vip, s_active_vmac);
-            int arc = system(cmd);
-            (void)arc;
+        (void)host_pfx;
+        s_vip_bound_kernel = (sysnet_addr_add(iface, clean_vip, 32, NULL) == 0);
+        uint8_t pub_mac[6];
+        if (s_vip_bound_kernel && g_config.vrrp_use_vmac && cluster_parse_mac_bytes(s_active_vmac, pub_mac)) {
+            sysnet_arp_publish(clean_vip, iface, pub_mac);
         }
 #else
+        /* Drop kernel RSTs from the VIP before it becomes reachable: until the checkpointed
+         * streams are restored, client segments would otherwise be answered with RST */
+        rst_filter_arm(iface, clean_vip);
+
         if (strncmp(iface, "lo", 2) != 0) {
             /* Create a dedicated VRRP macvlan virtual interface (vrrp<VRID>) separate from the main interface */
             int vrid = (g_config.vrrp_router_id >= 1 && g_config.vrrp_router_id <= 255) ? g_config.vrrp_router_id : 51;
             int rtable = 100 + vrid;
             snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "vrrp%d", vrid);
 
-            char mac_arg[64] = {0};
-            if (g_config.vrrp_use_vmac && s_active_vmac[0] != '\0') {
-                snprintf(mac_arg, sizeof(mac_arg), "address %.31s ", s_active_vmac);
-            }
+            sysnet_rule_del(clean_vip, 0);
+            sysnet_rule_del(clean_vip, rtable);
+            sysnet_route_flush_table(rtable);
+            sysnet_link_del(s_active_vip_iface);
+            sysnet_addr_del(iface, clean_vip, prefix);
+            sysnet_addr_del(iface, clean_vip, host_pfx);
 
-            snprintf(cmd, sizeof(cmd),
-                     "modprobe macvlan >/dev/null 2>&1 || true; "
-                     "ip rule del from %.45s blackhole >/dev/null 2>&1 || true; "
-                     "ip rule del from %.45s lookup %d >/dev/null 2>&1 || true; "
-                     "ip route flush table %d >/dev/null 2>&1 || true; "
-                     "ip link del dev %.31s >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
-                     "ip link add link %.31s name %.31s %stype macvlan mode bridge >/dev/null 2>&1 && "
-                     "ip link set dev %.31s up >/dev/null 2>&1 && "
-                     "ip addr replace %.45s/32 dev %.31s >/dev/null 2>&1",
-                     clean_vip,
-                     clean_vip, rtable,
-                     rtable,
-                     s_active_vip_iface,
-                     clean_vip, prefix, iface,
-                     clean_vip, iface,
-                     iface, s_active_vip_iface, mac_arg,
-                     s_active_vip_iface,
-                     clean_vip, s_active_vip_iface);
+            uint8_t vmac[6];
+            const uint8_t *mac = (g_config.vrrp_use_vmac && cluster_parse_mac_bytes(s_active_vmac, vmac)) ? vmac : NULL;
+            int lrc = sysnet_link_add_macvlan(iface, s_active_vip_iface, mac);
+            int arc = (lrc == 0) ? sysnet_addr_add(s_active_vip_iface, clean_vip, host_pfx, NULL) : lrc;
 
-            if (system(cmd) == 0) {
+            if (arc == 0) {
                 s_vmac_iface_created = true;
                 s_vip_bound_kernel = true;
 
-                snprintf(cmd, sizeof(cmd),
-                         "ip link set dev %.31s promisc off >/dev/null 2>&1 || true; "
-                         "sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2 >/dev/null 2>&1 || true; "
-                         "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 >/dev/null 2>&1 || true; "
-                         "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_filter=0 "
-                         "net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 "
-                         "net.ipv4.conf.%.31s.accept_local=1 >/dev/null 2>&1 || true; "
-                         "sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=1 >/dev/null 2>&1 || true",
-                         iface,
-                         iface, iface, iface,
-                         s_active_vip_iface, s_active_vip_iface,
-                         s_active_vip_iface, s_active_vip_iface,
-                         s_active_vip_iface);
-                int src = system(cmd);
-                (void)src;
+                sysnet_link_set_promisc(iface, false);
+                set_vip_sysctls(iface, s_active_vip_iface);
 
                 /* Policy routing so VIP responses egress via vrrp<VRID> while node traffic uses parent iface */
                 if (s_iface_subnet_cidr[0] != '\0') {
-                    snprintf(cmd, sizeof(cmd),
-                             "ip route replace %.63s dev %.31s scope link src %.45s table %d >/dev/null 2>&1 || true",
-                             s_iface_subnet_cidr, s_active_vip_iface, clean_vip, rtable);
-                    int rrc = system(cmd);
-                    (void)rrc;
+                    sysnet_route_replace(rtable, s_iface_subnet_cidr, NULL, s_active_vip_iface, clean_vip);
                 }
                 if (s_iface_default_gw[0] != '\0') {
-                    snprintf(cmd, sizeof(cmd),
-                             "ip route replace default via %.63s dev %.31s src %.45s onlink table %d >/dev/null 2>&1 || true",
-                             s_iface_default_gw, s_active_vip_iface, clean_vip, rtable);
-                    int grc = system(cmd);
-                    (void)grc;
+                    sysnet_route_replace(rtable, NULL, s_iface_default_gw, s_active_vip_iface, clean_vip);
                 }
                 if (s_iface_subnet_cidr[0] != '\0' || s_iface_default_gw[0] != '\0') {
-                    snprintf(cmd, sizeof(cmd),
-                             "ip rule add pref 100 from %.45s lookup %d >/dev/null 2>&1 || true",
-                             clean_vip, rtable);
-                    int prc = system(cmd);
-                    (void)prc;
+                    sysnet_rule_add(clean_vip, 100, rtable);
                 }
             } else {
-                /* Fallback if macvlan kernel module is unavailable: labeled IP alias without altering parent MAC */
+                add_log("\033[1;33m[VRRP VIP]\033[0m macvlan %s on %s unavailable (%s) — falling back to labeled alias",
+                        s_active_vip_iface, iface, strerror(-arc));
+                if (lrc == 0) sysnet_link_del(s_active_vip_iface);
+                /* Fallback if macvlan is unavailable: labeled IP alias without altering parent MAC */
+                char label[32]; /* sysnet truncates to IFNAMSIZ */
+                snprintf(label, sizeof(label), "%.10s:vrrp%d", iface, vrid);
                 snprintf(s_active_vip_iface, sizeof(s_active_vip_iface), "%.63s", iface);
-                snprintf(cmd, sizeof(cmd),
-                         "ip addr replace %.45s/32 dev %.31s label %.20s:vrrp%d >/dev/null 2>&1",
-                         clean_vip, iface, iface, vrid);
-                s_vip_bound_kernel = (system(cmd) == 0);
+                s_vip_bound_kernel = (sysnet_addr_add(iface, clean_vip, host_pfx, label) == 0);
             }
         } else {
-            snprintf(cmd, sizeof(cmd),
-                     "ip addr replace %.45s/%d dev %.31s >/dev/null 2>&1",
-                     clean_vip, prefix, iface);
-            s_vip_bound_kernel = (system(cmd) == 0);
+            sysnet_rule_del(clean_vip, 0);
+            s_vip_bound_kernel = (sysnet_addr_add(iface, clean_vip, prefix, NULL) == 0);
         }
 
         if (s_vip_bound_kernel) {
+            /* Raw-socket GARP request+reply now, then a 250ms-spaced burst from the cluster loop */
             broadcast_active_vip_garp();
-            snprintf(cmd, sizeof(cmd),
-                     "arping -U -c 1 -I %.31s %.45s >/dev/null 2>&1 || "
-                     "arping -A -c 1 -I %.31s %.45s >/dev/null 2>&1 || true",
-                     s_active_vip_iface, clean_vip, s_active_vip_iface, clean_vip);
-            int arc = system(cmd);
-            (void)arc;
             s_last_garp_sent_ms = now_monotonic_ms();
             s_garp_burst_remaining = 3;
-            install_vip_rst_filter(iface, clean_vip);
         }
 #endif
 
@@ -1228,54 +1234,29 @@ static void release_virtual_ip(void) {
         return;
     }
 
-#ifdef __linux__
     /* Add blackhole rule so BACKUP node never egresses stray packets with VIP as source */
-    char bcmd[128];
-    snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
-    int brc = system(bcmd);
-    (void)brc;
-#endif
+    add_vip_blackhole_rule();
 
     if (s_vip_bound_kernel && is_safe_iface_name(g_config.vip_interface) && geteuid() == 0) {
-        char cmd[512];
+        int host_pfx = strchr(clean_vip, ':') ? 128 : 32;
 #ifdef __APPLE__
         (void)prev_active_iface;
         (void)rtable;
-        snprintf(cmd, sizeof(cmd),
-                 "ifconfig %.31s inet %.45s -alias >/dev/null 2>&1 || true; "
-                 "arp -d %.45s >/dev/null 2>&1 || true",
-                 g_config.vip_interface, clean_vip, clean_vip);
-        int rc = system(cmd);
-        (void)rc;
+        (void)prefix;
+        sysnet_addr_del(g_config.vip_interface, clean_vip, host_pfx);
+        sysnet_arp_delete(clean_vip);
 #else
+        sysnet_link_set_promisc(g_config.vip_interface, false);
         if (s_vmac_iface_created && is_safe_iface_name(prev_active_iface)) {
-            snprintf(cmd, sizeof(cmd),
-                     "ip link set dev %.31s promisc off >/dev/null 2>&1 || true; "
-                     "ip rule del from %.45s lookup %d >/dev/null 2>&1 || true; "
-                     "ip route flush table %d >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
-                     "ip link del dev %.31s >/dev/null 2>&1 || true",
-                     g_config.vip_interface,
-                     clean_vip, rtable, rtable,
-                     clean_vip, prev_active_iface,
-                     clean_vip, prefix, prev_active_iface,
-                     prev_active_iface);
-            int rc = system(cmd);
-            (void)rc;
+            sysnet_rule_del(clean_vip, rtable);
+            sysnet_link_del(prev_active_iface);
+            sysnet_route_flush_table(rtable);
             s_vmac_iface_created = false;
         } else {
-            snprintf(cmd, sizeof(cmd),
-                     "ip link set dev %.31s promisc off >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true; "
-                     "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true",
-                     g_config.vip_interface,
-                     clean_vip, g_config.vip_interface,
-                     clean_vip, prefix, g_config.vip_interface);
-            int rc = system(cmd);
-            (void)rc;
+            sysnet_addr_del(g_config.vip_interface, clean_vip, host_pfx);
+            sysnet_addr_del(g_config.vip_interface, clean_vip, prefix);
         }
-        install_vip_rst_filter(g_config.vip_interface, clean_vip);
+        rst_filter_disarm();
 #endif
         s_vip_bound_kernel = false;
     }
@@ -1579,34 +1560,603 @@ static void send_unix_heartbeat_fd_to_peers(void) {
     broadcast_unix_fd_msg(&m, fds, 1);
 }
 
+/* ------------------------------------------------------------------------------------------ */
+/* Reliable TCP checkpoint channel                                                            */
+/* Full stream migrations (client + backend sockets, kernel queues, proxy buffers) can reach  */
+/* ~200 KB: too big and too loss-sensitive for UDP. Each node listens on TCP cluster_port and */
+/* keeps one outbound connection per peer. Frames are length-prefixed and HMAC-authenticated. */
+/* ------------------------------------------------------------------------------------------ */
+#define CLUSTER_STREAM_MAGIC          0x41444D47u /* "ADMG" */
+#define CLUSTER_STREAM_TYPE_MIGRATION 1
+#define CLUSTER_STREAM_MAX_PAYLOAD    (512u * 1024u)
+#define CLUSTER_STREAM_SEND_TIMEOUT_MS 500
+#define MAX_INBOUND_STREAMS           (MAX_CLUSTER_PEERS * 2)
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  type;
+    uint8_t  vrid;
+    uint8_t  sender_state;
+    uint32_t sender_node_id;
+    uint64_t timestamp_ms;
+    uint32_t payload_len;
+    uint8_t  hmac[CLUSTER_HMAC_LEN];
+} ClusterStreamFrameHdr;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  flags;              /* MIGRATED_F_* */
+    uint8_t  has_backend;
+    uint16_t reserved;
+    uint64_t bytes_to_backend;   /* Network byte order */
+    uint64_t bytes_from_backend;
+    uint64_t skip_backend_bytes;
+    uint32_t client_cp_len;
+    uint32_t backend_cp_len;
+    uint32_t c2b_len;
+    uint32_t b2c_len;
+} ClusterStreamMigrationHdr;
+
+typedef struct {
+    pthread_mutex_t mu;
+    int fd;
+    bool connected;
+    uint64_t next_retry_ms;
+} PeerStreamLink;
+
+typedef struct {
+    int fd;
+    uint8_t *buf;
+    size_t len;
+    size_t cap;
+} InboundStream;
+
+static PeerStreamLink s_links[MAX_CLUSTER_PEERS];
+static InboundStream s_inbound[MAX_INBOUND_STREAMS];
+static int s_stream_listen_fd = -1;
+static bool s_stream_initialized = false;
+
+static void stream_channel_init_state(void) {
+    if (s_stream_initialized) return;
+    for (int i = 0; i < MAX_CLUSTER_PEERS; i++) {
+        pthread_mutex_init(&s_links[i].mu, NULL);
+        s_links[i].fd = -1;
+        s_links[i].connected = false;
+        s_links[i].next_retry_ms = 0;
+    }
+    for (int i = 0; i < MAX_INBOUND_STREAMS; i++) {
+        s_inbound[i].fd = -1;
+    }
+    s_stream_initialized = true;
+}
+
+static void stream_link_close_locked(PeerStreamLink *l, uint64_t now_ms) {
+    if (l->fd >= 0) close(l->fd);
+    l->fd = -1;
+    l->connected = false;
+    l->next_retry_ms = now_ms + 1000;
+}
+
+static void stream_inbound_close(InboundStream *in) {
+    if (in->fd >= 0) close(in->fd);
+    free(in->buf);
+    in->fd = -1;
+    in->buf = NULL;
+    in->len = in->cap = 0;
+}
+
+static bool stream_channel_open(const char *bind_ip, int port) {
+    stream_channel_init_state();
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    net_set_reuse(fd, 1, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, bind_ip, &a.sin_addr) != 1) a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 16) < 0) {
+        add_log("\033[1;31m[HA STREAM]\033[0m TCP checkpoint channel bind %s:%d failed: %s", bind_ip, port, strerror(errno));
+        close(fd);
+        return false;
+    }
+    net_set_nonblocking(fd);
+    s_stream_listen_fd = fd;
+    return true;
+}
+
+static void stream_channel_close(void) {
+    if (!s_stream_initialized) return;
+    if (s_stream_listen_fd >= 0) {
+        close(s_stream_listen_fd);
+        s_stream_listen_fd = -1;
+    }
+    for (int i = 0; i < MAX_CLUSTER_PEERS; i++) {
+        pthread_mutex_lock(&s_links[i].mu);
+        stream_link_close_locked(&s_links[i], 0);
+        s_links[i].next_retry_ms = 0;
+        pthread_mutex_unlock(&s_links[i].mu);
+    }
+    for (int i = 0; i < MAX_INBOUND_STREAMS; i++) {
+        stream_inbound_close(&s_inbound[i]);
+    }
+}
+
+/* Start nonblocking connects to peers without an outbound link (cluster thread) */
+static void stream_links_maintain(uint64_t now_ms) {
+    if (s_stream_listen_fd < 0) return;
+    pthread_mutex_lock(&s_cluster_mutex);
+    int n = s_num_peers;
+    struct sockaddr_storage addrs[MAX_CLUSTER_PEERS];
+    socklen_t lens[MAX_CLUSTER_PEERS];
+    for (int i = 0; i < n; i++) {
+        addrs[i] = s_peers[i].addr;
+        lens[i] = s_peers[i].addr_len;
+    }
+    pthread_mutex_unlock(&s_cluster_mutex);
+
+    for (int i = 0; i < n; i++) {
+        PeerStreamLink *l = &s_links[i];
+        pthread_mutex_lock(&l->mu);
+        if (l->fd < 0 && now_ms >= l->next_retry_ms && lens[i] > 0) {
+            int fd = socket(addrs[i].ss_family, SOCK_STREAM, 0);
+            if (fd >= 0) {
+                net_set_nonblocking(fd);
+                net_set_nodelay(fd, 1);
+                int sb = 4 * 1024 * 1024;
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
+#ifdef SO_NOSIGPIPE
+                int one = 1;
+                setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+                int rc = connect(fd, (struct sockaddr *)&addrs[i], lens[i]);
+                if (rc == 0 || errno == EINPROGRESS) {
+                    l->fd = fd;
+                    l->connected = (rc == 0);
+                } else {
+                    close(fd);
+                    l->next_retry_ms = now_ms + 1000;
+                }
+            } else {
+                l->next_retry_ms = now_ms + 1000;
+            }
+        }
+        pthread_mutex_unlock(&l->mu);
+    }
+}
+
+static bool stream_any_link_connected(void) {
+    if (!s_stream_initialized) return false;
+    for (int i = 0; i < MAX_CLUSTER_PEERS; i++) {
+        if (s_links[i].connected) return true;
+    }
+    return false;
+}
+
+static bool stream_send_all(int fd, const uint8_t *buf, size_t len) {
+    uint64_t deadline = now_monotonic_ms() + CLUSTER_STREAM_SEND_TIMEOUT_MS;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            uint64_t now = now_monotonic_ms();
+            if (now >= deadline) return false;
+            struct pollfd p = { .fd = fd, .events = POLLOUT, .revents = 0 };
+            poll(&p, 1, (int)(deadline - now));
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/* Send one frame to every connected peer; returns number of peers that accepted it */
+static int stream_broadcast_frame(const uint8_t *frame, size_t len) {
+    int delivered = 0;
+    for (int i = 0; i < MAX_CLUSTER_PEERS; i++) {
+        PeerStreamLink *l = &s_links[i];
+        pthread_mutex_lock(&l->mu);
+        if (l->connected && l->fd >= 0) {
+            if (stream_send_all(l->fd, frame, len)) {
+                delivered++;
+                atomic_fetch_add_explicit(&s_tx_packets, 1, memory_order_relaxed);
+            } else {
+                add_log("\033[1;31m[HA STREAM]\033[0m Checkpoint send to peer link %d failed: %s", i, strerror(errno));
+                stream_link_close_locked(l, now_monotonic_ms());
+            }
+        }
+        pthread_mutex_unlock(&l->mu);
+    }
+    return delivered;
+}
+
+static void handle_stream_migration(const uint8_t *payload, size_t len, uint8_t sender_state) {
+    if (len < sizeof(ClusterStreamMigrationHdr)) return;
+    ClusterStreamMigrationHdr mh;
+    memcpy(&mh, payload, sizeof(mh));
+    uint32_t ccl = ntohl(mh.client_cp_len);
+    uint32_t bcl = ntohl(mh.backend_cp_len);
+    uint32_t c2l = ntohl(mh.c2b_len);
+    uint32_t b2l = ntohl(mh.b2c_len);
+    size_t base = offsetof(ClusterTcpCheckpointWire, queue_data);
+    if (ccl < base || ccl > sizeof(ClusterTcpCheckpointWire)) return;
+    if (bcl != 0 && (bcl < base || bcl > sizeof(ClusterTcpCheckpointWire))) return;
+    if (c2l > BUFFER_SIZE || b2l > BUFFER_SIZE) return;
+    if ((uint64_t)sizeof(mh) + ccl + bcl + c2l + b2l != len) return;
+
+    const uint8_t *p = payload + sizeof(mh);
+    ClusterTcpCheckpointWire *cw = malloc(sizeof(*cw));
+    ClusterTcpCheckpointWire *bw = (bcl > 0) ? malloc(sizeof(*bw)) : NULL;
+    MigratedStreamState *st = calloc(1, sizeof(*st));
+    if (!cw || !st || (bcl > 0 && !bw)) {
+        free(cw);
+        free(bw);
+        free(st);
+        return;
+    }
+    memcpy(cw, p, ccl);
+    p += ccl;
+    bool ok = (tcp_checkpoint_wire_len(cw) == ccl);
+    if (ok && bw) {
+        memcpy(bw, p, bcl);
+        p += bcl;
+        ok = (tcp_checkpoint_wire_len(bw) == bcl);
+        if (ok) {
+            tcp_checkpoint_from_wire(bw, &st->backend, NULL, NULL, NULL, NULL, NULL, NULL);
+            st->has_backend = true;
+        }
+    }
+    if (ok && c2l > 0 && (st->c2b = malloc(c2l)) != NULL) {
+        memcpy(st->c2b, p, c2l);
+        st->c2b_len = c2l;
+    }
+    p += c2l;
+    if (ok && b2l > 0 && (st->b2c = malloc(b2l)) != NULL) {
+        memcpy(st->b2c, p, b2l);
+        st->b2c_len = b2l;
+    }
+    st->bytes_to_backend = net_to_u64(mh.bytes_to_backend);
+    st->bytes_from_backend = net_to_u64(mh.bytes_from_backend);
+    st->skip_backend_bytes = net_to_u64(mh.skip_backend_bytes);
+    st->flags = mh.flags;
+
+    if (ok && session_table_store_stream_migration(cw, st)) {
+        st = NULL; /* owned by the session table now */
+        atomic_fetch_add_explicit(&s_synced_sessions, 1, memory_order_relaxed);
+        VrrpState my_state = (VrrpState)atomic_load_explicit(&s_vrrp_state, memory_order_relaxed);
+        if (my_state == VRRP_STATE_MASTER && sender_state != VRRP_STATE_MASTER) {
+            session_table_promote_shadow_conns();
+            rst_filter_extend();
+        }
+    }
+    migrated_stream_release(st);
+    free(cw);
+    free(bw);
+}
+
+/* Parse complete frames from an inbound buffer; returns false if the stream must be closed */
+static bool stream_inbound_process(InboundStream *in) {
+    size_t off = 0;
+    while (in->len - off >= sizeof(ClusterStreamFrameHdr)) {
+        ClusterStreamFrameHdr *h = (ClusterStreamFrameHdr *)(in->buf + off);
+        uint32_t plen = ntohl(h->payload_len);
+        uint8_t expected_vrid = (uint8_t)(g_config.vrrp_router_id > 0 ? g_config.vrrp_router_id : 51);
+        if (ntohl(h->magic) != CLUSTER_STREAM_MAGIC || h->version != CLUSTER_PROTO_VERSION ||
+            h->vrid != expected_vrid || plen > CLUSTER_STREAM_MAX_PAYLOAD) {
+            return false;
+        }
+        size_t total = sizeof(*h) + plen;
+        if (in->len - off < total) break;
+
+        uint8_t rx_hmac[CLUSTER_HMAC_LEN];
+        uint8_t calc[CLUSTER_HMAC_LEN];
+        memcpy(rx_hmac, h->hmac, CLUSTER_HMAC_LEN);
+        memset(h->hmac, 0, CLUSTER_HMAC_LEN);
+        compute_packet_hmac(h, total, calc);
+#ifndef NO_SSL
+        bool auth = (CRYPTO_memcmp(rx_hmac, calc, CLUSTER_HMAC_LEN) == 0);
+#else
+        uint8_t diff = 0;
+        for (size_t i = 0; i < CLUSTER_HMAC_LEN; i++) diff |= (uint8_t)(rx_hmac[i] ^ calc[i]);
+        bool auth = (diff == 0);
+#endif
+        uint64_t ts = net_to_u64(h->timestamp_ms);
+        uint64_t wall = now_wallclock_ms();
+        uint64_t skew = (wall > ts) ? (wall - ts) : (ts - wall);
+        if (!auth || skew > CLUSTER_ANTI_REPLAY_WINDOW_MS) {
+            add_log("\033[1;31m[HA STREAM]\033[0m Rejected checkpoint frame (%s)", auth ? "stale timestamp" : "bad HMAC");
+            return false;
+        }
+        atomic_fetch_add_explicit(&s_rx_packets, 1, memory_order_relaxed);
+        if (ntohl(h->sender_node_id) != s_node_id && h->type == CLUSTER_STREAM_TYPE_MIGRATION) {
+            handle_stream_migration((const uint8_t *)(h + 1), plen, h->sender_state);
+        }
+        off += total;
+    }
+    if (off > 0) {
+        memmove(in->buf, in->buf + off, in->len - off);
+        in->len -= off;
+    }
+    return true;
+}
+
+static void stream_inbound_read(InboundStream *in) {
+    for (;;) {
+        if (in->cap - in->len < 65536) {
+            size_t ncap = in->cap ? in->cap * 2 : 262144;
+            if (ncap > sizeof(ClusterStreamFrameHdr) + CLUSTER_STREAM_MAX_PAYLOAD + 65536) {
+                ncap = sizeof(ClusterStreamFrameHdr) + CLUSTER_STREAM_MAX_PAYLOAD + 65536;
+            }
+            if (ncap <= in->cap) {
+                stream_inbound_close(in);
+                return;
+            }
+            uint8_t *nb = realloc(in->buf, ncap);
+            if (!nb) {
+                stream_inbound_close(in);
+                return;
+            }
+            in->buf = nb;
+            in->cap = ncap;
+        }
+        ssize_t r = recv(in->fd, in->buf + in->len, in->cap - in->len, MSG_DONTWAIT);
+        if (r > 0) {
+            in->len += (size_t)r;
+            if (!stream_inbound_process(in)) {
+                stream_inbound_close(in);
+                return;
+            }
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        stream_inbound_close(in);
+        return;
+    }
+}
+
+static void stream_accept_pending(void) {
+    for (;;) {
+        int fd = accept(s_stream_listen_fd, NULL, NULL);
+        if (fd < 0) return;
+        int slot = -1;
+        for (int i = 0; i < MAX_INBOUND_STREAMS; i++) {
+            if (s_inbound[i].fd < 0) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            close(fd);
+            continue;
+        }
+        net_set_nonblocking(fd);
+        int rb = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
+        s_inbound[slot].fd = fd;
+        s_inbound[slot].len = 0;
+    }
+}
+
+/* Poll set entries owned by the TCP channel */
+typedef struct {
+    int kind;   /* 0 = listen, 1 = outbound link, 2 = inbound stream */
+    int index;
+} StreamPollRef;
+
+static int stream_fill_pollfds(struct pollfd *pfds, StreamPollRef *refs, int max) {
+    int n = 0;
+    if (s_stream_listen_fd < 0) return 0;
+    if (n < max) {
+        pfds[n] = (struct pollfd){ .fd = s_stream_listen_fd, .events = POLLIN };
+        refs[n++] = (StreamPollRef){ 0, 0 };
+    }
+    for (int i = 0; i < MAX_CLUSTER_PEERS && n < max; i++) {
+        int fd = s_links[i].fd;
+        if (fd < 0) continue;
+        pfds[n] = (struct pollfd){ .fd = fd, .events = s_links[i].connected ? POLLIN : POLLOUT };
+        refs[n++] = (StreamPollRef){ 1, i };
+    }
+    for (int i = 0; i < MAX_INBOUND_STREAMS && n < max; i++) {
+        if (s_inbound[i].fd < 0) continue;
+        pfds[n] = (struct pollfd){ .fd = s_inbound[i].fd, .events = POLLIN };
+        refs[n++] = (StreamPollRef){ 2, i };
+    }
+    return n;
+}
+
+static void stream_handle_pollfds(const struct pollfd *pfds, const StreamPollRef *refs, int n, uint64_t now_ms) {
+    for (int k = 0; k < n; k++) {
+        short re = pfds[k].revents;
+        if (re == 0) continue;
+        if (refs[k].kind == 0) {
+            stream_accept_pending();
+        } else if (refs[k].kind == 1) {
+            PeerStreamLink *l = &s_links[refs[k].index];
+            pthread_mutex_lock(&l->mu);
+            if (l->fd == pfds[k].fd) {
+                if (!l->connected) {
+                    int err = 0;
+                    socklen_t el = sizeof(err);
+                    getsockopt(l->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                    if (err == 0 && (re & POLLOUT)) {
+                        l->connected = true;
+                    } else {
+                        stream_link_close_locked(l, now_ms);
+                    }
+                } else {
+                    /* Peers never send on our outbound link: readable means closed or reset */
+                    char tmp[256];
+                    ssize_t r = recv(l->fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+                    if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                        stream_link_close_locked(l, now_ms);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&l->mu);
+        } else {
+            InboundStream *in = &s_inbound[refs[k].index];
+            if (in->fd == pfds[k].fd) stream_inbound_read(in);
+        }
+    }
+}
+
+bool cluster_fd_is_vip_sourced(int fd) {
+    if (fd < 0) return false;
+    char clean_vip[64] = {0};
+    int prefix = 32;
+    if (!parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) return false;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) < 0) return false;
+    uint8_t vip[16];
+    if (ss.ss_family == AF_INET) {
+        return inet_pton(AF_INET, clean_vip, vip) == 1 &&
+               memcmp(&((struct sockaddr_in *)&ss)->sin_addr, vip, 4) == 0;
+    }
+    if (ss.ss_family == AF_INET6) {
+        const struct in6_addr *a6 = &((struct sockaddr_in6 *)&ss)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(a6)) {
+            return inet_pton(AF_INET, clean_vip, vip) == 1 && memcmp(&a6->s6_addr[12], vip, 4) == 0;
+        }
+        return inet_pton(AF_INET6, clean_vip, vip) == 1 && memcmp(a6, vip, 16) == 0;
+    }
+    return false;
+}
+
+/* Client + backend checkpoint and proxy buffers in one frame over the TCP channel */
+static bool send_stream_migration(const TcpSocketCheckpoint *client_cp,
+                                  int backend_idx,
+                                  int backend_fd,
+                                  const char *initial_req,
+                                  uint16_t req_len,
+                                  uint64_t bytes_to_client,
+                                  const ClusterConnState *state) {
+    if (!stream_any_link_connected()) return false;
+
+    const char *b_ip = (backend_idx >= 0 && backend_idx < g_num_backends) ? g_backends[backend_idx].ip : "";
+    uint16_t b_port = (backend_idx >= 0 && backend_idx < g_num_backends) ? (uint16_t)g_backends[backend_idx].port : 0;
+
+    ClusterTcpCheckpointWire *cw = malloc(sizeof(*cw));
+    ClusterTcpCheckpointWire *bw = malloc(sizeof(*bw));
+    if (!cw || !bw) {
+        free(cw);
+        free(bw);
+        return false;
+    }
+    tcp_checkpoint_to_wire(client_cp, backend_idx, b_ip, b_port, bytes_to_client, initial_req, req_len, cw);
+    size_t ccl = tcp_checkpoint_wire_len(cw);
+
+    size_t bcl = 0;
+    TcpSocketCheckpoint bcp;
+    if (backend_fd >= 0 && cluster_fd_is_vip_sourced(backend_fd) && tcp_repair_checkpoint(backend_fd, NULL, &bcp)) {
+        tcp_checkpoint_to_wire(&bcp, backend_idx, b_ip, b_port, 0, NULL, 0, bw);
+        bcl = tcp_checkpoint_wire_len(bw);
+        tcp_checkpoint_release(&bcp);
+    }
+    /* Without the backend socket the buffers are meaningless on the new node */
+    uint32_t c2l = bcl ? state->c2b_len : 0;
+    uint32_t b2l = bcl ? state->b2c_len : 0;
+
+    size_t plen = sizeof(ClusterStreamMigrationHdr) + ccl + bcl + c2l + b2l;
+    size_t total = sizeof(ClusterStreamFrameHdr) + plen;
+    uint8_t *frame = (plen <= CLUSTER_STREAM_MAX_PAYLOAD) ? malloc(total) : NULL;
+    if (!frame) {
+        free(cw);
+        free(bw);
+        return false;
+    }
+
+    ClusterStreamFrameHdr *h = (ClusterStreamFrameHdr *)frame;
+    memset(h, 0, sizeof(*h));
+    h->magic = htonl(CLUSTER_STREAM_MAGIC);
+    h->version = CLUSTER_PROTO_VERSION;
+    h->type = CLUSTER_STREAM_TYPE_MIGRATION;
+    h->vrid = (uint8_t)(g_config.vrrp_router_id > 0 ? g_config.vrrp_router_id : 51);
+    h->sender_state = (uint8_t)atomic_load_explicit(&s_vrrp_state, memory_order_relaxed);
+    h->sender_node_id = htonl(s_node_id);
+    h->timestamp_ms = u64_to_net(now_wallclock_ms());
+    h->payload_len = htonl((uint32_t)plen);
+
+    ClusterStreamMigrationHdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.flags = state->flags;
+    mh.has_backend = bcl ? 1 : 0;
+    mh.bytes_to_backend = u64_to_net(state->bytes_to_backend);
+    mh.bytes_from_backend = u64_to_net(state->bytes_from_backend);
+    mh.skip_backend_bytes = u64_to_net(state->skip_backend_bytes);
+    mh.client_cp_len = htonl((uint32_t)ccl);
+    mh.backend_cp_len = htonl((uint32_t)bcl);
+    mh.c2b_len = htonl(c2l);
+    mh.b2c_len = htonl(b2l);
+
+    uint8_t *p = frame + sizeof(*h);
+    memcpy(p, &mh, sizeof(mh));
+    p += sizeof(mh);
+    memcpy(p, cw, ccl);
+    p += ccl;
+    if (bcl) {
+        memcpy(p, bw, bcl);
+        p += bcl;
+    }
+    if (c2l) {
+        memcpy(p, state->c2b, c2l);
+        p += c2l;
+    }
+    if (b2l) memcpy(p, state->b2c, b2l);
+    compute_packet_hmac(frame, total, h->hmac);
+
+    int delivered = stream_broadcast_frame(frame, total);
+    add_log("\033[1;34m[HA STREAM]\033[0m Migrated stream over TCP (backend socket=%s, c2b=%u, b2c=%u, %zu bytes) to %d peer(s)",
+            bcl ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", c2l, b2l, total, delivered);
+    free(frame);
+    free(cw);
+    free(bw);
+    return delivered > 0;
+}
+
 void cluster_replicate_live_conn(const struct sockaddr_storage *client_addr,
                                  int backend_idx,
                                  int client_fd,
                                  int backend_fd,
                                  const char *initial_req,
                                  uint16_t req_len,
-                                 uint64_t bytes_to_client) {
+                                 uint64_t bytes_to_client,
+                                 const ClusterConnState *state) {
     if (!s_cluster_running || !client_addr || client_fd < 0) return;
 
-    /* 1. Broadcast network TCP_REPAIR + kTLS Checkpoint over cluster UDP */
+    /* 1. Broadcast network TCP_REPAIR + kTLS Checkpoint: full stream over TCP, else client-only UDP */
     if (s_cluster_fd >= 0) {
         TcpSocketCheckpoint cp;
-        if (tcp_repair_checkpoint(client_fd, NULL, &cp)) {
-            ClusterWirePacket pkt;
-            memset(&pkt, 0, sizeof(pkt));
+        /* ~60 KB packet: heap, not the 512 KB worker stack */
+        ClusterWirePacket *pkt = malloc(sizeof(*pkt));
+        bool have_cp = pkt && tcp_repair_checkpoint(client_fd, NULL, &cp);
+        if (have_cp && state &&
+            send_stream_migration(&cp, backend_idx, backend_fd, initial_req, req_len, bytes_to_client, state)) {
+            tcp_checkpoint_release(&cp);
+            have_cp = false;
+        }
+        if (have_cp) {
             const char *b_ip = (backend_idx >= 0 && backend_idx < g_num_backends) ? g_backends[backend_idx].ip : "";
             uint16_t b_port = (backend_idx >= 0 && backend_idx < g_num_backends) ? (uint16_t)g_backends[backend_idx].port : 0;
-            tcp_checkpoint_to_wire(&cp, backend_idx, b_ip, b_port, bytes_to_client, initial_req, req_len, &pkt.tcp_cp);
-            size_t total_len = prepare_tcp_checkpoint_packet(&pkt, &pkt.tcp_cp);
-            broadcast_cluster_packet(&pkt, total_len);
+            tcp_checkpoint_to_wire(&cp, backend_idx, b_ip, b_port, bytes_to_client, initial_req, req_len, &pkt->tcp_cp);
+            size_t total_len = prepare_tcp_checkpoint_packet(pkt, &pkt->tcp_cp);
+            broadcast_cluster_packet(pkt, total_len);
 
             char cip[INET6_ADDRSTRLEN];
             int cport = 0;
             get_client_ip_port(client_addr, cip, sizeof(cip), &cport);
-            add_log("\033[1;34m[HA SYNC]\033[0m Replicated TCP stream for %s:%d (kTLS=%s, wire_flags=0x%02x, snd_seq=%u)",
+            add_log("\033[1;34m[HA SYNC]\033[0m Replicated TCP stream for %s:%d (kTLS=%s, wire_flags=0x%02x, snd_seq=%u, sndq=%u, rcvq=%u)",
                     cip, cport, cp.is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m",
-                    (unsigned int)pkt.tcp_cp.flags, cp.snd_seq);
+                    (unsigned int)pkt->tcp_cp.flags, cp.snd_seq, cp.snd_queue_len, cp.rcv_queue_len);
+            tcp_checkpoint_release(&cp);
         }
+        free(pkt);
     }
 
     /* 2. Local UNIX domain socket replication (for single-host tests / child processes) */
@@ -1855,7 +2405,7 @@ static size_t prepare_tcp_checkpoint_packet(ClusterWirePacket *pkt,
         pkt->tcp_cp = *cp_wire;
     }
 
-    size_t total_len = sizeof(ClusterPacketHeader) + sizeof(ClusterTcpCheckpointWire);
+    size_t total_len = sizeof(ClusterPacketHeader) + tcp_checkpoint_wire_len(&pkt->tcp_cp);
     compute_packet_hmac(pkt, total_len, pkt->hdr.hmac);
     return total_len;
 }
@@ -2034,6 +2584,7 @@ static void transition_to_master(uint64_t now_ms) {
         atomic_fetch_add_explicit(&s_failover_count, 1, memory_order_relaxed);
         acquire_virtual_ip();
         int promoted = session_table_promote_shadow_conns();
+        rst_filter_extend();
         add_log("\033[1;32m[VRRP ELECTION]\033[0m Node %08X transitioned %s -> MASTER (prio %u, VRID %d, adopted %d active stream(s))",
                 s_node_id, cluster_state_name(prev),
                 (unsigned int)s_master_effective_prio, g_config.vrrp_router_id, promoted);
@@ -2053,16 +2604,7 @@ static void transition_to_backup(uint32_t new_master_id, uint8_t master_prio, ui
     s_master_effective_prio = master_prio;
 
     if (prev == VRRP_STATE_MASTER) {
-#ifdef __linux__
-        char clean_vip[64] = {0};
-        int prefix = 32;
-        if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
-            char bcmd[128];
-            snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
-            int brc = system(bcmd);
-            (void)brc;
-        }
-#endif
+        add_vip_blackhole_rule();
         worker_pool_handover_active_conns();
         release_virtual_ip();
         add_log("\033[1;33m[VRRP ELECTION]\033[0m Node %08X stepped down MASTER -> BACKUP (new Master %08X, prio %u)",
@@ -2091,7 +2633,9 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
     uint16_t sess_count = ntohs(pkt->hdr.session_count);
     size_t expected_len;
     if (pkt->hdr.pkt_type == CLUSTER_PKT_TCP_CHECKPOINT) {
-        expected_len = sizeof(ClusterPacketHeader) + sizeof(ClusterTcpCheckpointWire);
+        expected_len = sizeof(ClusterPacketHeader) + offsetof(ClusterTcpCheckpointWire, queue_data);
+        if (bytes_read < expected_len) return;
+        expected_len = sizeof(ClusterPacketHeader) + tcp_checkpoint_wire_len(&pkt->tcp_cp);
     } else {
         if (sess_count > CLUSTER_MAX_BATCH_SESSIONS) return;
         expected_len = sizeof(ClusterPacketHeader) + (size_t)sess_count * sizeof(ClusterSessionWire);
@@ -2184,6 +2728,12 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
     } else if (pkt->hdr.pkt_type == CLUSTER_PKT_TCP_CHECKPOINT) {
         if (session_table_store_tcp_checkpoint(&pkt->tcp_cp)) {
             atomic_fetch_add_explicit(&s_synced_sessions, 1, memory_order_relaxed);
+            /* Handover checkpoint arriving after our promotion (preemption, or slower than the
+             * SWITCHOVER packet): adopt it now, otherwise it would sit in the table until it expires */
+            if (my_state == VRRP_STATE_MASTER && sender_state != VRRP_STATE_MASTER) {
+                session_table_promote_shadow_conns();
+                rst_filter_extend();
+            }
         }
     } else if (pkt->hdr.pkt_type == CLUSTER_PKT_SYNC_REQ) {
         /* If we are MASTER (or have active sessions), send snapshot + live FDs back to requester */
@@ -2195,6 +2745,13 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
             }
         }
     } else if (pkt->hdr.pkt_type == CLUSTER_PKT_SWITCHOVER) {
+        /* Priority 0 = the Master yielded to us; priority > 0 = a Backup asks us to yield.
+         * Deciding on our own state alone made the duplicate copy (sent twice) undo the switch. */
+        bool peer_yielded = (sender_eff_prio == 0);
+        if ((peer_yielded && my_state == VRRP_STATE_MASTER) ||
+            (!peer_yielded && my_state != VRRP_STATE_MASTER)) {
+            return; /* duplicate or stale request */
+        }
         add_log("\033[1;35m[VRRP SWITCHOVER]\033[0m Received manual switchover signal from Node %08X", sender_id);
         if (my_state == VRRP_STATE_MASTER) {
             /* Peer requested to take over Master: step down and hold standby lock */
@@ -2202,20 +2759,13 @@ static void process_incoming_packet(ClusterWirePacket *pkt,
             s_stepdown_until_ms = 0;
             s_last_master_advert_ms = now_ms;
 
-#ifdef __linux__
-            char clean_vip[64] = {0};
-            int prefix = 32;
-            if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
-                char bcmd[128];
-                snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
-                int brc = system(bcmd);
-                (void)brc;
-            }
-#endif
+            add_vip_blackhole_rule();
 
+            /* BACKUP before handover: checkpoints then carry sender_state BACKUP and are adopted
+             * immediately even if they reach the peer after it already became MASTER */
+            atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
             worker_pool_handover_active_conns();
             release_virtual_ip();
-            atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
             atomic_store_explicit(&s_current_master_id, sender_id, memory_order_relaxed);
             if (s_alive_pipe[0] >= 0) close(s_alive_pipe[0]);
             if (s_alive_pipe[1] >= 0) close(s_alive_pipe[1]);
@@ -2348,7 +2898,8 @@ static void *cluster_worker_thread(void *arg) {
     }
 
     while (s_cluster_running && g_server_running) {
-        struct pollfd pfds[4];
+        struct pollfd pfds[4 + 1 + MAX_CLUSTER_PEERS + MAX_INBOUND_STREAMS];
+        StreamPollRef stream_refs[1 + MAX_CLUSTER_PEERS + MAX_INBOUND_STREAMS];
         int nfds = 0;
 
         int idx_cluster = -1;
@@ -2384,12 +2935,21 @@ static void *cluster_worker_thread(void *arg) {
             pfds[idx_alive].revents = 0;
         }
 
+        stream_links_maintain(now_ms);
+        int stream_base = nfds;
+        int stream_n = stream_fill_pollfds(&pfds[stream_base], stream_refs,
+                                           (int)(sizeof(stream_refs) / sizeof(stream_refs[0])));
+        nfds += stream_n;
+
         int timeout_ms = (int)(advert_ms / 2);
         if (timeout_ms < 10) timeout_ms = 10;
         if (timeout_ms > 50) timeout_ms = 50;
 
         int pr = poll(pfds, (nfds_t)nfds, timeout_ms);
         now_ms = now_monotonic_ms();
+        if (pr > 0 && stream_n > 0) {
+            stream_handle_pollfds(&pfds[stream_base], stream_refs, stream_n, now_ms);
+        }
 
         /* Always drain incoming SCM_RIGHTS live socket messages and cluster socket messages first */
         process_incoming_unix_fd_messages();
@@ -2416,11 +2976,21 @@ static void *cluster_worker_thread(void *arg) {
             }
         }
 
+        if (s_stepdown_requested) {
+            s_stepdown_requested = 0;
+            cluster_trigger_stepdown();
+        }
+
         if (s_bulk_sync_requested) {
             s_bulk_sync_requested = false;
             ClusterWirePacket sync_req;
             size_t len = prepare_packet(&sync_req, CLUSTER_PKT_SYNC_REQ, 0, false, NULL, 0);
             broadcast_cluster_packet(&sync_req, len);
+        }
+
+        if (atomic_load(&s_rst_filter_active) && now_ms >= atomic_load(&s_rst_filter_until_ms)) {
+            rst_filter_disarm();
+            add_log("\033[1;36m[HA RST FILTER]\033[0m Takeover window closed: kernel RSTs from the VIP re-enabled");
         }
 
         /* Drain pending session replication deltas */
@@ -2453,7 +3023,9 @@ static void *cluster_worker_thread(void *arg) {
         pthread_mutex_unlock(&s_cluster_mutex);
 
         VrrpState cur_state = (VrrpState)atomic_load_explicit(&s_vrrp_state, memory_order_relaxed);
-        if (cur_state != VRRP_STATE_MASTER) {
+        if (s_cluster_stopping) {
+            /* cluster_stop() already marked us BACKUP for the handover: never re-elect ourselves */
+        } else if (cur_state != VRRP_STATE_MASTER) {
             bool better_peer_alive = is_peer_better_than(best_alive_peer_prio, best_alive_peer_id,
                                                          my_eff_prio, s_node_id);
             if (!better_peer_alive && (now_ms - s_last_master_advert_ms) >= master_down_ms) {
@@ -2616,29 +3188,18 @@ bool cluster_start(void) {
                 int rtable = 100 + vrid;
                 char vrrp_if[64];
                 snprintf(vrrp_if, sizeof(vrrp_if), "vrrp%d", vrid);
-                char init_cmd[1024];
-                snprintf(init_cmd, sizeof(init_cmd),
-                         "ip rule del from %.45s lookup %d >/dev/null 2>&1 || true; "
-                         "ip route flush table %d >/dev/null 2>&1 || true; "
-                         "ip link del dev %.31s >/dev/null 2>&1 || true; "
-                         "ip addr del %.45s/%d dev %.31s >/dev/null 2>&1 || true; "
-                         "ip addr del %.45s/32 dev %.31s >/dev/null 2>&1 || true",
-                         clean_vip, rtable, rtable, vrrp_if,
-                         clean_vip, vip_prefix, parent_iface,
-                         clean_vip, parent_iface);
-                int irc = system(init_cmd);
-                (void)irc;
+                int host_pfx = strchr(clean_vip, ':') ? 128 : 32;
+                sysnet_rule_del(clean_vip, rtable);
+                sysnet_route_flush_table(rtable);
+                sysnet_link_del(vrrp_if);
+                sysnet_addr_del(parent_iface, clean_vip, vip_prefix);
+                sysnet_addr_del(parent_iface, clean_vip, host_pfx);
 
                 /* Flush any stale ARP neighbor entries for cluster peers and announce our physical MAC */
                 pthread_mutex_lock(&s_cluster_mutex);
                 for (int i = 0; i < s_num_peers; i++) {
                     if (net_validate_ip(s_peers[i].ip)) {
-                        char ncmd[256];
-                        snprintf(ncmd, sizeof(ncmd),
-                                 "ip neigh del %.45s dev %.31s >/dev/null 2>&1 || true",
-                                 s_peers[i].ip, parent_iface);
-                        int nrc = system(ncmd);
-                        (void)nrc;
+                        sysnet_neigh_del(s_peers[i].ip, parent_iface);
                     }
                 }
                 pthread_mutex_unlock(&s_cluster_mutex);
@@ -2646,11 +3207,10 @@ bool cluster_start(void) {
                 if (s_iface_primary_ip[0] != '\0' && s_saved_orig_mac[0] != '\0') {
                     send_vrrp_garp_on_iface(parent_iface, s_iface_primary_ip, s_saved_orig_mac);
                 }
-                char bcmd[128];
-                snprintf(bcmd, sizeof(bcmd), "ip rule del from %.45s blackhole >/dev/null 2>&1 || true; ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip, clean_vip);
-                int brc = system(bcmd);
-                (void)brc;
-                install_vip_rst_filter(parent_iface, clean_vip);
+                sysnet_rule_del(clean_vip, 0);
+                sysnet_rule_add(clean_vip, 50, 0);
+                /* Leftover from a crashed run: the filter is armed only during a takeover */
+                remove_vip_rst_filter(parent_iface, clean_vip);
             }
 #endif
         }
@@ -2679,6 +3239,16 @@ bool cluster_start(void) {
     }
     net_set_reuse(fd, 1, 1);
     net_set_nonblocking(fd);
+    /* A handover bursts one checkpoint datagram (up to ~60 KB) per stream */
+    int cbuf = 8 * 1024 * 1024;
+#ifdef SO_RCVBUFFORCE
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &cbuf, sizeof(cbuf)) < 0)
+#endif
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &cbuf, sizeof(cbuf));
+#ifdef SO_SNDBUFFORCE
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &cbuf, sizeof(cbuf)) < 0)
+#endif
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &cbuf, sizeof(cbuf));
 
     struct sockaddr_in baddr;
     memset(&baddr, 0, sizeof(baddr));
@@ -2692,6 +3262,7 @@ bool cluster_start(void) {
         close(fd);
         return false;
     }
+    stream_channel_open(bind_ip, cport);
 
     if (g_config.cluster_enable_multicast) {
         struct ip_mreq mreq;
@@ -2741,7 +3312,10 @@ void cluster_stop(void) {
     if (!s_cluster_running) return;
 
     /* If we are MASTER, hand over active streams and send Priority-0 release packet for instant failover (<1ms) */
+    s_cluster_stopping = true;
     if (atomic_load_explicit(&s_vrrp_state, memory_order_relaxed) == VRRP_STATE_MASTER) {
+        add_vip_blackhole_rule();
+        atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
         worker_pool_handover_active_conns();
         if (s_alive_pipe[1] >= 0) {
             close(s_alive_pipe[1]);
@@ -2757,6 +3331,8 @@ void cluster_stop(void) {
     s_manual_demoted = false;
     wakeup_cluster_thread();
     pthread_join(s_cluster_thread, NULL);
+    s_cluster_stopping = false;
+    stream_channel_close();
 
     if (s_cluster_fd >= 0) {
         close(s_cluster_fd);
@@ -2776,12 +3352,8 @@ void cluster_stop(void) {
     char clean_vip[64] = {0};
     int prefix = 32;
     if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
-#ifdef __linux__
-        char bcmd[128];
-        snprintf(bcmd, sizeof(bcmd), "ip rule del from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
-        int brc = system(bcmd);
-        (void)brc;
-#endif
+        sysnet_rule_del(clean_vip, 0);
+        rst_filter_disarm();
         remove_vip_rst_filter(g_config.vip_interface, clean_vip);
     }
 
@@ -2836,22 +3408,14 @@ void cluster_trigger_stepdown(void) {
         s_stepdown_until_ms = 0;
         s_last_master_advert_ms = now_ms;
 
-#ifdef __linux__
-        char clean_vip[64] = {0};
-        int prefix = 32;
-        if (parse_vip_cidr(g_config.virtual_ip, clean_vip, sizeof(clean_vip), &prefix)) {
-            char bcmd[128];
-            snprintf(bcmd, sizeof(bcmd), "ip rule add pref 50 from %.45s blackhole >/dev/null 2>&1 || true", clean_vip);
-            int brc = system(bcmd);
-            (void)brc;
-        }
-#endif
+        add_vip_blackhole_rule();
 
-        /* Hand over active connections cleanly FIRST while VIP is alive */
+        /* Hand over active connections cleanly FIRST while VIP is alive (state already BACKUP
+         * so the peer adopts checkpoints that arrive after its promotion) */
+        atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
         worker_pool_handover_active_conns();
 
         release_virtual_ip();
-        atomic_store_explicit(&s_vrrp_state, VRRP_STATE_BACKUP, memory_order_release);
         atomic_store_explicit(&s_current_master_id, 0, memory_order_relaxed);
 
         if (s_alive_pipe[0] >= 0) close(s_alive_pipe[0]);
@@ -2897,6 +3461,15 @@ void cluster_trigger_stepdown(void) {
         }
     }
     wakeup_cluster_thread();
+}
+
+void cluster_request_stepdown_async(void) {
+    s_stepdown_requested = 1;
+    if (s_wakeup_pipe[1] >= 0) {
+        char c = 's';
+        ssize_t w = write(s_wakeup_pipe[1], &c, 1);
+        (void)w;
+    }
 }
 
 void cluster_request_bulk_sync(void) {

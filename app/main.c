@@ -33,6 +33,11 @@ static void handle_sighup(int sig) {
     g_reload_requested = 1;
 }
 
+static void handle_switchover_signal(int sig) {
+    (void)sig;
+    cluster_request_stepdown_async();
+}
+
 int main(int argc, char *argv[]) {
     if (!setlocale(LC_ALL, "")) {
         setlocale(LC_ALL, "C.UTF-8");
@@ -65,6 +70,13 @@ int main(int argc, char *argv[]) {
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    /* SIGUSR1: manual VRRP switchover (same as TUI key 'c') */
+    struct sigaction sa_usr1;
+    memset(&sa_usr1, 0, sizeof(sa_usr1));
+    sa_usr1.sa_handler = handle_switchover_signal;
+    sigemptyset(&sa_usr1.sa_mask);
+    sigaction(SIGUSR1, &sa_usr1, NULL);
 
     struct sigaction sa_pipe;
     memset(&sa_pipe, 0, sizeof(sa_pipe));

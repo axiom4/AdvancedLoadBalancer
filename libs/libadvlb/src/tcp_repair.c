@@ -2,6 +2,7 @@
 #include "advlb/cluster.h"
 #include "advlb/net_utils.h"
 #include "advlb/log.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <linux/types.h>
+#include <linux/sockios.h>
+#include "advlb/sysnet.h"
 
 #ifndef TCP_REPAIR
 #define TCP_REPAIR 19
@@ -174,6 +178,60 @@ bool ktls_send_close_notify(int fd) {
 #endif
 }
 
+void tcp_checkpoint_release(TcpSocketCheckpoint *cp) {
+    if (!cp) return;
+    free(cp->queue_data);
+    cp->queue_data = NULL;
+    cp->snd_queue_len = cp->snd_unsent_len = cp->rcv_queue_len = 0;
+}
+
+void migrated_stream_release(MigratedStreamState *st) {
+    if (!st) return;
+    tcp_checkpoint_release(&st->backend);
+    free(st->c2b);
+    free(st->b2c);
+    free(st);
+}
+
+#ifdef __linux__
+/* Peek one repair queue (socket must already be in TCP_REPAIR). Returns bytes copied or -1. */
+static ssize_t peek_repair_queue(int sock_fd, int queue, uint8_t *buf, size_t len) {
+    if (len == 0) return 0;
+    setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &queue, sizeof(queue));
+    return recv(sock_fd, buf, len, MSG_PEEK | MSG_DONTWAIT);
+}
+
+/* CRIU-style capture of the kernel send/receive queues while the socket is in repair mode */
+static void capture_tcp_queues(int sock_fd, TcpSocketCheckpoint *cp) {
+    int outq = 0, unsent = 0, inq = 0;
+    if (ioctl(sock_fd, SIOCOUTQ, &outq) < 0) outq = 0;
+    if (ioctl(sock_fd, SIOCOUTQNSD, &unsent) < 0) unsent = 0;
+    if (ioctl(sock_fd, SIOCINQ, &inq) < 0) inq = 0;
+    if (outq <= 0 && inq <= 0) return;
+
+    if ((size_t)outq + (size_t)inq > TCP_CHECKPOINT_QUEUE_MAX) {
+        add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m Queues too large to replicate (sndq=%d rcvq=%d, max %d) fd=%d",
+                outq, inq, TCP_CHECKPOINT_QUEUE_MAX, sock_fd);
+        return;
+    }
+    uint8_t *buf = malloc((size_t)outq + (size_t)inq);
+    if (!buf) return;
+
+    /* The send queue only shrinks under us (ACKs), so the peeked length is authoritative */
+    ssize_t sq = peek_repair_queue(sock_fd, TCP_SEND_QUEUE, buf, (size_t)outq);
+    ssize_t rq = peek_repair_queue(sock_fd, TCP_RECV_QUEUE, buf + (sq > 0 ? sq : 0), (size_t)inq);
+    if (sq < 0 || rq < 0) {
+        add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m Peek repair queues failed: %s (fd=%d)", strerror(errno), sock_fd);
+        free(buf);
+        return;
+    }
+    cp->queue_data = buf;
+    cp->snd_queue_len = (uint32_t)sq;
+    cp->snd_unsent_len = (unsent > 0 && (uint32_t)unsent <= (uint32_t)sq) ? (uint32_t)unsent : 0;
+    cp->rcv_queue_len = (uint32_t)rq;
+}
+#endif
+
 bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_cp) {
     if (sock_fd < 0 || !out_cp) return false;
     (void)ssl_ptr;
@@ -282,6 +340,11 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         slen = sizeof(out_cp->rcv_seq);
         getsockopt(sock_fd, SOL_TCP, TCP_QUEUE_SEQ, &out_cp->rcv_seq, &slen);
 
+        /* kTLS replaces the socket recvmsg path, so queues cannot be peeked: only plain TCP carries them */
+        if (!out_cp->is_ktls) {
+            capture_tcp_queues(sock_fd, out_cp);
+        }
+
         struct adlb_tcp_repair_window wnd;
         socklen_t wlen = sizeof(wnd);
         if (getsockopt(sock_fd, SOL_TCP, TCP_REPAIR_WINDOW, &wnd, &wlen) == 0) {
@@ -308,8 +371,9 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
                 strerror(errno), errno);
     }
 
-    add_log("\033[1;32m[HA CHECKPOINT DONE]\033[0m fd=%d is_ktls=%s snd_seq=%u",
-            sock_fd, out_cp->is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", out_cp->snd_seq);
+    add_log("\033[1;32m[HA CHECKPOINT DONE]\033[0m fd=%d is_ktls=%s snd_seq=%u sndq=%u (unsent %u) rcvq=%u",
+            sock_fd, out_cp->is_ktls ? "\033[1;32mYES\033[0m" : "\033[1;33mNO\033[0m", out_cp->snd_seq,
+            out_cp->snd_queue_len, out_cp->snd_unsent_len, out_cp->rcv_queue_len);
     return true;
 #else
     return true;
@@ -317,23 +381,25 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
 }
 
 #ifdef __linux__
-/* Format sockaddr as plain IP string; IPv4-mapped IPv6 (::ffff:a.b.c.d) is unwrapped to IPv4,
- * which is how netfilter conntrack tracks dual-stack flows. */
-static bool sockaddr_to_ct_ip(const struct sockaddr_storage *ss, char *out, size_t out_sz, int *out_port) {
+/* Raw address bytes as conntrack tracks them: IPv4-mapped IPv6 (::ffff:a.b.c.d) is unwrapped to IPv4 */
+static int sockaddr_to_ct_addr(const struct sockaddr_storage *ss, const void **out_addr, uint16_t *out_port) {
     if (ss->ss_family == AF_INET) {
         const struct sockaddr_in *s4 = (const struct sockaddr_in *)ss;
-        *out_port = ntohs(s4->sin_port);
-        return inet_ntop(AF_INET, &s4->sin_addr, out, (socklen_t)out_sz) != NULL;
+        *out_addr = &s4->sin_addr;
+        *out_port = s4->sin_port;
+        return AF_INET;
     }
     if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)ss;
-        *out_port = ntohs(s6->sin6_port);
+        *out_port = s6->sin6_port;
         if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
-            return inet_ntop(AF_INET, &s6->sin6_addr.s6_addr[12], out, (socklen_t)out_sz) != NULL;
+            *out_addr = &s6->sin6_addr.s6_addr[12];
+            return AF_INET;
         }
-        return inet_ntop(AF_INET6, &s6->sin6_addr, out, (socklen_t)out_sz) != NULL;
+        *out_addr = &s6->sin6_addr;
+        return AF_INET6;
     }
-    return false;
+    return 0;
 }
 
 /* Drop any stale netfilter conntrack entry for this 4-tuple left over from a previous
@@ -341,20 +407,32 @@ static bool sockaddr_to_ct_ip(const struct sockaddr_storage *ss, char *out, size
  * restored stream would be classified INVALID (and dropped/rejected by typical firewall rules). */
 static void flush_stale_conntrack_entry(const TcpSocketCheckpoint *cp) {
     if (geteuid() != 0) return;
-    char cip[INET6_ADDRSTRLEN] = {0};
-    char lip[INET6_ADDRSTRLEN] = {0};
-    int cport = 0, lport = 0;
-    if (!sockaddr_to_ct_ip(&cp->remote_addr, cip, sizeof(cip), &cport)) return;
-    if (!sockaddr_to_ct_ip(&cp->local_addr, lip, sizeof(lip), &lport)) return;
-    if (cport <= 0 || lport <= 0) return;
+    const void *caddr = NULL, *laddr = NULL;
+    uint16_t cport = 0, lport = 0;
+    int cfam = sockaddr_to_ct_addr(&cp->remote_addr, &caddr, &cport);
+    int lfam = sockaddr_to_ct_addr(&cp->local_addr, &laddr, &lport);
+    if (cfam == 0 || cfam != lfam || cport == 0 || lport == 0) return;
+    /* Original direction is peer->us for client streams, us->peer for backend streams */
+    sysnet_conntrack_del_tcp(cfam, caddr, cport, laddr, lport);
+    sysnet_conntrack_del_tcp(cfam, laddr, lport, caddr, cport);
+}
 
-    char cmd[384];
-    snprintf(cmd, sizeof(cmd),
-             "command -v conntrack >/dev/null 2>&1 && "
-             "conntrack -D -p tcp -s %s --sport %d -d %s --dport %d >/dev/null 2>&1; true",
-             cip, cport, lip, lport);
-    int rc = system(cmd);
-    (void)rc;
+/* Write repair-mode data into the selected queue; returns false on short write */
+static bool fill_repair_queue(int s, int queue, const uint8_t *data, uint32_t len) {
+    if (len == 0) return true;
+    setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &queue, sizeof(queue));
+    uint32_t done = 0;
+    while (done < len) {
+        ssize_t w = send(s, data + done, len - done, MSG_NOSIGNAL);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            add_log("\033[1;31m[HA RESTORE ERR]\033[0m refill %s queue failed at %u/%u: %s (errno %d)",
+                    queue == TCP_SEND_QUEUE ? "send" : "recv", done, len, strerror(errno), errno);
+            return false;
+        }
+        done += (uint32_t)w;
+    }
+    return true;
 }
 #endif
 
@@ -370,23 +448,22 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     int s = socket(domain, SOCK_STREAM, 0);
     if (s < 0) return -1;
 
-    int on = 1;
-    if (setsockopt(s, SOL_TCP, TCP_REPAIR, &on, sizeof(on)) < 0) {
-        close(s);
-        return -1;
-    }
-
     int reuse = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #ifdef SO_REUSEPORT
     setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
 #endif
-#ifdef SO_BINDTODEVICE
-    const char *vip_iface = cluster_get_active_vip_iface();
-    if (vip_iface && vip_iface[0] != '\0') {
-        setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, vip_iface, (socklen_t)(strlen(vip_iface) + 1));
+
+    /* TCP_REPAIR must come AFTER SO_REUSEADDR: it sets sk_reuse = SK_FORCE_REUSE, which
+     * SO_REUSEADDR would downgrade, making bind() to VIP:port fail against our own listener */
+    int on = 1;
+    if (setsockopt(s, SOL_TCP, TCP_REPAIR, &on, sizeof(on)) < 0) {
+        close(s);
+        return -1;
     }
-#endif
+    /* No SO_BINDTODEVICE: with VMAC disabled peers reach the VIP through the parent NIC, and a
+     * device-bound socket never matches segments arriving there (silently lost). Egress from the
+     * VIP is already steered to vrrp<VRID> by the "from VIP lookup 100+VRID" policy rule. */
     int one = 1;
     setsockopt(s, SOL_IP, IP_FREEBIND, &one, sizeof(one));
     setsockopt(s, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
@@ -395,19 +472,31 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
 
     socklen_t loc_len = (cp->local_addr.ss_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
     if (bind(s, (const struct sockaddr *)&cp->local_addr, loc_len) < 0) {
+        /* connect() would autobind an ephemeral port: wrong 4-tuple, the client answers with RST */
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m bind failed: %s (errno %d)", strerror(errno), errno);
+        close(s);
+        return -1;
     }
 
-    /* Set Sequence numbers while socket is in TCP_CLOSE (mandatory for Linux TCP_REPAIR) */
+    /* Set Sequence numbers while socket is in TCP_CLOSE (mandatory for Linux TCP_REPAIR).
+     * Queues are refilled later, so start each sequence at the head of its captured queue. */
+    const uint8_t *snd_data = cp->queue_data;
+    const uint8_t *rcv_data = cp->queue_data ? cp->queue_data + cp->snd_queue_len : NULL;
+    uint32_t snd_len = cp->queue_data ? cp->snd_queue_len : 0;
+    uint32_t rcv_len = cp->queue_data ? cp->rcv_queue_len : 0;
+    uint32_t unsent_len = (cp->snd_unsent_len <= snd_len) ? cp->snd_unsent_len : 0;
+    uint32_t snd_start = cp->snd_seq - snd_len;
+    uint32_t rcv_start = cp->rcv_seq - rcv_len;
+
     int q = TCP_SEND_QUEUE;
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
-    if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->snd_seq, sizeof(cp->snd_seq)) < 0) {
+    if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &snd_start, sizeof(snd_start)) < 0) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m set snd_seq failed: %s (errno %d)", strerror(errno), errno);
     }
 
     q = TCP_RECV_QUEUE;
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &q, sizeof(q));
-    if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &cp->rcv_seq, sizeof(cp->rcv_seq)) < 0) {
+    if (setsockopt(s, SOL_TCP, TCP_QUEUE_SEQ, &rcv_start, sizeof(rcv_start)) < 0) {
         add_log("\033[1;31m[HA RESTORE ERR]\033[0m set rcv_seq failed: %s (errno %d)", strerror(errno), errno);
     }
 
@@ -442,6 +531,12 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         }
     }
 
+    /* Refill queues before the window: the kernel validates rcv_wup against the restored rcv_nxt.
+     * Receive queue = bytes the old node ACKed but the proxy never read; send queue (already
+     * transmitted part) = bytes the client has not ACKed yet, retransmitted by the kernel on RTO. */
+    fill_repair_queue(s, TCP_RECV_QUEUE, rcv_data, rcv_len);
+    fill_repair_queue(s, TCP_SEND_QUEUE, snd_data, snd_len - unsent_len);
+
     /* Restore TCP sliding window parameters */
     struct adlb_tcp_repair_window wnd;
     memset(&wnd, 0, sizeof(wnd));
@@ -469,6 +564,15 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
         if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
             int err = errno;
             add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
+        }
+    }
+
+    /* Never-transmitted tail goes out as ordinary data now that repair mode is off */
+    if (unsent_len > 0) {
+        ssize_t w = send(s, snd_data + (snd_len - unsent_len), unsent_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w != (ssize_t)unsent_len) {
+            add_log("\033[1;31m[HA RESTORE ERR]\033[0m unsent tail short write %zd/%u: %s",
+                    w, unsent_len, strerror(errno));
         }
     }
 
@@ -550,7 +654,8 @@ void tcp_checkpoint_to_wire(const TcpSocketCheckpoint *cp,
                             uint16_t req_len,
                             ClusterTcpCheckpointWire *wire) {
     if (!cp || !wire) return;
-    memset(wire, 0, sizeof(*wire));
+    /* queue_data is a large variable-length tail: only the used part is ever read or sent */
+    memset(wire, 0, offsetof(ClusterTcpCheckpointWire, queue_data));
 
     wire->family = (cp->remote_addr.ss_family == AF_INET6) ? AF_INET6 : AF_INET;
     wire->proto = IPPROTO_TCP;
@@ -615,6 +720,21 @@ void tcp_checkpoint_to_wire(const TcpSocketCheckpoint *cp,
         memcpy(wire->rx_salt, cp->ktls.rx_salt, 4);
         memcpy(wire->rx_rec_seq, cp->ktls.rx_rec_seq, 8);
     }
+
+    uint32_t qlen = cp->queue_data ? cp->snd_queue_len + cp->rcv_queue_len : 0;
+    if (qlen > 0 && qlen <= TCP_CHECKPOINT_QUEUE_MAX) {
+        wire->snd_queue_len = htonl(cp->snd_queue_len);
+        wire->snd_unsent_len = htonl(cp->snd_unsent_len);
+        wire->rcv_queue_len = htonl(cp->rcv_queue_len);
+        memcpy(wire->queue_data, cp->queue_data, qlen);
+    }
+}
+
+size_t tcp_checkpoint_wire_len(const ClusterTcpCheckpointWire *wire) {
+    size_t base = offsetof(ClusterTcpCheckpointWire, queue_data);
+    if (!wire) return base;
+    uint64_t qlen = (uint64_t)ntohl(wire->snd_queue_len) + (uint64_t)ntohl(wire->rcv_queue_len);
+    return (qlen <= TCP_CHECKPOINT_QUEUE_MAX) ? base + (size_t)qlen : base;
 }
 
 void tcp_checkpoint_from_wire(const ClusterTcpCheckpointWire *wire,
@@ -692,6 +812,19 @@ void tcp_checkpoint_from_wire(const ClusterTcpCheckpointWire *wire,
         memcpy(out_cp->ktls.rx_key, wire->rx_key, 32);
         memcpy(out_cp->ktls.rx_salt, wire->rx_salt, 4);
         memcpy(out_cp->ktls.rx_rec_seq, wire->rx_rec_seq, 8);
+    }
+
+    uint32_t sq = ntohl(wire->snd_queue_len);
+    uint32_t rq = ntohl(wire->rcv_queue_len);
+    uint32_t us = ntohl(wire->snd_unsent_len);
+    if ((uint64_t)sq + rq > 0 && (uint64_t)sq + rq <= TCP_CHECKPOINT_QUEUE_MAX) {
+        out_cp->queue_data = malloc((size_t)sq + rq);
+        if (out_cp->queue_data) {
+            memcpy(out_cp->queue_data, wire->queue_data, (size_t)sq + rq);
+            out_cp->snd_queue_len = sq;
+            out_cp->snd_unsent_len = (us <= sq) ? us : 0;
+            out_cp->rcv_queue_len = rq;
+        }
     }
 }
 

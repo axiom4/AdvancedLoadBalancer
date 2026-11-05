@@ -98,6 +98,11 @@ bool session_table_store_shadow_fds(const struct sockaddr_storage *client_addr,
 /* Store TCP_REPAIR + kTLS checkpoint received over cluster UDP */
 bool session_table_store_tcp_checkpoint(const ClusterTcpCheckpointWire *wire);
 
+/* Store a full stream migration (client checkpoint + backend socket and proxy buffers).
+ * Takes ownership of state (also on failure). */
+bool session_table_store_stream_migration(const ClusterTcpCheckpointWire *client_wire,
+                                          MigratedStreamState *state);
+
 /* Promote all passive shadow sockets into the active worker pool upon becoming VRRP MASTER */
 int session_table_promote_shadow_conns(void);
 
