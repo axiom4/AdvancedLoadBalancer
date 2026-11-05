@@ -295,10 +295,13 @@ bool tcp_repair_checkpoint(int sock_fd, void *ssl_ptr, TcpSocketCheckpoint *out_
         int no_q = TCP_NO_QUEUE;
         setsockopt(sock_fd, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
 
-        int off = 0;
+        int off = -1; /* TCP_REPAIR_OFF_NO_WP (-1) disables repair without transmitting spurious window probe */
         if (setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
-            add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)",
-                    strerror(errno), errno);
+            off = 0;
+            if (setsockopt(sock_fd, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
+                add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)",
+                        strerror(errno), errno);
+            }
         }
     } else {
         add_log("\033[1;31m[HA CHECKPOINT ERR]\033[0m enable TCP_REPAIR failed: %s (errno %d)",
@@ -460,10 +463,13 @@ int tcp_repair_restore(const TcpSocketCheckpoint *cp) {
     int no_q = TCP_NO_QUEUE;
     setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &no_q, sizeof(no_q));
 
-    int off = 0;
+    int off = -1; /* TCP_REPAIR_OFF_NO_WP */
     if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
-        int err = errno;
-        add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
+        off = 0;
+        if (setsockopt(s, SOL_TCP, TCP_REPAIR, &off, sizeof(off)) < 0) {
+            int err = errno;
+            add_log("\033[1;31m[HA RESTORE ERR]\033[0m disable TCP_REPAIR failed: %s (errno %d)", strerror(err), err);
+        }
     }
 
     /* kTLS restore on healthy established TCP socket */

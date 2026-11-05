@@ -1105,7 +1105,7 @@ static void acquire_virtual_ip(void) {
                 s_vip_bound_kernel = true;
 
                 snprintf(cmd, sizeof(cmd),
-                         "ip link set dev %.31s promisc on >/dev/null 2>&1 || true; "
+                         "ip link set dev %.31s promisc off >/dev/null 2>&1 || true; "
                          "sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2 >/dev/null 2>&1 || true; "
                          "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_ignore=1 net.ipv4.conf.%.31s.arp_announce=2 >/dev/null 2>&1 || true; "
                          "sysctl -qw net.ipv4.conf.%.31s.rp_filter=0 net.ipv4.conf.%.31s.arp_filter=0 "
