@@ -123,9 +123,15 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
     if (max_len == 0) return 0;
 
     if (ssl) {
+#ifndef NO_SSL
+        /* A stale entry in this thread's error queue makes SSL_get_error() report SSL_ERROR_SSL */
+        ERR_clear_error();
+#endif
+        errno = 0;
         int r = SSL_read(ssl, buf, (int)max_len);
         if (r > 0) return r;
         if (r == 0) return 0; // Connection closed normally
+        int read_errno = errno;
         int err = SSL_get_error(ssl, r);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
             *out_want_io = true;
@@ -150,7 +156,8 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
         if (qerr != 0) {
             char ebuf[160];
             ERR_error_string_n(qerr, ebuf, sizeof(ebuf));
-            add_log("\033[1;31m[HA ERR]\033[0m TLS read failure: %s", ebuf);
+            add_log("\033[1;31m[HA ERR]\033[0m TLS read failure: %s (fd=%d, ssl_err=%d, sys errno=%d %s)",
+                    ebuf, fd, err, read_errno, read_errno ? strerror(read_errno) : "-");
             ERR_clear_error();
         }
         if (errno == 0) errno = EPROTO;
