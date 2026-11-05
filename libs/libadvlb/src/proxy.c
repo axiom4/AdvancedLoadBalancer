@@ -159,11 +159,11 @@ static ssize_t nonblocking_read(int fd, SSL *ssl, char *buf, size_t max_len, boo
         if (err == SSL_ERROR_SSL && ERR_GET_REASON(qerr) == SSL_R_PACKET_LENGTH_TOO_LONG) {
             char probe;
             ssize_t pr = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-            add_log("\033[1;33m[HA TLS]\033[0m fd=%d record-layer error, FIN probe=%zd (errno %d)", fd, pr, pr < 0 ? errno : 0);
             if (pr == 0) {
                 ERR_clear_error();
                 return 0;
             }
+            add_log("\033[1;33m[HA TLS]\033[0m fd=%d record-layer error without FIN (probe=%zd, errno %d)", fd, pr, pr < 0 ? errno : 0);
         }
 #endif
         if (qerr != 0) {
